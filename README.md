@@ -1,47 +1,45 @@
 # agy-cmd
 
-Google Antigravity 桌面端与 IDE 内置斜杠指令选型参谋与分类速查 Skill。
+Google Antigravity 桌面端与 IDE 高阶能力自动路由器与内置斜杠指令参谋 Skill。
 
 ## 解决什么问题
 
-面对 Google Antigravity 十余个局部相似的内置斜杠指令（例如规划类的 `/grill-me` 与 `/plan`，多智能体与自治类的 `/goal`、`/boost`、`/swarm`、`/run-workflow`、`/teamwork`，以及定时类的 `/schedule` 与 `/automation`），根据手头真实任务描述直接给出：
+Google Antigravity 把需求追问、先审施工图、批量并发编排、三层深度推演等高阶能力分散在 19 个内置斜杠指令与底层工具中，默认对话不会主动调用。`agy-cmd` 提供双轨解决方案：
 
-1. 首选指令（或跨阶段两步连招）及套餐门槛说明；
-2. 结合 `@` 上下文挂载语法的可直接复制命令块；
-3. 敲下回车后的界面预期效果与排除最易混近邻指令的一句话理由。
+1. **全局常驻自动路由（安装后开启一次，所有新任务自动生效）**：
+   - **原生工具自动代执行**：遇到模糊新想法自动启动 Grill-Me 单题追问（`ask_question`）；跨 3 个以上文件改动自动先出 `Implementation Plan` 等批准再动代码；5 个以上独立模块语义批处理自动调用 `run_workflow` 写并发脚本；动态网页交互自动委派 `browser` 子智能体；简单局部小改保持零打扰直接执行。
+   - **前端专属模式首行提醒**：遇到反复未修好的疑难故障、死锁竞态或无人值守长闭环任务，在正常排查的同时于回复第 1 行附上可直接复制的 `/boost`、`/goal`、`/teamwork` 命令。
+2. **极简指令选型参谋与分类速查**：
+   - 主动询问“这活该敲什么指令”或对比相近指令时，零反问直接交付带 `@` 上下文挂载的可复制命令块与近邻排他理由，严格拦截桌面端无法使用的终端 CLI 专属命令。
 
-## 适用条件与边界
+## 安装与开启全局自动路由
 
-- **适用场景**：在 Antigravity 桌面端 App 或 IDE 聊天框中准备开展新任务拿不准敲哪个指令、纠结两个相近指令如何取舍，或需要按场景查阅桌面端内置指令清单。
-- **主要边界**：
-  - 仅覆盖桌面端 App 与 IDE 通用内置指令（共 19 项）及 `@` 挂载用法，主动拦截终端 `agy` CLI 专属命令（如 `/undo`、`/branch`、`/effort` 等）；
-  - 极简选型与速查定位，零反问直接交付，不做互动出题；
-  - 涉及编写底层 `hooks.json` 或 `mcp_config.json` 配置字段时，引导衔接内置的 `/agy-customizations`。
-
-## 安装
+### 第 1 步：一行命令安装 Skill
 
 ```bash
 npx -y skills add zou172866/agy-cmd -g --all
 ```
 
-## 最短使用示例
+### 第 2 步：激活全局常驻自动路由（任选一种）
 
-安装后，在 Antigravity 聊天框直接输入：
-
-```text
-/agy-cmd 我有 15 个历史文件夹想按同一套规则检查标签是否超标，该敲什么指令？
-```
-
-或直接用自然语言提问：
+在 Antigravity 聊天框直接发送：
 
 ```text
-桌面端里 /goal、/boost、/swarm 和 /run-workflow 分别在什么情况下用？
+/agy-cmd 开启自动路由
 ```
+
+或在终端运行内置脚本（将向 `~/.gemini/config/rules/agy-auto-router.md` 写入 `always_on` 规则并同步桌面端目录）：
+
+```bash
+python ~/.agents/skills/agy-cmd/scripts/setup_auto_router.py --install
+```
+
+如需关闭自动路由恢复默认行为，发送 `/agy-cmd 关闭自动路由` 或运行 `python ~/.agents/skills/agy-cmd/scripts/setup_auto_router.py --remove` 即可一键卸载。
 
 ## 运行依赖
 
-- Google Antigravity 桌面端 App 或 Antigravity IDE（或其他支持 Agent Skills 规范的客户端）
-- 无需额外 Python / Bash 脚本或外部 API 密钥
+- Google Antigravity 桌面端 App 或 Antigravity IDE
+- Python 3（仅用于执行 `setup_auto_router.py` 启用或移除全局常驻规则）
 
 ## 仓库目录结构
 
@@ -51,6 +49,8 @@ npx -y skills add zou172866/agy-cmd -g --all
 └── skills/
     └── agy-cmd/
         ├── SKILL.md
-        └── references/
-            └── desktop-commands-matrix.md
+        ├── references/
+        │   └── desktop-commands-matrix.md
+        └── scripts/
+            └── setup_auto_router.py
 ```
