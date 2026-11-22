@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 import json
 import math
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -580,13 +581,30 @@ def validate_bundle_sync(plugin_dir: Path) -> list[str]:
 
 
 def _check_hook_script_exists(plugin_dir: Path, command: str, hook_name: str, issues: list[str]) -> None:
-    tokens = command.split()
-    for tok in tokens:
-        cleaned = tok.strip("\"'")
-        if cleaned.startswith("./") or cleaned.startswith(".\\"):
-            script_path = (plugin_dir / cleaned).resolve()
-            if not script_path.is_file():
-                issues.append(f"钩子 {hook_name} 引用的脚本不存在：{script_path}")
+    checked_any = False
+    for dir_seg, file_seg in re.findall(
+        r"s0=/([A-Za-z0-9_.-]+)/\.source;s1=/([A-Za-z0-9_.-]+\.(?:m?js|cjs))/\.source",
+        command,
+    ):
+        checked_any = True
+        script_path = (plugin_dir / dir_seg / file_seg).resolve()
+        if not script_path.is_file():
+            issues.append(f"钩子 {hook_name} 引用的脚本不存在：{script_path}")
+
+    for quoted_rel in re.findall(r"\br\s*=\s*['\"](\.?/?hooks/[A-Za-z0-9_./-]+\.(?:m?js|cjs))['\"]", command):
+        checked_any = True
+        script_path = (plugin_dir / quoted_rel).resolve()
+        if not script_path.is_file():
+            issues.append(f"钩子 {hook_name} 引用的脚本不存在：{script_path}")
+
+    if not checked_any:
+        tokens = command.split()
+        for tok in tokens:
+            cleaned = tok.strip("\"'")
+            if cleaned.startswith("./") or cleaned.startswith(".\\"):
+                script_path = (plugin_dir / cleaned).resolve()
+                if not script_path.is_file():
+                    issues.append(f"钩子 {hook_name} 引用的脚本不存在：{script_path}")
 
 
 def remove_legacy_duplicate_skill(config_dir: Path, plugin_dir: Path) -> Path | None:
@@ -639,7 +657,7 @@ def sync_plugin_bundle_if_needed(target_plugin_dir: Path) -> bool:
 
     ignore_fn = shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo")
     target_plugin_dir.mkdir(parents=True, exist_ok=True)
-    for item_name in ("plugin.json", "hooks.json", "package.json", "README.md"):
+    for item_name in ("plugin.json", "hooks.json", "package.json", "README.md", "install.ps1", "install.sh"):
         src_file = source_root / item_name
         if src_file.is_file():
             shutil.copy2(src_file, target_plugin_dir / item_name)

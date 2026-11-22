@@ -3,7 +3,7 @@
     "SessionStart": [
       {
         "type": "command",
-        "command": "node ./hooks/session-start.mjs",
+        "command": "node -e /\\''/;Promise.all([import(/node:fs/.source),import(/node:path/.source),import(/node:os/.source),import(/node:url/.source)]).then(function(a,f,p,o,u,e,n,s0,s1,g,cg,pl,ag,h,cs,w,tg){f=a[0];p=a[1];o=a[2];u=a[3];e=process.env;n=/agy-cmd/.source;s0=/hooks/.source;s1=/session-start.mjs/.source;g=/.gemini/.source;cg=/config/.source;pl=/plugins/.source;ag=/.agents/.source;h=e.USERPROFILE?e.USERPROFILE:e.HOME?e.HOME:o.homedir();cs=[e.PLUGIN_ROOT,e.AGY_PLUGIN_ROOT,/./.source];w=process.cwd();[0,1,2,3,4,5,6,7].forEach(function(x,up){if(w){cs.push(p.join(w,ag,pl,n));up=p.dirname(w);w=up===w?0:up}});cs.push(e.ANTIGRAVITY_CONFIG_DIR?p.join(e.ANTIGRAVITY_CONFIG_DIR,pl,n):0,e.GEMINI_CONFIG_DIR?p.join(e.GEMINI_CONFIG_DIR,pl,n):0,e.GEMINI_HOME?p.join(e.GEMINI_HOME,g,cg,pl,n):0,e.GEMINI_HOME?p.join(e.GEMINI_HOME,cg,pl,n):0,h?p.join(h,g,cg,pl,n):0);cs.forEach(function(c,d,s,m){if(tg){}else{if(c){d=p.resolve(c);s=p.join(d,s0,s1);m=p.join(d,/plugin.json/.source);try{if(f.existsSync(s)){if(f.existsSync(m)){if(JSON.parse(f.readFileSync(m,/utf8/.source).trim()).name===n){tg=s}}}}catch{}}}});tg?(process.argv[1]=tg,import(u.pathToFileURL(tg).href).catch(function(){console.log(JSON.stringify({}))})):console.log(JSON.stringify({}))}).catch(function(){console.log(JSON.stringify({}))});//'",
         "timeout": 5
       }
     ],
@@ -13,7 +13,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node ./hooks/post-tool-use.mjs",
+            "command": "node -e /\\''/;Promise.all([import(/node:fs/.source),import(/node:path/.source),import(/node:os/.source),import(/node:url/.source)]).then(function(a,f,p,o,u,e,n,s0,s1,g,cg,pl,ag,h,cs,w,tg){f=a[0];p=a[1];o=a[2];u=a[3];e=process.env;n=/agy-cmd/.source;s0=/hooks/.source;s1=/post-tool-use.mjs/.source;g=/.gemini/.source;cg=/config/.source;pl=/plugins/.source;ag=/.agents/.source;h=e.USERPROFILE?e.USERPROFILE:e.HOME?e.HOME:o.homedir();cs=[e.PLUGIN_ROOT,e.AGY_PLUGIN_ROOT,/./.source];w=process.cwd();[0,1,2,3,4,5,6,7].forEach(function(x,up){if(w){cs.push(p.join(w,ag,pl,n));up=p.dirname(w);w=up===w?0:up}});cs.push(e.ANTIGRAVITY_CONFIG_DIR?p.join(e.ANTIGRAVITY_CONFIG_DIR,pl,n):0,e.GEMINI_CONFIG_DIR?p.join(e.GEMINI_CONFIG_DIR,pl,n):0,e.GEMINI_HOME?p.join(e.GEMINI_HOME,g,cg,pl,n):0,e.GEMINI_HOME?p.join(e.GEMINI_HOME,cg,pl,n):0,h?p.join(h,g,cg,pl,n):0);cs.forEach(function(c,d,s,m){if(tg){}else{if(c){d=p.resolve(c);s=p.join(d,s0,s1);m=p.join(d,/plugin.json/.source);try{if(f.existsSync(s)){if(f.existsSync(m)){if(JSON.parse(f.readFileSync(m,/utf8/.source).trim()).name===n){tg=s}}}}catch{}}}});tg?(process.argv[1]=tg,import(u.pathToFileURL(tg).href).catch(function(){console.log(JSON.stringify({}))})):console.log(JSON.stringify({}))}).catch(function(){console.log(JSON.stringify({}))});//'",
             "timeout": 5
           }
         ]
@@ -22,14 +22,14 @@
     "PreInvocation": [
       {
         "type": "command",
-        "command": "node ./hooks/pre-invocation.mjs",
+        "command": "node -e /\\''/;Promise.all([import(/node:fs/.source),import(/node:path/.source),import(/node:os/.source),import(/node:url/.source)]).then(function(a,f,p,o,u,e,n,s0,s1,g,cg,pl,ag,h,cs,w,tg){f=a[0];p=a[1];o=a[2];u=a[3];e=process.env;n=/agy-cmd/.source;s0=/hooks/.source;s1=/pre-invocation.mjs/.source;g=/.gemini/.source;cg=/config/.source;pl=/plugins/.source;ag=/.agents/.source;h=e.USERPROFILE?e.USERPROFILE:e.HOME?e.HOME:o.homedir();cs=[e.PLUGIN_ROOT,e.AGY_PLUGIN_ROOT,/./.source];w=process.cwd();[0,1,2,3,4,5,6,7].forEach(function(x,up){if(w){cs.push(p.join(w,ag,pl,n));up=p.dirname(w);w=up===w?0:up}});cs.push(e.ANTIGRAVITY_CONFIG_DIR?p.join(e.ANTIGRAVITY_CONFIG_DIR,pl,n):0,e.GEMINI_CONFIG_DIR?p.join(e.GEMINI_CONFIG_DIR,pl,n):0,e.GEMINI_HOME?p.join(e.GEMINI_HOME,g,cg,pl,n):0,e.GEMINI_HOME?p.join(e.GEMINI_HOME,cg,pl,n):0,h?p.join(h,g,cg,pl,n):0);cs.forEach(function(c,d,s,m){if(tg){}else{if(c){d=p.resolve(c);s=p.join(d,s0,s1);m=p.join(d,/plugin.json/.source);try{if(f.existsSync(s)){if(f.existsSync(m)){if(JSON.parse(f.readFileSync(m,/utf8/.source).trim()).name===n){tg=s}}}}catch{}}}});tg?(process.argv[1]=tg,import(u.pathToFileURL(tg).href).catch(function(){console.log(JSON.stringify({}))})):console.log(JSON.stringify({}))}).catch(function(){console.log(JSON.stringify({}))});//'",
         "timeout": 5
       }
     ],
     "Stop": [
       {
         "type": "command",
-        "command": "node ./hooks/stop.mjs",
+        "command": "node -e /\\''/;Promise.all([import(/node:fs/.source),import(/node:path/.source),import(/node:os/.source),import(/node:url/.source)]).then(function(a,f,p,o,u,e,n,s0,s1,g,cg,pl,ag,h,cs,w,tg){f=a[0];p=a[1];o=a[2];u=a[3];e=process.env;n=/agy-cmd/.source;s0=/hooks/.source;s1=/stop.mjs/.source;g=/.gemini/.source;cg=/config/.source;pl=/plugins/.source;ag=/.agents/.source;h=e.USERPROFILE?e.USERPROFILE:e.HOME?e.HOME:o.homedir();cs=[e.PLUGIN_ROOT,e.AGY_PLUGIN_ROOT,/./.source];w=process.cwd();[0,1,2,3,4,5,6,7].forEach(function(x,up){if(w){cs.push(p.join(w,ag,pl,n));up=p.dirname(w);w=up===w?0:up}});cs.push(e.ANTIGRAVITY_CONFIG_DIR?p.join(e.ANTIGRAVITY_CONFIG_DIR,pl,n):0,e.GEMINI_CONFIG_DIR?p.join(e.GEMINI_CONFIG_DIR,pl,n):0,e.GEMINI_HOME?p.join(e.GEMINI_HOME,g,cg,pl,n):0,e.GEMINI_HOME?p.join(e.GEMINI_HOME,cg,pl,n):0,h?p.join(h,g,cg,pl,n):0);cs.forEach(function(c,d,s,m){if(tg){}else{if(c){d=p.resolve(c);s=p.join(d,s0,s1);m=p.join(d,/plugin.json/.source);try{if(f.existsSync(s)){if(f.existsSync(m)){if(JSON.parse(f.readFileSync(m,/utf8/.source).trim()).name===n){tg=s}}}}catch{}}}});tg?(process.argv[1]=tg,import(u.pathToFileURL(tg).href).catch(function(){console.log(JSON.stringify({}))})):console.log(JSON.stringify({}))}).catch(function(){console.log(JSON.stringify({}))});//'",
         "timeout": 5
       }
     ]

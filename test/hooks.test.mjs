@@ -1184,3 +1184,58 @@ test("unwrapUserRequestText strips <ADDITIONAL_METADATA> so expanded slash promp
   );
   assert.deepEqual(out, {});
 });
+
+test("hooks.json cross-workspace bootstrapper executes all 4 hooks cleanly from a foreign workspace CWD", () => {
+  const dir = makeTmpDir("agy-cmd-foreign-cwd-");
+  const foreignWs = path.join(dir, "business-repo");
+  const stateDir = path.join(dir, "state");
+  fs.mkdirSync(foreignWs, { recursive: true });
+  fs.mkdirSync(stateDir, { recursive: true });
+
+  const hooksCfg = JSON.parse(fs.readFileSync(path.join(PLUGIN_ROOT, "hooks.json"), "utf8"));
+  const spec = hooksCfg["agy-cmd-router"];
+  const env = {
+    ...process.env,
+    PLUGIN_ROOT,
+    PLUGIN_DATA: stateDir,
+    AGY_CMD_STATE_DIR: "",
+    ANTIGRAVITY_PARENT_CONVERSATION_ID: "",
+    ANTIGRAVITY_SUBAGENT: ""
+  };
+
+  for (const [evName, cmdStr, payload, checkFn] of [
+    ["SessionStart", spec.SessionStart[0].command, { conversationId: "xcwd-1" }, (o) => typeof o === "object"],
+    [
+      "PostToolUse",
+      spec.PostToolUse[0].hooks[0].command,
+      { conversationId: "xcwd-1", toolCall: { name: "run_command", args: { CommandLine: "pytest" } }, error: "exit 1" },
+      (o) => Object.keys(o).length === 0
+    ],
+    [
+      "PreInvocation",
+      spec.PreInvocation[0].command,
+      { conversationId: "xcwd-1", invocationNum: 0, initialNumSteps: 1, lastUserInput: "你好" },
+      (o) => typeof o === "object"
+    ],
+    [
+      "Stop",
+      spec.Stop[0].command,
+      { conversationId: "xcwd-1", terminationReason: "IDLE_READY", fullyIdle: true },
+      (o) => o.decision === "allow"
+    ]
+  ]) {
+    const res = spawnSync(cmdStr, {
+      shell: true,
+      cwd: foreignWs,
+      input: JSON.stringify(payload),
+      encoding: "utf8",
+      timeout: 5000,
+      windowsHide: true,
+      env
+    });
+    assert.equal(res.status, 0, `${evName} failed from foreign CWD: ${res.stderr}`);
+    assert.equal(res.stderr, "", `${evName} emitted unexpected stderr: ${res.stderr}`);
+    const parsed = JSON.parse(res.stdout.trim());
+    assert.ok(checkFn(parsed), `${evName} unexpected output: ${res.stdout}`);
+  }
+});

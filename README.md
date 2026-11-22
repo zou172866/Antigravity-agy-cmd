@@ -8,20 +8,25 @@
 
 需要电脑已安装 Google Antigravity 桌面版、Node.js（20 及以上版本）和 Python 3。
 
-打开终端，复制对应系统的两行命令运行，完成后重启或刷新 Antigravity 窗口即可使用。
+打开终端，复制对应系统的一行命令运行，完成后重启或刷新 Antigravity 窗口即可使用。
 
-**Windows（PowerShell）：**
+**Windows（PowerShell 一行直装）：**
+
+```powershell
+irm https://raw.githubusercontent.com/zou172866/agy-cmd/main/install.ps1 | iex
+```
+
+**macOS / Linux（一行直装）：**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/zou172866/agy-cmd/main/install.sh | sh
+```
+
+也可以手动克隆仓库安装：
 
 ```powershell
 git clone https://github.com/zou172866/agy-cmd "$HOME\.gemini\config\plugins\agy-cmd"
 python "$HOME\.gemini\config\plugins\agy-cmd\skills\agy-cmd\scripts\setup_auto_router.py" --install
-```
-
-**macOS / Linux：**
-
-```bash
-git clone https://github.com/zou172866/agy-cmd ~/.gemini/config/plugins/agy-cmd
-python3 ~/.gemini/config/plugins/agy-cmd/skills/agy-cmd/scripts/setup_auto_router.py --install
 ```
 
 如果只安装基础文字规则（不含自动重试和右侧面板），可以运行：

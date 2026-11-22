@@ -420,6 +420,17 @@ class TestStarFollowupCliAndState(unittest.TestCase):
         script_src = SCRIPT_PATH.read_text(encoding="utf-8")
         self.assertNotRegex(script_src, r"\binput\s*\(")
 
+    def test_validate_hooks_json_detects_missing_script_inside_polyglot_bootstrap(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            p_dir = Path(tmp) / "agy-cmd"
+            self._create_valid_plugin_skeleton(p_dir)
+            real_hooks = HOOKS_JSON_PATH.read_text(encoding="utf-8")
+            (p_dir / "hooks.json").write_text(real_hooks, encoding="utf-8")
+            self.assertEqual(router.validate_hooks_json(p_dir, p_dir / "hooks.json"), [])
+            (p_dir / "hooks" / "stop.mjs").unlink()
+            issues = router.validate_hooks_json(p_dir, p_dir / "hooks.json")
+            self.assertTrue(any("stop.mjs" in item for item in issues), f"Expected missing stop.mjs issue, got {issues}")
+
 
 if __name__ == "__main__":
     unittest.main()
