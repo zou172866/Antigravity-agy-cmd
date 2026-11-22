@@ -86,9 +86,9 @@ python skills/agy-cmd/scripts/setup_auto_router.py --remove
 ## 自检与测试
 
 - 运行依赖：Google Antigravity 桌面端 App / IDE、Node.js ≥ 20、Python 3
-- 执行全套单元测试（42 项钩子、面板安全与 CLI 测试）：
+- 执行全套单元测试（钩子、面板安全、Star 里程碑与 CLI 测试）：
   ```bash
-  node --test test/hooks.test.mjs test/sidecar.test.mjs
+  node --test test/hooks.test.mjs test/sidecar.test.mjs test/star-prompt.test.mjs
   python -m unittest discover -s test -p "test_*.py" -v
   ```
 

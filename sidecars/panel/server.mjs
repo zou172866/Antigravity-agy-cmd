@@ -46,42 +46,75 @@ export function renderPanelHtml(csrfToken = "") {
 
 function readJsonBody(req, maxBytes = MAX_BODY_BYTES) {
   return new Promise((resolve) => {
+    let settled = false;
+    const finish = (val) => {
+      if (settled) return;
+      settled = true;
+      resolve(val);
+    };
+
+    const declaredLenRaw = req.headers?.["content-length"];
+    if (declaredLenRaw !== undefined) {
+      const declaredLen = Number(declaredLenRaw);
+      if (Number.isFinite(declaredLen) && declaredLen > maxBytes) {
+        req.on("error", () => {});
+        try {
+          req.pause();
+        } catch {}
+        finish({ ok: false, status: 413, error: "Payload too large" });
+        return;
+      }
+    }
+
     let raw = "";
     let bytes = 0;
     let overflow = false;
     req.setEncoding("utf8");
     req.on("data", (chunk) => {
+      if (settled || overflow) return;
       bytes += Buffer.byteLength(chunk, "utf8");
       if (bytes > maxBytes) {
         overflow = true;
-        req.destroy();
+        raw = "";
+        try {
+          req.pause();
+        } catch {}
+        finish({ ok: false, status: 413, error: "Payload too large" });
         return;
       }
       raw += chunk;
     });
     req.on("end", () => {
-      if (overflow) {
-        resolve({ ok: false, status: 413, error: "Payload too large" });
-        return;
-      }
+      if (settled || overflow) return;
       if (!raw.trim()) {
-        resolve({ ok: true, data: {} });
+        finish({ ok: true, data: {} });
         return;
       }
       try {
         const parsed = JSON.parse(raw);
         if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-          resolve({ ok: false, status: 400, error: "Request body must be a JSON object" });
+          finish({ ok: false, status: 400, error: "Request body must be a JSON object" });
           return;
         }
-        resolve({ ok: true, data: parsed });
+        finish({ ok: true, data: parsed });
       } catch {
-        resolve({ ok: false, status: 400, error: "Malformed JSON body" });
+        finish({ ok: false, status: 400, error: "Malformed JSON body" });
       }
     });
     req.on("error", () => {
-      resolve({ ok: false, status: 400, error: "Request stream error" });
+      finish({ ok: false, status: 400, error: "Request stream error" });
     });
+  });
+}
+
+function scheduleOversizedSocketClose(req, res) {
+  res.once("finish", () => {
+    const closeTimer = setTimeout(() => {
+      try {
+        req.destroy();
+      } catch {}
+    }, 150);
+    closeTimer.unref?.();
   });
 }
 
@@ -89,10 +122,11 @@ export function createStandaloneServer({
   stateDir = resolveStateDir(process.env),
   csrfToken = crypto.randomBytes(24).toString("hex")
 } = {}) {
-  const sendJson = (res, status, payload) => {
+  const sendJson = (res, status, payload, extraHeaders = {}) => {
     res.writeHead(status, {
       "Content-Type": "application/json; charset=utf-8",
-      ...NO_STORE_HEADERS
+      ...NO_STORE_HEADERS,
+      ...extraHeaders
     });
     res.end(JSON.stringify(payload));
   };
@@ -126,7 +160,7 @@ export function createStandaloneServer({
 
     if (url.pathname.startsWith("/api/")) {
       if (req.method !== "POST") {
-        sendJson(res, 405, { ok: false, error: "Method Not Allowed (use POST)" });
+        sendJson(res, 405, { ok: false, error: "Method Not Allowed (use POST)" }, { Allow: "POST" });
         return;
       }
       const providedToken = String(req.headers["x-agy-cmd-csrf"] || "");
@@ -134,9 +168,22 @@ export function createStandaloneServer({
         sendJson(res, 401, { ok: false, error: "Invalid or missing CSRF token" });
         return;
       }
+      const contentType = String(req.headers["content-type"] || "").trim();
+      if (!/^application\/json(?:\s*;.*)?$/i.test(contentType)) {
+        sendJson(res, 415, { ok: false, error: "Unsupported Media Type (expected application/json)" });
+        return;
+      }
       const parsed = await readJsonBody(req);
       if (!parsed.ok) {
-        sendJson(res, parsed.status, { ok: false, error: parsed.error });
+        if (parsed.status === 413) {
+          scheduleOversizedSocketClose(req, res);
+        }
+        sendJson(
+          res,
+          parsed.status,
+          { ok: false, error: parsed.error },
+          parsed.status === 413 ? { Connection: "close" } : {}
+        );
         return;
       }
       const out = dispatchPanelApi(url.pathname, parsed.data, { stateDir });
@@ -147,6 +194,58 @@ export function createStandaloneServer({
     res.writeHead(404, NO_STORE_HEADERS);
     res.end("Not Found");
   });
+}
+
+export function registerSidecarRoutes(
+  app,
+  {
+    stateDir = resolveStateDir(process.env),
+    csrfToken = "",
+    SidecarResponse = null
+  } = {}
+) {
+  const wrapJson = (out) => {
+    const serialized = JSON.stringify(out.body);
+    if (SidecarResponse) {
+      return new SidecarResponse(serialized, {
+        status: out.status,
+        contentType: "application/json; charset=utf-8",
+        headers: NO_STORE_HEADERS
+      });
+    }
+    if (out.status >= 400) {
+      return { ...out.body, status: out.status };
+    }
+    return out.body;
+  };
+
+  if (typeof app.page === "function") {
+    app.page("/", () => {
+      const html = renderPanelHtml(csrfToken);
+      if (SidecarResponse) {
+        return new SidecarResponse(html, {
+          status: 200,
+          contentType: "text/html; charset=utf-8",
+          headers: NO_STORE_HEADERS
+        });
+      }
+      return html;
+    });
+  }
+
+  for (const route of ["/api/state", "/api/settings", "/api/dismiss-onboarding", "/api/star-prompt"]) {
+    app.api(
+      route,
+      (rawData) =>
+        wrapJson(
+          dispatchPanelApi(route, rawData, {
+            stateDir,
+            defaultConvId: app.config?.conversationId || ""
+          })
+        ),
+      "POST"
+    );
+  }
 }
 
 function shouldUseSidecarSdk(env, hasSidecarApp) {
@@ -195,44 +294,7 @@ async function start() {
     reloadTimer.unref?.();
 
     const app = new SidecarApp();
-    const wrapJson = (out) => {
-      const serialized = JSON.stringify(out.body);
-      if (SidecarResponse) {
-        return new SidecarResponse(serialized, {
-          status: out.status,
-          contentType: "application/json; charset=utf-8",
-          headers: NO_STORE_HEADERS
-        });
-      }
-      return out.body;
-    };
-
-    app.page("/", () => {
-      const html = renderPanelHtml(csrfToken);
-      if (SidecarResponse) {
-        return new SidecarResponse(html, {
-          status: 200,
-          contentType: "text/html; charset=utf-8",
-          headers: NO_STORE_HEADERS
-        });
-      }
-      return html;
-    });
-
-    for (const route of ["/api/state", "/api/settings", "/api/dismiss-onboarding"]) {
-      app.api(
-        route,
-        (rawData) =>
-          wrapJson(
-            dispatchPanelApi(route, rawData, {
-              stateDir,
-              defaultConvId: app.config?.conversationId || ""
-            })
-          ),
-        "POST"
-      );
-    }
-
+    registerSidecarRoutes(app, { stateDir, csrfToken, SidecarResponse });
     await app.run();
     return;
   }

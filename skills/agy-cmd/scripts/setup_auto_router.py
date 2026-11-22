@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -17,6 +18,11 @@ RULE_FILENAME = "agy-auto-router.md"
 MIN_RETRY_MAX = 1
 MAX_RETRY_MAX = 50
 DEFAULT_RETRY_MAX = 3
+
+GITHUB_REPO_URL = "https://github.com/zou172866/agy-cmd"
+GH_STAR_COMMAND = "gh api -X PUT /user/starred/zou172866/agy-cmd"
+GH_AUTH_CHECK_TIMEOUT_SEC = 1.5
+STAR_PROMPT_STATES = ("pending", "clicked", "dismissed", "copied_cli")
 
 RULE_FRONTMATTER = """---
 trigger: always_on
@@ -105,6 +111,112 @@ def save_json_atomic(file_path: Path, data: dict) -> None:
         raise
 
 
+def is_gh_cli_authenticated(
+    *,
+    bin_name: str = "gh",
+    args: tuple[str, ...] | list[str] = ("auth", "status"),
+    timeout_sec: float = GH_AUTH_CHECK_TIMEOUT_SEC,
+    env: dict[str, str] | None = None,
+) -> bool:
+    try:
+        raw_timeout = float(timeout_sec)
+    except (TypeError, ValueError):
+        raw_timeout = GH_AUTH_CHECK_TIMEOUT_SEC
+    effective_timeout = (
+        min(GH_AUTH_CHECK_TIMEOUT_SEC, max(0.05, raw_timeout))
+        if raw_timeout > 0
+        else GH_AUTH_CHECK_TIMEOUT_SEC
+    )
+    base_env = dict(os.environ if env is None else env)
+    base_env["GH_PROMPT_DISABLED"] = "1"
+    base_env["NO_COLOR"] = "1"
+    run_kwargs: dict = {
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+        "timeout": effective_timeout,
+        "env": base_env,
+        "check": False,
+    }
+    if os.name == "nt":
+        run_kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    try:
+        res = subprocess.run([bin_name, *args], **run_kwargs)
+        return bool(res.returncode == 0)
+    except Exception:
+        return False
+
+
+def print_star_followup_hint(
+    *,
+    mode: str = "install",
+    gh_authenticated: bool | None = None,
+) -> None:
+    is_authed = is_gh_cli_authenticated() if gh_authenticated is None else bool(gh_authenticated)
+    if mode in ("check", "status", "doctor"):
+        print(f"[agy-cmd] 自检通过 · 追踪兼容性更新或点 Star：{GITHUB_REPO_URL}")
+        if is_authed:
+            print(f"[agy-cmd] 检测到已登录 GitHub CLI（可手动点 Star）：{GH_STAR_COMMAND}")
+        return
+    print()
+    print("[agy-cmd] Antigravity 更新频繁，去 GitHub 点 Star / Watch Releases 防升级失效：")
+    print(f"          {GITHUB_REPO_URL}")
+    if is_authed:
+        print("[agy-cmd] 检测到已登录 GitHub CLI，也可随时在终端手动执行点 Star：")
+        print(f"          {GH_STAR_COMMAND}")
+
+
+def normalize_star_prompt_state(raw: object) -> dict:
+    defaults = {
+        "state": "pending",
+        "triggeredAt": None,
+        "resolvedAt": None,
+        "milestoneAutoRetries": 0,
+    }
+    obj = raw
+    if isinstance(raw, str):
+        trimmed = raw.strip()
+        if not trimmed:
+            return dict(defaults)
+        try:
+            obj = json.loads(trimmed)
+        except Exception:
+            return dict(defaults)
+    if not isinstance(obj, dict):
+        return dict(defaults)
+    src = obj.get("starPrompt") if "starPrompt" in obj else obj
+    if not isinstance(src, dict):
+        return dict(defaults)
+    raw_state = src.get("state")
+    state = raw_state if isinstance(raw_state, str) and raw_state in STAR_PROMPT_STATES else "pending"
+
+    def _norm_iso(val: object) -> str | None:
+        if not isinstance(val, str):
+            return None
+        t = val.strip()
+        return t if t and len(t) <= 64 else None
+
+    milestone = 0
+    raw_count = src.get("milestoneAutoRetries")
+    if isinstance(raw_count, (int, float)) and not isinstance(raw_count, bool):
+        if raw_count >= 0:
+            milestone = int(raw_count)
+    elif isinstance(raw_count, str) and raw_count.strip():
+        try:
+            parsed_num = float(raw_count.strip())
+            if parsed_num >= 0:
+                milestone = int(parsed_num)
+        except ValueError:
+            pass
+
+    return {
+        "state": state,
+        "triggeredAt": _norm_iso(src.get("triggeredAt")),
+        "resolvedAt": _norm_iso(src.get("resolvedAt")),
+        "milestoneAutoRetries": milestone,
+    }
+
+
 def default_settings() -> dict:
     return {
         "version": 2,
@@ -122,6 +234,7 @@ def default_settings() -> dict:
             "lastAutoRetryAt": "",
             "lastAutoRetryConvId": "",
         },
+        "starPrompt": normalize_star_prompt_state(None),
         "updatedAt": "",
     }
 
@@ -134,9 +247,10 @@ def load_settings(state_dir: Path) -> dict:
     try:
         raw = json.loads(settings_path.read_text(encoding="utf-8"))
         if isinstance(raw, dict):
-            base.update({k: v for k, v in raw.items() if k != "stats"})
+            base.update({k: v for k, v in raw.items() if k not in ("stats", "starPrompt")})
             if isinstance(raw.get("stats"), dict):
                 base["stats"].update(raw["stats"])
+            base["starPrompt"] = normalize_star_prompt_state(raw.get("starPrompt"))
             if (
                 raw.get("version") == 1
                 and raw.get("configuredByUser") is False
@@ -151,6 +265,7 @@ def load_settings(state_dir: Path) -> dict:
     if base.get("planTier") != "paid":
         base["planTier"] = "free"
         base["boostEnabled"] = False
+    base["starPrompt"] = normalize_star_prompt_state(base.get("starPrompt"))
     return base
 
 
@@ -447,6 +562,11 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="可选：指定自定义插件状态目录（默认使用 PLUGIN_DATA）",
     )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="以纯 JSON 格式输出 --status 或 --sync-check 结果（不包含文本提示）",
+    )
     args = parser.parse_args(argv)
 
     has_settings_mutation = any(
@@ -474,8 +594,9 @@ def main(argv: list[str] | None = None) -> int:
             plan_tier=args.plan_tier,
             boost_flag=args.boost,
         )
-        print(f"已更新 agy-cmd 运行设置（{state_dir / 'settings.json'}）：")
-        print(f"  {format_settings_summary(updated)}")
+        if not (args.json and (args.status or args.sync_check)):
+            print(f"已更新 agy-cmd 运行设置（{state_dir / 'settings.json'}）：")
+            print(f"  {format_settings_summary(updated)}")
         if not has_lifecycle_action:
             return 0
 
@@ -488,6 +609,31 @@ def main(argv: list[str] | None = None) -> int:
             ) == normalize_lf(RULE_BODY)
             hook_issues = validate_hooks_json(plugin_dir, plugin_hooks_path)
             sidecar_issues = validate_sidecar(plugin_dir)
+            warnings = list(hook_issues) + list(sidecar_issues)
+            if cfg_warning:
+                warnings.insert(0, cfg_warning)
+            if standalone_rule_path.is_file():
+                warnings.append(f"检测到旧版独立规则，可能造成重复注入：{standalone_rule_path}")
+            if legacy_skill_path.is_file():
+                warnings.append(f"检测到旧版独立 Skill，可能造成重复加载：{legacy_skill_path.parent}")
+            healthy = bool(enabled and rule_ok and not warnings)
+            if args.json:
+                print(
+                    json.dumps(
+                        {
+                            "ok": healthy,
+                            "installed": True,
+                            "mode": "plugin",
+                            "enabled": enabled,
+                            "ruleSynced": rule_ok,
+                            "pluginDir": str(plugin_dir),
+                            "issues": warnings,
+                            "settings": settings,
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+                return 0
             print(f"模式：正式插件（{plugin_dir}）")
             print(f"插件状态：{'已启用' if enabled else '已停用'}")
             if cfg_warning:
@@ -508,13 +654,47 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"警告：检测到旧版独立规则，可能造成重复注入：{standalone_rule_path}")
             if legacy_skill_path.is_file():
                 print(f"警告：检测到旧版独立 Skill，可能造成重复加载：{legacy_skill_path.parent}")
+            if healthy:
+                print_star_followup_hint(mode="status")
             return 0
         if standalone_rule_path.is_file():
             synced = normalize_lf(standalone_rule_path.read_text(encoding="utf-8")) == normalize_lf(
                 RULE_CONTENT
             )
+            if args.json:
+                print(
+                    json.dumps(
+                        {
+                            "ok": synced,
+                            "installed": True,
+                            "mode": "standalone",
+                            "enabled": True,
+                            "ruleSynced": synced,
+                            "rulePath": str(standalone_rule_path),
+                            "issues": [] if synced else [f"独立规则存在漂移：{standalone_rule_path}"],
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+                return 0
             print(
                 f"模式：独立规则 | 状态：已启用（{'已同步' if synced else '存在漂移'}，{standalone_rule_path}）"
+            )
+            if synced:
+                print_star_followup_hint(mode="status")
+            return 0
+        if args.json:
+            print(
+                json.dumps(
+                    {
+                        "ok": False,
+                        "installed": False,
+                        "mode": None,
+                        "enabled": False,
+                        "issues": [f"未检测到插件 {plugin_dir} 或独立规则 {standalone_rule_path}"],
+                    },
+                    ensure_ascii=False,
+                )
             )
             return 0
         print(f"状态：未启用（未检测到插件 {plugin_dir} 或独立规则 {standalone_rule_path}）")
@@ -535,21 +715,77 @@ def main(argv: list[str] | None = None) -> int:
                 issues.append(f"存在重复的旧版独立 Skill：{legacy_skill_path.parent}")
             issues.extend(validate_hooks_json(plugin_dir, plugin_hooks_path))
             issues.extend(validate_sidecar(plugin_dir))
+            if args.json:
+                print(
+                    json.dumps(
+                        {
+                            "ok": len(issues) == 0,
+                            "installed": True,
+                            "mode": "plugin",
+                            "pluginDir": str(plugin_dir),
+                            "issues": issues,
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+                return 2 if issues else 0
             if issues:
                 for item in issues:
                     print(f"FAIL：{item}")
                 return 2
             print(f"OK：插件规则、钩子与右侧面板均已零漂移同步且无重复加载（{plugin_rule_path}）")
+            print_star_followup_hint(mode="check")
             return 0
 
         if not standalone_rule_path.is_file():
+            if args.json:
+                print(
+                    json.dumps(
+                        {
+                            "ok": False,
+                            "installed": False,
+                            "mode": "standalone",
+                            "issues": [f"独立规则不存在：{standalone_rule_path}"],
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+                return 1
             print(f"FAIL：独立规则不存在：{standalone_rule_path}")
             return 1
         disk = normalize_lf(standalone_rule_path.read_text(encoding="utf-8"))
         if disk != normalize_lf(RULE_CONTENT):
+            if args.json:
+                print(
+                    json.dumps(
+                        {
+                            "ok": False,
+                            "installed": True,
+                            "mode": "standalone",
+                            "issues": [f"独立规则与脚本 RULE_CONTENT 存在漂移：{standalone_rule_path}"],
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+                return 2
             print(f"FAIL：独立规则与脚本 RULE_CONTENT 存在漂移：{standalone_rule_path}")
             return 2
+        if args.json:
+            print(
+                json.dumps(
+                    {
+                        "ok": True,
+                        "installed": True,
+                        "mode": "standalone",
+                        "rulePath": str(standalone_rule_path),
+                        "issues": [],
+                    },
+                    ensure_ascii=False,
+                )
+            )
+            return 0
         print(f"OK：独立规则已零漂移同步（{standalone_rule_path}）")
+        print_star_followup_hint(mode="check")
         return 0
 
     if args.remove:
@@ -585,6 +821,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"已清理旧版独立 Skill 以防重复加载：{removed_skill}")
             print()
             print(POST_INSTALL_REMINDER)
+            print_star_followup_hint(mode="install")
             return 0
 
         standalone_rule_path.parent.mkdir(parents=True, exist_ok=True)
@@ -593,6 +830,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"已启用全局常驻自动路由规则（独立模式）：{standalone_rule_path}")
         if synced:
             print(f"已同步桌面端 Skill 目录：{synced}")
+        print_star_followup_hint(mode="install")
         return 0
 
     return 1

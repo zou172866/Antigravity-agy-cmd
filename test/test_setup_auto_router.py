@@ -210,5 +210,182 @@ class TestSetupAutoRouterCLI(unittest.TestCase):
             self.assertEqual(bad_cfg.read_text(encoding="utf-8"), "{broken json")
 
 
+class TestStarFollowupCliAndState(unittest.TestCase):
+    def _create_valid_plugin_skeleton(self, p_dir: Path) -> None:
+        TestSetupAutoRouterCLI()._create_valid_plugin_skeleton(p_dir)
+
+    def test_normalize_star_prompt_state_and_settings_preservation(self) -> None:
+        for bad in (None, "", "{bad", [], {"starPrompt": "bad"}, {"state": "evil", "milestoneAutoRetries": -3, "milestone": True}):
+            self.assertEqual(
+                router.normalize_star_prompt_state(bad),
+                {
+                    "state": "pending",
+                    "triggeredAt": None,
+                    "resolvedAt": None,
+                    "milestoneAutoRetries": 0,
+                },
+            )
+        self.assertEqual(
+            router.normalize_star_prompt_state(
+                {
+                    "starPrompt": {
+                        "state": "copied_cli",
+                        "triggeredAt": "2026-11-22T01:00:00Z",
+                        "resolvedAt": "2026-11-22T01:05:00Z",
+                        "milestoneAutoRetries": 4,
+                    }
+                }
+            ),
+            {
+                "state": "copied_cli",
+                "triggeredAt": "2026-11-22T01:00:00Z",
+                "resolvedAt": "2026-11-22T01:05:00Z",
+                "milestoneAutoRetries": 4,
+            },
+        )
+        # Bool must not be coerced to milestoneAutoRetries=1
+        self.assertEqual(
+            router.normalize_star_prompt_state({"milestoneAutoRetries": True})["milestoneAutoRetries"],
+            0,
+        )
+
+    def test_gh_cli_auth_timeout_fail_open_and_followup_hint_formatting(self) -> None:
+        import io
+        import time
+        from contextlib import redirect_stdout
+
+        self.assertFalse(router.is_gh_cli_authenticated(bin_name="definitely-missing-gh-xyz-999"))
+        self.assertFalse(
+            router.is_gh_cli_authenticated(bin_name=sys.executable, args=["-c", "import sys; sys.exit(1)"])
+        )
+        self.assertTrue(
+            router.is_gh_cli_authenticated(bin_name=sys.executable, args=["-c", "import sys; sys.exit(0)"])
+        )
+
+        t0 = time.monotonic()
+        slow = router.is_gh_cli_authenticated(
+            bin_name=sys.executable,
+            args=["-c", "import time; time.sleep(5)"],
+            timeout_sec=0.2,
+        )
+        elapsed = time.monotonic() - t0
+        self.assertFalse(slow)
+        self.assertLess(elapsed, 1.5)
+
+        buf_no_gh = io.StringIO()
+        with redirect_stdout(buf_no_gh):
+            router.print_star_followup_hint(mode="install", gh_authenticated=False)
+        self.assertIn(router.GITHUB_REPO_URL, buf_no_gh.getvalue())
+        self.assertNotIn(router.GH_STAR_COMMAND, buf_no_gh.getvalue())
+
+        buf_with_gh = io.StringIO()
+        with redirect_stdout(buf_with_gh):
+            router.print_star_followup_hint(mode="check", gh_authenticated=True)
+        self.assertIn(router.GITHUB_REPO_URL, buf_with_gh.getvalue())
+        self.assertIn(router.GH_STAR_COMMAND, buf_with_gh.getvalue())
+
+    def test_stripped_path_install_check_status_json_isolation_and_non_interactive(self) -> None:
+        import os
+
+        stripped_env = dict(os.environ)
+        stripped_env.pop("PATH", None)
+        stripped_env.pop("Path", None)
+        py_dir = str(Path(sys.executable).resolve().parent)
+        stripped_env["PATH"] = py_dir
+        if os.name == "nt":
+            stripped_env["Path"] = py_dir
+
+        def run_stripped(*cli_args: str) -> subprocess.CompletedProcess[str]:
+            return subprocess.run(
+                [sys.executable, str(SCRIPT_PATH), *cli_args],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                env=stripped_env,
+                check=False,
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_dir = Path(tmp) / "cfg"
+            st_dir = Path(tmp) / "state"
+            p_dir = cfg_dir / "plugins" / "agy-cmd"
+            self._create_valid_plugin_skeleton(p_dir)
+
+            # 1. Failing --sync-check omits Star hint; --sync-check --json emits valid JSON
+            fail_chk = run_stripped("--sync-check", "--config-dir", str(cfg_dir))
+            self.assertEqual(fail_chk.returncode, 2)
+            self.assertNotIn(router.GITHUB_REPO_URL, fail_chk.stdout)
+
+            fail_json = run_stripped("--sync-check", "--json", "--config-dir", str(cfg_dir))
+            self.assertEqual(fail_json.returncode, 2)
+            parsed_fail = json.loads(fail_json.stdout)
+            self.assertFalse(parsed_fail["ok"])
+            self.assertNotIn(router.GITHUB_REPO_URL, fail_json.stdout)
+
+            # 2. --install prints GitHub URL exactly once and omits gh command when gh is absent
+            inst = run_stripped("--install", "--config-dir", str(cfg_dir), "--state-dir", str(st_dir))
+            self.assertEqual(inst.returncode, 0, inst.stderr)
+            self.assertEqual(inst.stdout.count(router.GITHUB_REPO_URL), 1)
+            self.assertNotIn(router.GH_STAR_COMMAND, inst.stdout)
+
+            # 3. Passing --sync-check & healthy --status print Star hint; --json stays strictly pure JSON
+            ok_chk = run_stripped("--sync-check", "--config-dir", str(cfg_dir))
+            self.assertEqual(ok_chk.returncode, 0, ok_chk.stderr)
+            self.assertEqual(ok_chk.stdout.count(router.GITHUB_REPO_URL), 1)
+            self.assertNotIn(router.GH_STAR_COMMAND, ok_chk.stdout)
+
+            ok_chk_json = run_stripped("--sync-check", "--json", "--config-dir", str(cfg_dir))
+            self.assertEqual(ok_chk_json.returncode, 0)
+            self.assertTrue(json.loads(ok_chk_json.stdout)["ok"])
+            self.assertNotIn(router.GITHUB_REPO_URL, ok_chk_json.stdout)
+
+            ok_st = run_stripped("--status", "--config-dir", str(cfg_dir), "--state-dir", str(st_dir))
+            self.assertEqual(ok_st.returncode, 0)
+            self.assertEqual(ok_st.stdout.count(router.GITHUB_REPO_URL), 1)
+
+            ok_st_json = run_stripped("--status", "--json", "--config-dir", str(cfg_dir), "--state-dir", str(st_dir))
+            self.assertEqual(ok_st_json.returncode, 0)
+            self.assertTrue(json.loads(ok_st_json.stdout)["ok"])
+            self.assertNotIn(router.GITHUB_REPO_URL, ok_st_json.stdout)
+
+            # 4. Settings mutation & --remove never spam Star hint, and preserve terminal starPrompt
+            st_dir.mkdir(parents=True, exist_ok=True)
+            (st_dir / "settings.json").write_text(
+                json.dumps(
+                    {
+                        "version": 2,
+                        "planTier": "free",
+                        "starPrompt": {
+                            "state": "dismissed",
+                            "triggeredAt": "2026-11-22T00:00:00Z",
+                            "resolvedAt": "2026-11-22T00:01:00Z",
+                            "milestoneAutoRetries": 3,
+                        },
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            mut = run_stripped("--auto-retry", "4", "--state-dir", str(st_dir))
+            self.assertEqual(mut.returncode, 0)
+            self.assertNotIn(router.GITHUB_REPO_URL, mut.stdout)
+            saved_after = json.loads((st_dir / "settings.json").read_text(encoding="utf-8"))
+            self.assertEqual(saved_after["starPrompt"]["state"], "dismissed")
+
+            rem = run_stripped("--remove", "--config-dir", str(cfg_dir))
+            self.assertEqual(rem.returncode, 0)
+            self.assertNotIn(router.GITHUB_REPO_URL, rem.stdout)
+
+            # 5. Disabled plugin --status omits Star hint
+            disabled_st = run_stripped("--status", "--config-dir", str(cfg_dir), "--state-dir", str(st_dir))
+            self.assertEqual(disabled_st.returncode, 0)
+            self.assertNotIn(router.GITHUB_REPO_URL, disabled_st.stdout)
+
+        # Static non-interactive guarantee
+        script_src = SCRIPT_PATH.read_text(encoding="utf-8")
+        self.assertNotRegex(script_src, r"\binput\s*\(")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -7,6 +7,12 @@ export const MAX_RETRY_MAX = 50;
 export const DEFAULT_RETRY_MAX = 3;
 export const SETTINGS_VERSION = 2;
 
+export const GITHUB_REPO_URL = "https://github.com/zou172866/agy-cmd";
+export const GH_STAR_COMMAND = "gh api -X PUT /user/starred/zou172866/agy-cmd";
+export const STAR_PROMPT_STATES = Object.freeze(["pending", "clicked", "dismissed", "copied_cli"]);
+export const STAR_PROMPT_TERMINAL_STATES = Object.freeze(["clicked", "dismissed", "copied_cli"]);
+export const STAR_PROMPT_MIN_AUTO_RETRIES = 3;
+
 export const VALID_RETRY_MODES = new Set(["off", "count", "infinite"]);
 export const VALID_RETRY_SCOPES = new Set(["smart", "all_failures", "goal_only"]);
 export const VALID_PLAN_TIERS = new Set(["free", "paid"]);
@@ -58,7 +64,66 @@ export function createDefaultSettings() {
       lastAutoRetryAt: "",
       lastAutoRetryConvId: ""
     },
+    starPrompt: {
+      state: "pending",
+      triggeredAt: null,
+      resolvedAt: null,
+      milestoneAutoRetries: 0
+    },
     updatedAt: ""
+  };
+}
+
+export function normalizeStarPromptState(raw) {
+  const defaults = {
+    state: "pending",
+    triggeredAt: null,
+    resolvedAt: null,
+    milestoneAutoRetries: 0
+  };
+  let obj = raw;
+  if (typeof raw === "string") {
+    const trimmed = raw.trim();
+    if (!trimmed) return { ...defaults };
+    try {
+      obj = JSON.parse(trimmed);
+    } catch {
+      return { ...defaults };
+    }
+  }
+  if (!obj || typeof obj !== "object" || Array.isArray(obj)) {
+    return { ...defaults };
+  }
+  let src = obj;
+  if (Object.prototype.hasOwnProperty.call(obj, "starPrompt")) {
+    src =
+      obj.starPrompt && typeof obj.starPrompt === "object" && !Array.isArray(obj.starPrompt)
+        ? obj.starPrompt
+        : null;
+  }
+  if (!src || typeof src !== "object" || Array.isArray(src)) {
+    return { ...defaults };
+  }
+  const state =
+    typeof src.state === "string" && STAR_PROMPT_STATES.includes(src.state) ? src.state : "pending";
+  const normIso = (v) => {
+    if (typeof v !== "string") return null;
+    const t = v.trim();
+    return t && t.length <= 64 ? t : null;
+  };
+  let milestoneAutoRetries = 0;
+  const rawCount = src.milestoneAutoRetries;
+  if (typeof rawCount === "number" || (typeof rawCount === "string" && rawCount.trim() !== "")) {
+    const n = Number(rawCount);
+    if (Number.isFinite(n) && n >= 0) {
+      milestoneAutoRetries = Math.floor(n);
+    }
+  }
+  return {
+    state,
+    triggeredAt: normIso(src.triggeredAt),
+    resolvedAt: normIso(src.resolvedAt),
+    milestoneAutoRetries
   };
 }
 
@@ -152,6 +217,7 @@ export function normalizeSettings(raw = {}) {
       lastAutoRetryConvId:
         typeof rawStats.lastAutoRetryConvId === "string" ? rawStats.lastAutoRetryConvId : ""
     },
+    starPrompt: normalizeStarPromptState(src.starPrompt),
     updatedAt: typeof src.updatedAt === "string" ? src.updatedAt : ""
   };
 }
@@ -188,7 +254,11 @@ export function updateSettings(stateDir, patch = {}, options = {}) {
   }
 
   const current = readSettings(stateDir);
-  const next = { ...current, stats: { ...current.stats } };
+  const next = {
+    ...current,
+    stats: { ...current.stats },
+    starPrompt: normalizeStarPromptState(current.starPrompt)
+  };
 
   if ("planTier" in patch) {
     if (!VALID_PLAN_TIERS.has(patch.planTier)) {
@@ -314,6 +384,96 @@ export function recordAutoRetryStat(stateDir, convId, nowIso = new Date().toISOS
   } catch {
     // Non-critical telemetry; never fail Stop hook
   }
+}
+
+export function evaluateStarPrompt(stateDir, { markTriggered = false, nowIso = null } = {}) {
+  const settings = readSettings(stateDir);
+  const current = normalizeStarPromptState(settings.starPrompt);
+  const totalAutoRetries = Math.max(0, Math.floor(Number(settings.stats?.totalAutoRetries || 0)));
+
+  if (current.state !== "pending") {
+    const milestoneAutoRetries = Math.max(0, Math.floor(Number(current.milestoneAutoRetries || 0)));
+    return {
+      state: current.state,
+      triggeredAt: current.triggeredAt,
+      resolvedAt: current.resolvedAt,
+      milestoneAutoRetries,
+      shouldShow: false,
+      triggerReason: null,
+      totalAutoRetries,
+      thresholds: {
+        minAutoRetries: STAR_PROMPT_MIN_AUTO_RETRIES
+      }
+    };
+  }
+
+  const milestoneReached = totalAutoRetries >= STAR_PROMPT_MIN_AUTO_RETRIES;
+  const shouldShow = current.state === "pending" && milestoneReached;
+  const triggerReason = milestoneReached ? "auto_retry_milestone" : null;
+
+  let effective = current;
+  if (shouldShow && markTriggered && !current.triggeredAt) {
+    const ts = typeof nowIso === "string" && nowIso.trim() ? nowIso.trim() : new Date().toISOString();
+    const next = {
+      state: "pending",
+      triggeredAt: ts,
+      resolvedAt: null,
+      milestoneAutoRetries: Math.max(current.milestoneAutoRetries, totalAutoRetries)
+    };
+    try {
+      writeSettings(stateDir, { ...settings, starPrompt: next });
+      effective = next;
+    } catch {
+      effective = next;
+    }
+  }
+
+  return {
+    state: effective.state,
+    triggeredAt: effective.triggeredAt,
+    resolvedAt: effective.resolvedAt,
+    milestoneAutoRetries: effective.milestoneAutoRetries,
+    shouldShow,
+    triggerReason,
+    totalAutoRetries,
+    thresholds: {
+      minAutoRetries: STAR_PROMPT_MIN_AUTO_RETRIES
+    }
+  };
+}
+
+export function setStarPromptState(stateDir, nextState, { nowIso = null } = {}) {
+  if (typeof nextState !== "string" || !STAR_PROMPT_TERMINAL_STATES.includes(nextState)) {
+    return {
+      ok: false,
+      error: "Invalid 'state' value: expected 'clicked', 'dismissed', or 'copied_cli'"
+    };
+  }
+
+  const settings = readSettings(stateDir);
+  const current = normalizeStarPromptState(settings.starPrompt);
+  if (current.state !== "pending") {
+    return {
+      ok: true,
+      starPrompt: evaluateStarPrompt(stateDir, { markTriggered: false }),
+      alreadyResolved: true
+    };
+  }
+
+  const ts = typeof nowIso === "string" && nowIso.trim() ? nowIso.trim() : new Date().toISOString();
+  const totalAutoRetries = Math.max(0, Math.floor(Number(settings.stats?.totalAutoRetries || 0)));
+  const saved = {
+    state: nextState,
+    triggeredAt: current.triggeredAt || ts,
+    resolvedAt: ts,
+    milestoneAutoRetries: Math.max(current.milestoneAutoRetries, totalAutoRetries)
+  };
+  writeSettings(stateDir, { ...settings, starPrompt: saved });
+  return {
+    ok: true,
+    starPrompt: evaluateStarPrompt(stateDir, { markTriggered: false }),
+    alreadyResolved: false
+  };
 }
 
 export function parseChineseOrArabicInt(token) {

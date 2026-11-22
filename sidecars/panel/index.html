@@ -31,6 +31,10 @@
       --warn-soft: #fffbeb;
       --warn-border: #f59e0b;
       --warn-btn-bg: #fef3c7;
+      --star-glyph: #d97706;
+      --btn-primary-bg: #4338ca;
+      --btn-primary-hover: #3730a3;
+      --btn-primary-fg: #ffffff;
       --radius: 11px;
     }
 
@@ -55,9 +59,14 @@
       --warn-soft: rgba(245, 158, 11, 0.18);
       --warn-border: rgba(251, 191, 36, 0.55);
       --warn-btn-bg: rgba(245, 158, 11, 0.28);
+      --star-glyph: #fbbf24;
+      --btn-primary-bg: #4f46e5;
+      --btn-primary-hover: #6366f1;
+      --btn-primary-fg: #ffffff;
     }
 
     *, *::before, *::after { box-sizing: border-box; }
+    .hidden, [hidden] { display: none !important; }
 
     html, body {
       margin: 0 !important;
@@ -109,6 +118,39 @@
       font-size: 13px;
     }
 
+    .header-actions {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .star-link-tag {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      height: 24px;
+      padding: 0 8px;
+      border-radius: 999px;
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      color: var(--text-secondary);
+      font-size: 11.5px;
+      font-weight: 650;
+      text-decoration: none;
+      white-space: nowrap;
+      transition: background-color 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+    }
+    .star-link-tag:hover {
+      background: var(--bg-hover);
+      border-color: var(--border-strong);
+      color: var(--text-primary);
+    }
+    .star-link-glyph {
+      color: var(--star-glyph);
+      font-size: 12px;
+      line-height: 1;
+    }
+
     .ver-pill {
       font-size: 11px;
       padding: 2px 8px;
@@ -117,6 +159,83 @@
       border: 1px solid var(--accent-border);
       color: var(--accent);
       font-weight: 700;
+    }
+
+    .star-banner {
+      border: 1.5px solid var(--accent-border);
+      background: var(--accent-soft);
+      color: var(--text-primary);
+      border-radius: var(--radius);
+      padding: 11px 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .star-banner-msg {
+      font-size: 12px;
+      line-height: 1.5;
+      color: var(--text-primary);
+      margin: 0;
+    }
+    .star-banner-actions {
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+    .star-btn-primary {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 4px 10px;
+      border-radius: 7px;
+      border: 1px solid var(--btn-primary-bg);
+      background: var(--btn-primary-bg);
+      color: var(--btn-primary-fg);
+      font-size: 12px;
+      font-weight: 650;
+      text-decoration: none;
+      cursor: pointer;
+      transition: background-color 0.15s ease;
+    }
+    .star-btn-primary:hover {
+      background: var(--btn-primary-hover);
+      border-color: var(--btn-primary-hover);
+    }
+    .star-btn-ghost {
+      padding: 4px 10px;
+      border-radius: 7px;
+      border: 1px solid var(--border-strong);
+      background: var(--bg-card);
+      color: var(--text-secondary);
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background-color 0.15s ease, color 0.15s ease;
+    }
+    .star-btn-ghost:hover {
+      background: var(--bg-hover);
+      color: var(--text-primary);
+    }
+    .star-cli-link {
+      border: none;
+      background: transparent;
+      color: var(--text-muted);
+      font-size: 11.5px;
+      font-weight: 500;
+      padding: 3px 6px;
+      border-radius: 6px;
+      cursor: pointer;
+      transition: background-color 0.15s ease, color 0.15s ease;
+    }
+    .star-cli-link:hover {
+      color: var(--text-primary);
+      background: var(--bg-hover);
+    }
+    .star-banner-feedback {
+      font-size: 11.5px;
+      color: var(--ok-text);
+      font-weight: 600;
     }
 
     .onboard-card {
@@ -345,7 +464,20 @@
         <span class="brand-icon">/</span>
         <span>agy-cmd 自动路由</span>
       </div>
-      <span class="ver-pill">v2.1.1</span>
+      <div class="header-actions">
+        <a
+          id="github-star-link"
+          class="star-link-tag"
+          href="https://github.com/zou172866/agy-cmd"
+          target="_blank"
+          rel="noopener noreferrer"
+          title="去 GitHub 点 Star 或 Watch Releases，及时获取 Antigravity 兼容性更新"
+        >
+          <span class="star-link-glyph" aria-hidden="true">★</span>
+          <span>Star</span>
+        </a>
+        <span class="ver-pill">v2.1.1</span>
+      </div>
     </div>
 
     <div id="onboard-card" class="onboard-card" hidden>
@@ -355,6 +487,28 @@
       </p>
       <button id="btn-ack-onboard" class="onboard-btn" type="button">已知晓，保留当前默认设置</button>
     </div>
+
+    <!-- 达标一次性 GitHub Star 横幅（默认隐藏；累计自动续跑 ≥3 次触发，操作后永久收起） -->
+    <section id="star-milestone-banner" class="star-banner hidden" role="region" aria-label="GitHub Star 里程碑提示" hidden>
+      <p id="star-banner-msg" class="star-banner-msg"></p>
+      <div id="star-banner-actions" class="star-banner-actions">
+        <a
+          id="star-banner-open-btn"
+          class="star-btn-primary"
+          href="https://github.com/zou172866/agy-cmd"
+          target="_blank"
+          rel="noopener noreferrer"
+        >★ 去 GitHub 点 Star</a>
+        <button id="star-banner-dismiss-btn" class="star-btn-ghost" type="button">不再提示</button>
+        <button
+          id="star-banner-copy-cli-btn"
+          class="star-cli-link"
+          type="button"
+          title="仅将 gh api -X PUT /user/starred/zou172866/agy-cmd 复制到剪贴板，绝不自动执行"
+        >复制 gh 命令</button>
+        <span id="star-banner-feedback" class="star-banner-feedback hidden" hidden></span>
+      </div>
+    </section>
 
     <!-- 卡片 1：自动续跑监工 (Stop 钩子) -->
     <section class="card">
@@ -498,7 +652,13 @@
     (() => {
       "use strict";
       const CSRF_TOKEN = "__AGY_CMD_CSRF__";
+      const GITHUB_REPO_URL = "https://github.com/zou172866/agy-cmd";
+      const GH_STAR_CLI_CMD = "gh api -X PUT /user/starred/zou172866/agy-cmd";
       let toastTimer = null;
+      let cachedStarPrompt = null;
+      let starPromptResolvedLocally = false;
+      let starPromptPersisted = false;
+      let starCopyHideTimer = null;
 
       // Sync theme strictly from Antigravity's actual host --background luminance
       // (never from OS prefers-color-scheme, avoiding dark-OS + light-App white text mismatch).
@@ -573,11 +733,28 @@
       const lblTotalRetries = $("lbl-total-retries");
       const btnResetStats = $("btn-reset-stats");
       const toastEl = $("toast");
+      const githubStarLink = $("github-star-link");
+      const starBannerEl = $("star-milestone-banner");
+      const starBannerMsgEl = $("star-banner-msg");
+      const starBannerOpenBtn = $("star-banner-open-btn");
+      const starBannerDismissBtn = $("star-banner-dismiss-btn");
+      const starBannerCopyCliBtn = $("star-banner-copy-cli-btn");
+      const starBannerFeedbackEl = $("star-banner-feedback");
 
       const retryModeBtns = Array.from(document.querySelectorAll("[data-retry-mode]"));
       const presetBtns = Array.from(document.querySelectorAll("[data-preset]"));
       const tierBtns = Array.from(document.querySelectorAll("[data-tier]"));
       const scopeRadios = Array.from(document.querySelectorAll('input[name="retry-scope"]'));
+
+      function setElementHidden(el, isHidden) {
+        if (!el) return;
+        const hide = Boolean(isHidden);
+        el.hidden = hide;
+        if (el.classList) {
+          if (hide) el.classList.add("hidden");
+          else el.classList.remove("hidden");
+        }
+      }
 
       function showToast(msg) {
         clearTimeout(toastTimer);
@@ -586,8 +763,9 @@
         toastTimer = setTimeout(() => { toastEl.hidden = true; }, 1800);
       }
 
-      async function callApi(pathname, payload = {}) {
-        const convId = window.sidecar?.conversationId || "";
+      async function callApi(pathname, payload = {}, options = {}) {
+        const includeConvId = options.includeConvId !== false;
+        const convId = includeConvId ? (window.sidecar?.conversationId || "") : "";
         const bodyObj = convId ? { conversationId: convId, ...payload } : payload;
         const headers = { "Content-Type": "application/json" };
         if (!window.sidecar?.fetch && CSRF_TOKEN) {
@@ -606,6 +784,122 @@
           throw new Error(data.error || `HTTP ${res.status}`);
         }
         return data;
+      }
+
+      function renderStarMilestoneBanner(sp) {
+        if (!starBannerEl) return;
+        if (!sp || typeof sp !== "object") {
+          if (starCopyHideTimer === null) setElementHidden(starBannerEl, true);
+          return;
+        }
+        cachedStarPrompt = sp;
+        if (sp.state && sp.state !== "pending") {
+          starPromptResolvedLocally = true;
+          starPromptPersisted = true;
+        }
+        if (starPromptResolvedLocally || !sp.shouldShow || sp.state !== "pending") {
+          if (starCopyHideTimer === null) setElementHidden(starBannerEl, true);
+          return;
+        }
+        if (starBannerMsgEl) {
+          const rawCount = Number(sp.totalAutoRetries ?? sp.milestoneAutoRetries ?? 3);
+          const retryCount =
+            Number.isFinite(rawCount) && rawCount >= 3 ? Math.floor(rawCount) : 3;
+          starBannerMsgEl.textContent =
+            `已为你累计自动拦截续跑 ${retryCount} 次。Antigravity 更新频繁，去 GitHub 点个 Star / Watch 防下次升级失效找不到修复版。`;
+        }
+        setElementHidden(starBannerEl, false);
+      }
+
+      async function persistStarPromptState(state) {
+        if (starPromptPersisted) return;
+        starPromptPersisted = true;
+        try {
+          const data = await callApi("/api/star-prompt", { state }, { includeConvId: false });
+          if (data?.starPrompt) {
+            cachedStarPrompt = data.starPrompt;
+          }
+        } catch {
+          starPromptPersisted = false;
+        }
+      }
+
+      function hideStarBannerNow() {
+        setElementHidden(starBannerEl, true);
+      }
+
+      function handleHeaderStarClick() {
+        if (!starPromptResolvedLocally && (!cachedStarPrompt || cachedStarPrompt.state === "pending")) {
+          starPromptResolvedLocally = true;
+          if (starCopyHideTimer !== null) {
+            clearTimeout(starCopyHideTimer);
+            starCopyHideTimer = null;
+          }
+          hideStarBannerNow();
+          persistStarPromptState("clicked");
+        }
+      }
+
+      function handleStarBannerOpen() {
+        starPromptResolvedLocally = true;
+        if (starCopyHideTimer !== null) {
+          clearTimeout(starCopyHideTimer);
+          starCopyHideTimer = null;
+        }
+        hideStarBannerNow();
+        persistStarPromptState("clicked");
+      }
+
+      function handleStarBannerDismiss() {
+        starPromptResolvedLocally = true;
+        if (starCopyHideTimer !== null) {
+          clearTimeout(starCopyHideTimer);
+          starCopyHideTimer = null;
+        }
+        hideStarBannerNow();
+        persistStarPromptState("dismissed");
+      }
+
+      async function handleStarBannerCopyCli() {
+        starPromptResolvedLocally = true;
+        let copied = false;
+        if (navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
+          try {
+            await navigator.clipboard.writeText(GH_STAR_CLI_CMD);
+            copied = true;
+          } catch {}
+        }
+        if (!copied && typeof document.createElement === "function" && document.body) {
+          const ta = document.createElement("textarea");
+          ta.value = GH_STAR_CLI_CMD;
+          ta.setAttribute("readonly", "");
+          ta.style.position = "fixed";
+          ta.style.top = "-9999px";
+          ta.style.left = "-9999px";
+          document.body.appendChild(ta);
+          if (typeof ta.focus === "function") ta.focus();
+          if (typeof ta.select === "function") ta.select();
+          try {
+            copied = Boolean(document.execCommand && document.execCommand("copy"));
+          } catch {
+            copied = false;
+          } finally {
+            document.body.removeChild(ta);
+          }
+        }
+        persistStarPromptState("copied_cli");
+        if (starBannerFeedbackEl) {
+          starBannerFeedbackEl.textContent = copied
+            ? "已复制，需自行在终端运行"
+            : `复制失败，可手动执行：${GH_STAR_CLI_CMD}`;
+          setElementHidden(starBannerFeedbackEl, false);
+        }
+        if (starCopyHideTimer !== null) clearTimeout(starCopyHideTimer);
+        starCopyHideTimer = setTimeout(() => {
+          starCopyHideTimer = null;
+          setElementHidden(starBannerFeedbackEl, true);
+          hideStarBannerNow();
+        }, 2500);
       }
 
       function render(data) {
@@ -647,6 +941,7 @@
         lblSummary.textContent = data.summaryZh || "";
         lblBoostStatus.textContent = data.boostStatusZh || "";
         lblTotalRetries.textContent = String(s.stats?.totalAutoRetries ?? 0);
+        renderStarMilestoneBanner(data.starPrompt || s.starPrompt);
       }
 
       async function savePatch(patch, toastText = "设置已实时生效") {
@@ -729,6 +1024,19 @@
       btnResetStats.addEventListener("click", () => {
         savePatch({ resetStats: true }, "统计已清零");
       });
+
+      if (githubStarLink) {
+        githubStarLink.addEventListener("click", handleHeaderStarClick);
+      }
+      if (starBannerOpenBtn) {
+        starBannerOpenBtn.addEventListener("click", handleStarBannerOpen);
+      }
+      if (starBannerDismissBtn) {
+        starBannerDismissBtn.addEventListener("click", handleStarBannerDismiss);
+      }
+      if (starBannerCopyCliBtn) {
+        starBannerCopyCliBtn.addEventListener("click", handleStarBannerCopyCli);
+      }
 
       async function refresh() {
         try {

@@ -3,8 +3,11 @@ import fs from "node:fs";
 import path from "node:path";
 import { sanitizeConversationId } from "../../hooks/lib/common.mjs";
 import {
+  evaluateStarPrompt,
   formatRetrySummaryZh,
   readSettings,
+  setStarPromptState,
+  STAR_PROMPT_TERMINAL_STATES,
   updateSettings
 } from "../../hooks/lib/settings.mjs";
 import { readState } from "../../hooks/lib/state.mjs";
@@ -16,6 +19,28 @@ export const NO_STORE_HEADERS = Object.freeze({
 
 const LOCAL_HOST_RE = /^(?:127\.0\.0\.1|localhost|\[::1\])(?::\d{1,5})?$/i;
 const LOCAL_ORIGIN_RE = /^https?:\/\/(?:127\.0\.0\.1|localhost|\[::1\])(?::\d{1,5})?$/i;
+const VSCODE_WEBVIEW_RE = /^vscode-webview:\/\/[a-z0-9._-]+(?:\/.*)?$/i;
+const STAR_PROMPT_ALLOWED_KEYS = new Set(["state"]);
+const STAR_PROMPT_ALLOWED_STATES = new Set(STAR_PROMPT_TERMINAL_STATES);
+
+function matchesSameLoopbackHostPort(headerUrlStr, hostHeader) {
+  try {
+    const parsed = new URL(headerUrlStr);
+    if (!LOCAL_ORIGIN_RE.test(parsed.origin)) {
+      return false;
+    }
+    if (hostHeader) {
+      const hUrl = new URL(`http://${hostHeader}`);
+      if (parsed.hostname.toLowerCase() !== hUrl.hostname.toLowerCase()) return false;
+      const pPort = parsed.port || (parsed.protocol === "https:" ? "443" : "80");
+      const hPort = hUrl.port || "80";
+      if (pPort !== hPort) return false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 export function isAllowedLocalRequest(req) {
   if (!req?.headers) return true;
@@ -31,23 +56,18 @@ export function isAllowedLocalRequest(req) {
 
   const origin = String(req.headers.origin || "").trim();
   if (origin) {
-    if (/^vscode-webview:\/\/[a-z0-9._-]+$/i.test(origin)) {
-      return true;
-    }
-    if (!LOCAL_ORIGIN_RE.test(origin)) {
+    if (!VSCODE_WEBVIEW_RE.test(origin) && !matchesSameLoopbackHostPort(origin, host)) {
       return false;
     }
-    if (host) {
-      try {
-        const oUrl = new URL(origin);
-        const hUrl = new URL(`http://${host}`);
-        if (oUrl.hostname.toLowerCase() !== hUrl.hostname.toLowerCase()) return false;
-        if ((oUrl.port || "80") !== (hUrl.port || "80")) return false;
-      } catch {
-        return false;
-      }
+  }
+
+  const referer = String(req.headers.referer || "").trim();
+  if (referer) {
+    if (!VSCODE_WEBVIEW_RE.test(referer) && !matchesSameLoopbackHostPort(referer, host)) {
+      return false;
     }
   }
+
   return true;
 }
 
@@ -69,7 +89,8 @@ function countTrackedSessions(stateDir) {
   }
 }
 
-export function buildPanelStatePayload(stateDir, rawConvId = "") {
+export function buildPanelStatePayload(stateDir, rawConvId = "", { markStarTriggered = true } = {}) {
+  const starPrompt = evaluateStarPrompt(stateDir, { markTriggered: markStarTriggered });
   const settings = readSettings(stateDir);
   const trackedSessions = countTrackedSessions(stateDir);
   let activeSession = null;
@@ -91,6 +112,7 @@ export function buildPanelStatePayload(stateDir, rawConvId = "") {
   return {
     ok: true,
     settings,
+    starPrompt,
     summaryZh: formatRetrySummaryZh(settings),
     boostStatusZh:
       settings.planTier === "paid" && settings.boostEnabled
@@ -103,7 +125,52 @@ export function buildPanelStatePayload(stateDir, rawConvId = "") {
   };
 }
 
+export function handleStarPromptMutation(stateDir, rawData) {
+  if (!rawData || typeof rawData !== "object" || Array.isArray(rawData)) {
+    return {
+      status: 400,
+      body: { ok: false, error: "Request body must be a JSON object" }
+    };
+  }
+  for (const key of Object.keys(rawData)) {
+    if (!STAR_PROMPT_ALLOWED_KEYS.has(key)) {
+      return {
+        status: 400,
+        body: { ok: false, error: `Unexpected field '${key}' in request body` }
+      };
+    }
+  }
+  if (typeof rawData.state !== "string" || !STAR_PROMPT_ALLOWED_STATES.has(rawData.state)) {
+    return {
+      status: 400,
+      body: {
+        ok: false,
+        error: "Invalid 'state' value: expected 'clicked', 'dismissed', or 'copied_cli'"
+      }
+    };
+  }
+  const res = setStarPromptState(stateDir, rawData.state);
+  if (!res.ok) {
+    return {
+      status: 400,
+      body: { ok: false, error: res.error }
+    };
+  }
+  return {
+    status: 200,
+    body: {
+      ok: true,
+      starPrompt: res.starPrompt,
+      alreadyResolved: Boolean(res.alreadyResolved)
+    }
+  };
+}
+
 export function dispatchPanelApi(pathname, rawData, { stateDir, defaultConvId = "" } = {}) {
+  if (pathname === "/api/star-prompt") {
+    return handleStarPromptMutation(stateDir, rawData);
+  }
+
   const data =
     rawData === undefined || rawData === null
       ? {}
@@ -135,7 +202,7 @@ export function dispatchPanelApi(pathname, rawData, { stateDir, defaultConvId = 
       updateSettings(stateDir, data, { markConfigured: true });
       return {
         status: 200,
-        body: buildPanelStatePayload(stateDir, convId)
+        body: buildPanelStatePayload(stateDir, convId, { markStarTriggered: false })
       };
     } catch (err) {
       return {
@@ -153,7 +220,7 @@ export function dispatchPanelApi(pathname, rawData, { stateDir, defaultConvId = 
     );
     return {
       status: 200,
-      body: buildPanelStatePayload(stateDir, convId)
+      body: buildPanelStatePayload(stateDir, convId, { markStarTriggered: false })
     };
   }
 
