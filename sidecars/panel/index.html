@@ -1,0 +1,740 @@
+<!doctype html>
+<html lang="zh-CN" data-color-scheme="light">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>agy-cmd 自动路由控制面板</title>
+  <script src="/preload.js"></script>
+  <style>
+    /* Default strictly to high-contrast Light palette (never rely on OS prefers-color-scheme,
+       which causes white-on-white text when Windows is Dark but Antigravity is Light).
+       Dark palette only activates when Antigravity's own --background variable is dark. */
+    :root,
+    :root[data-color-scheme="light"] {
+      --bg-canvas: #f6f8fa;
+      --bg-card: #ffffff;
+      --bg-subtle: #f1f5f9;
+      --bg-hover: #e2e8f0;
+      --border: #cbd5e1;
+      --border-strong: #94a3b8;
+      --text-primary: #0f172a;
+      --text-secondary: #1e293b;
+      --text-muted: #475569;
+      --accent: #4338ca;
+      --accent-soft: #eef2ff;
+      --accent-border: #6366f1;
+      --ok-dot: #10b981;
+      --ok-text: #065f46;
+      --ok-soft: #ecfdf5;
+      --ok-border: #6ee7b7;
+      --warn-text: #78350f;
+      --warn-soft: #fffbeb;
+      --warn-border: #f59e0b;
+      --warn-btn-bg: #fef3c7;
+      --radius: 11px;
+    }
+
+    :root[data-color-scheme="dark"] {
+      --bg-canvas: #0f172a;
+      --bg-card: #1e293b;
+      --bg-subtle: #0f172a;
+      --bg-hover: #334155;
+      --border: #334155;
+      --border-strong: #475569;
+      --text-primary: #f8fafc;
+      --text-secondary: #e2e8f0;
+      --text-muted: #cbd5e1;
+      --accent: #a5b4fc;
+      --accent-soft: rgba(99, 102, 241, 0.24);
+      --accent-border: #818cf8;
+      --ok-dot: #34d399;
+      --ok-text: #d1fae5;
+      --ok-soft: rgba(16, 185, 129, 0.18);
+      --ok-border: rgba(52, 211, 153, 0.45);
+      --warn-text: #fef3c7;
+      --warn-soft: rgba(245, 158, 11, 0.18);
+      --warn-border: rgba(251, 191, 36, 0.55);
+      --warn-btn-bg: rgba(245, 158, 11, 0.28);
+    }
+
+    *, *::before, *::after { box-sizing: border-box; }
+
+    html, body {
+      margin: 0 !important;
+      padding: 0 !important;
+      background-color: var(--bg-canvas) !important;
+      color: var(--text-primary) !important;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif !important;
+      font-size: 13px;
+      line-height: 1.5;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    .wrap {
+      max-width: 480px;
+      margin: 0 auto;
+      padding: 14px 13px 28px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+
+    .header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      padding-bottom: 2px;
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-weight: 700;
+      font-size: 15px;
+      color: var(--text-primary);
+    }
+
+    .brand-icon {
+      width: 24px;
+      height: 24px;
+      border-radius: 7px;
+      background: linear-gradient(135deg, #0ea5e9, #4f46e5, #7c3aed);
+      color: #ffffff;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: 800;
+      font-size: 13px;
+    }
+
+    .ver-pill {
+      font-size: 11px;
+      padding: 2px 8px;
+      border-radius: 999px;
+      background: var(--accent-soft);
+      border: 1px solid var(--accent-border);
+      color: var(--accent);
+      font-weight: 700;
+    }
+
+    .onboard-card {
+      border: 1.5px solid var(--warn-border);
+      background: var(--warn-soft);
+      color: var(--warn-text);
+      border-radius: var(--radius);
+      padding: 11px 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 7px;
+    }
+    .onboard-card[hidden] { display: none; }
+    .onboard-title { font-weight: 700; font-size: 13px; color: var(--warn-text); }
+    .onboard-desc { font-size: 12px; margin: 0; color: var(--warn-text); line-height: 1.5; }
+    .onboard-btn {
+      align-self: flex-start;
+      border: 1px solid var(--warn-border);
+      background: var(--warn-btn-bg);
+      color: var(--warn-text);
+      border-radius: 7px;
+      padding: 5px 11px;
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    .onboard-btn:hover { filter: brightness(0.96); }
+
+    .card {
+      border: 1px solid var(--border);
+      background: var(--bg-card);
+      color: var(--text-primary);
+      border-radius: var(--radius);
+      padding: 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+    }
+
+    .card-head { display: flex; align-items: center; justify-content: space-between; gap: 6px; }
+    .card-title { font-weight: 700; font-size: 13.5px; margin: 0; color: var(--text-primary); }
+    .card-sub { font-size: 12px; color: var(--text-muted); margin: -4px 0 0; }
+
+    .seg-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
+    .seg-grid-2 { display: grid; grid-template-columns: repeat(2, 1fr); gap: 6px; }
+
+    .seg-btn {
+      border: 1px solid var(--border);
+      background: var(--bg-subtle);
+      color: var(--text-primary);
+      border-radius: 9px;
+      padding: 8px 6px;
+      cursor: pointer;
+      text-align: center;
+      transition: all 0.12s ease;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 2px;
+    }
+    .seg-btn:hover { border-color: var(--border-strong); }
+    .seg-btn strong { font-size: 12.5px; font-weight: 700; color: var(--text-primary); }
+    .seg-btn span { font-size: 11px; color: var(--text-muted); font-weight: 500; }
+    .seg-btn.active {
+      border: 1.5px solid var(--accent-border);
+      background: var(--accent-soft);
+    }
+    .seg-btn.active strong { color: var(--accent); }
+    .seg-btn.active span { color: var(--text-secondary); }
+
+    .count-box {
+      border: 1px dashed var(--border-strong);
+      background: var(--bg-subtle);
+      border-radius: 9px;
+      padding: 9px 10px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      transition: opacity 0.15s ease;
+    }
+    .count-box.dimmed { opacity: 0.48; pointer-events: none; }
+
+    .chips-row { display: flex; align-items: center; justify-content: space-between; gap: 6px; flex-wrap: wrap; }
+    .chips { display: flex; gap: 5px; flex-wrap: wrap; }
+
+    .chip {
+      border: 1px solid var(--border);
+      background: var(--bg-card);
+      color: var(--text-secondary);
+      border-radius: 999px;
+      padding: 3px 9px;
+      font-size: 11.5px;
+      font-weight: 500;
+      cursor: pointer;
+    }
+    .chip:hover { border-color: var(--border-strong); }
+    .chip.active {
+      border-color: var(--accent-border);
+      background: var(--accent-soft);
+      color: var(--accent);
+      font-weight: 700;
+    }
+
+    .stepper { display: inline-flex; align-items: center; gap: 4px; }
+    .step-btn {
+      width: 26px;
+      height: 26px;
+      border-radius: 7px;
+      border: 1px solid var(--border);
+      background: var(--bg-card);
+      color: var(--text-primary);
+      font-weight: 700;
+      font-size: 14px;
+      cursor: pointer;
+    }
+    .step-btn:hover { background: var(--bg-hover); }
+    .step-input {
+      width: 48px;
+      height: 26px;
+      text-align: center;
+      border-radius: 7px;
+      border: 1px solid var(--border);
+      background: var(--bg-card);
+      color: var(--text-primary);
+      font-weight: 700;
+      font-size: 12.5px;
+    }
+
+    .scope-list, .toggle-list { display: flex; flex-direction: column; gap: 7px; }
+    .radio-row, .toggle-row {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 8px 10px;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: var(--bg-card);
+      color: var(--text-primary);
+      cursor: pointer;
+    }
+    .radio-row:hover, .toggle-row:hover { border-color: var(--border-strong); }
+    .radio-row.active {
+      border-color: var(--accent-border);
+      background: var(--accent-soft);
+    }
+
+    .row-text { display: flex; flex-direction: column; gap: 2px; flex: 1; }
+    .row-text b { font-size: 12.5px; font-weight: 650; color: var(--text-primary); }
+    .row-text small { font-size: 11.5px; color: var(--text-muted); line-height: 1.4; }
+
+    input[type="checkbox"], input[type="radio"] {
+      accent-color: var(--accent);
+      width: 16px;
+      height: 16px;
+      margin-top: 2px;
+      cursor: pointer;
+    }
+
+    .free-lock-note {
+      font-size: 12px;
+      padding: 8px 10px;
+      border-radius: 8px;
+      background: var(--ok-soft);
+      border: 1px solid var(--ok-border);
+      color: var(--ok-text);
+      line-height: 1.45;
+    }
+    .free-lock-note[hidden] { display: none; }
+
+    .status-bar { display: flex; flex-direction: column; gap: 5px; font-size: 12px; color: var(--text-primary); }
+    .status-line { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+    .status-muted { color: var(--text-secondary); }
+    .dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--ok-dot);
+      display: inline-block;
+      margin-right: 6px;
+    }
+    .link-btn {
+      border: none;
+      background: transparent;
+      color: var(--accent);
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+      padding: 0;
+      text-decoration: underline;
+    }
+
+    .hint-foot { font-size: 11.5px; color: var(--text-muted); line-height: 1.5; }
+    code {
+      padding: 1px 5px;
+      border-radius: 4px;
+      background: var(--bg-subtle);
+      border: 1px solid var(--border);
+      color: var(--text-primary);
+      font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+      font-size: 11px;
+    }
+
+    .toast {
+      position: fixed;
+      bottom: 12px;
+      left: 50%;
+      transform: translateX(-50%);
+      background: #0f172a;
+      color: #ffffff;
+      padding: 6px 14px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 600;
+      box-shadow: 0 4px 14px rgba(0, 0, 0, 0.25);
+      z-index: 50;
+    }
+    .toast[hidden] { display: none; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="header">
+      <div class="brand">
+        <span class="brand-icon">/</span>
+        <span>agy-cmd 自动路由</span>
+      </div>
+      <span class="ver-pill">v2.1</span>
+    </div>
+
+    <div id="onboard-card" class="onboard-card" hidden>
+      <div class="onboard-title">⚠️ 安装后首次确认提醒</div>
+      <p class="onboard-desc">
+        为防止免费号误触付费指令报错，初始默认已设为<strong>「免费版（关闭 Boost 自动接入）」</strong>及<strong>「最多自动重试 3 次」</strong>。请按你的实际账号与习惯在下方手动切换，改动即时生效。
+      </p>
+      <button id="btn-ack-onboard" class="onboard-btn" type="button">已知晓，保留当前默认设置</button>
+    </div>
+
+    <!-- 卡片 1：自动续跑监工 (Stop 钩子) -->
+    <section class="card">
+      <div class="card-head">
+        <h2 class="card-title">1. 防停机自动重试（Stop 监工）</h2>
+      </div>
+      <p class="card-sub">当验证/测试未通过而 AI 试图提前收工时，自动拦截并督促继续修复</p>
+
+      <div class="seg-grid" role="radiogroup" aria-label="自动重试模式">
+        <button class="seg-btn" data-retry-mode="off" type="button">
+          <strong>不用重试</strong>
+          <span>关闭 (0 次)</span>
+        </button>
+        <button class="seg-btn" data-retry-mode="count" type="button">
+          <strong>指定次数</strong>
+          <span id="seg-count-sub">最多 3 次</span>
+        </button>
+        <button class="seg-btn" data-retry-mode="infinite" type="button">
+          <strong>一直重试</strong>
+          <span>直到全绿 (∞)</span>
+        </button>
+      </div>
+
+      <div id="count-box" class="count-box">
+        <div class="chips-row">
+          <div class="chips">
+            <button class="chip" data-preset="1" type="button">1 次</button>
+            <button class="chip" data-preset="3" type="button">3 次 (推荐)</button>
+            <button class="chip" data-preset="5" type="button">5 次</button>
+            <button class="chip" data-preset="10" type="button">10 次</button>
+          </div>
+          <div class="stepper">
+            <button id="btn-dec" class="step-btn" type="button" aria-label="减少次数">−</button>
+            <input id="inp-max" class="step-input" type="number" min="1" max="50" value="3" aria-label="最大重试次数">
+            <button id="btn-inc" class="step-btn" type="button" aria-label="增加次数">+</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="scope-list">
+        <label id="scope-goal" class="radio-row">
+          <div class="row-text">
+            <b>仅口令触发（推荐）</b>
+            <small>说出“修到全绿 / 一直修别停”等诉求时激活自动续跑</small>
+          </div>
+          <input type="radio" name="retry-scope" value="goal_only">
+        </label>
+        <label id="scope-all" class="radio-row">
+          <div class="row-text">
+            <b>所有测试失败均触发</b>
+            <small>只要当轮跑过命令/测试且最后一次仍失败，就自动续跑</small>
+          </div>
+          <input type="radio" name="retry-scope" value="all_failures">
+        </label>
+      </div>
+
+      <div class="hint-foot">
+        安全刹车：即使选「一直重试」，手动点击停止按钮、AI 停下向你提问（无新命令/改动）或触及宿主安全上限时仍会立即停机。
+      </div>
+    </section>
+
+    <!-- 卡片 2：账号套餐与 Boost 接入 -->
+    <section class="card">
+      <div class="card-head">
+        <h2 class="card-title">2. 账号档位与 Boost 自动接入</h2>
+      </div>
+      <p class="card-sub">默认免费版以防非会员输入 <code>/boost</code> 报套餐权限错误，会员请手动切换</p>
+
+      <div class="seg-grid-2" role="radiogroup" aria-label="账号套餐档位">
+        <button class="seg-btn" data-tier="free" type="button">
+          <strong>免费版 (默认)</strong>
+          <span>屏蔽付费口令防报错</span>
+        </button>
+        <button class="seg-btn" data-tier="paid" type="button">
+          <strong>Pro / Ultra 会员</strong>
+          <span>解锁高阶指令推荐</span>
+        </button>
+      </div>
+
+      <div id="free-note" class="free-lock-note">
+        🛡️ 当前为<strong>免费版安全模式</strong>：已自动关闭 <code>/boost</code>、<code>/swarm</code>、<code>/teamwork</code> 提示防报错，卡壳时自动改用内置只读子智能体换视角重查。
+      </div>
+
+      <div class="toggle-list">
+        <label class="toggle-row" id="row-boost">
+          <div class="row-text">
+            <b>开启 <code>/boost</code> 自动接入提示</b>
+            <small id="boost-sub">连续失败/修改震荡时在首行给出可复制 <code>/boost</code> 攻坚口令</small>
+          </div>
+          <input id="chk-boost" type="checkbox">
+        </label>
+
+        <label class="toggle-row">
+          <div class="row-text">
+            <b>卡壳时自动换视角排查（全套餐可用）</b>
+            <small>反复修错未果时，指示 AI 停止盲改并派独立子智能体核查根因</small>
+          </div>
+          <input id="chk-free-fb" type="checkbox">
+        </label>
+
+        <label class="toggle-row">
+          <div class="row-text">
+            <b>只读 Plan Mode 审批兜底</b>
+            <small>Plan Mode 拒绝写方案文件时，强制正文输出方案等确认，防绕过审批</small>
+          </div>
+          <input id="chk-plan-fb" type="checkbox">
+        </label>
+      </div>
+    </section>
+
+    <!-- 卡片 3：实时生效概览 -->
+    <section class="card">
+      <div class="status-bar">
+        <div class="status-line">
+          <span><span class="dot"></span><strong id="lbl-summary">加载中…</strong></span>
+        </div>
+        <div class="status-line">
+          <span class="status-muted" id="lbl-boost-status">—</span>
+        </div>
+        <div class="status-line" style="margin-top:2px">
+          <span class="status-muted">累计自动拦截续跑：<strong id="lbl-total-retries">0</strong> 次</span>
+          <button id="btn-reset-stats" class="link-btn" type="button">清零统计</button>
+        </div>
+      </div>
+      <div class="hint-foot">
+        💡 单轮临时口令：在任意提问里顺带说 <code>这次最多重试 5 次</code>、<code>这次一直重试</code> 或 <code>这次不用重试</code> 即可仅对当轮生效。
+      </div>
+    </section>
+  </div>
+
+  <div id="toast" class="toast" hidden>已保存生效</div>
+
+  <script>
+    (() => {
+      "use strict";
+      const CSRF_TOKEN = "__AGY_CMD_CSRF__";
+      let toastTimer = null;
+
+      // Sync theme strictly from Antigravity's actual host --background luminance
+      // (never from OS prefers-color-scheme, avoiding dark-OS + light-App white text mismatch).
+      function parseLuminance(raw) {
+        const s = String(raw || "").trim().toLowerCase();
+        if (!s || s === "transparent") return null;
+        if (s.startsWith("#")) {
+          const h = s.slice(1);
+          if (h.length === 3) {
+            const r = parseInt(h[0] + h[0], 16);
+            const g = parseInt(h[1] + h[1], 16);
+            const b = parseInt(h[2] + h[2], 16);
+            return (0.299 * r + 0.587 * g + 0.114 * b) / 255;
+          }
+          if (h.length >= 6) {
+            const r = parseInt(h.slice(0, 2), 16);
+            const g = parseInt(h.slice(2, 4), 16);
+            const b = parseInt(h.slice(4, 6), 16);
+            return (0.299 * r + 0.587 * g + 0.114 * b) / 255;
+          }
+        }
+        const m = s.match(/^rgba?\(([^)]+)\)$/);
+        if (m) {
+          const p = m[1].split(/[\s,/]+/).filter(Boolean).map(Number);
+          if (p.length >= 3 && p.every(Number.isFinite)) {
+            return (0.299 * p[0] + 0.587 * p[1] + 0.114 * p[2]) / 255;
+          }
+        }
+        return null;
+      }
+
+      function syncHostTheme() {
+        const root = document.documentElement;
+        const hostBg =
+          root.style.getPropertyValue("--background") ||
+          root.style.getPropertyValue("--vscode-sideBar-background") ||
+          root.style.getPropertyValue("--vscode-editor-background") ||
+          "";
+        const lum = parseLuminance(hostBg);
+        if (lum !== null) {
+          root.setAttribute("data-color-scheme", lum < 0.42 ? "dark" : "light");
+        } else {
+          root.setAttribute("data-color-scheme", "light");
+        }
+      }
+
+      window.addEventListener("message", (ev) => {
+        if (ev.data?.type === "theme-change") {
+          requestAnimationFrame(syncHostTheme);
+        }
+      });
+      syncHostTheme();
+
+      const $ = (id) => document.getElementById(id);
+      const onboardCard = $("onboard-card");
+      const btnAckOnboard = $("btn-ack-onboard");
+      const countBox = $("count-box");
+      const segCountSub = $("seg-count-sub");
+      const inpMax = $("inp-max");
+      const btnDec = $("btn-dec");
+      const btnInc = $("btn-inc");
+      const scopeGoal = $("scope-goal");
+      const scopeAll = $("scope-all");
+      const freeNote = $("free-note");
+      const chkBoost = $("chk-boost");
+      const boostSub = $("boost-sub");
+      const chkFreeFb = $("chk-free-fb");
+      const chkPlanFb = $("chk-plan-fb");
+      const lblSummary = $("lbl-summary");
+      const lblBoostStatus = $("lbl-boost-status");
+      const lblTotalRetries = $("lbl-total-retries");
+      const btnResetStats = $("btn-reset-stats");
+      const toastEl = $("toast");
+
+      const retryModeBtns = Array.from(document.querySelectorAll("[data-retry-mode]"));
+      const presetBtns = Array.from(document.querySelectorAll("[data-preset]"));
+      const tierBtns = Array.from(document.querySelectorAll("[data-tier]"));
+      const scopeRadios = Array.from(document.querySelectorAll('input[name="retry-scope"]'));
+
+      function showToast(msg) {
+        clearTimeout(toastTimer);
+        toastEl.textContent = msg;
+        toastEl.hidden = false;
+        toastTimer = setTimeout(() => { toastEl.hidden = true; }, 1800);
+      }
+
+      async function callApi(pathname, payload = {}) {
+        const convId = window.sidecar?.conversationId || "";
+        const bodyObj = convId ? { conversationId: convId, ...payload } : payload;
+        const headers = { "Content-Type": "application/json" };
+        if (!window.sidecar?.fetch && CSRF_TOKEN) {
+          headers["X-Agy-Cmd-Csrf"] = CSRF_TOKEN;
+        }
+        const fetchFn = window.sidecar?.fetch
+          ? window.sidecar.fetch.bind(window.sidecar)
+          : window.fetch.bind(window);
+        const res = await fetchFn(pathname, {
+          method: "POST",
+          headers,
+          body: JSON.stringify(bodyObj)
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok || data.ok === false) {
+          throw new Error(data.error || `HTTP ${res.status}`);
+        }
+        return data;
+      }
+
+      function render(data) {
+        if (!data?.settings) return;
+        const s = data.settings;
+
+        onboardCard.hidden = Boolean(s.configuredByUser);
+
+        retryModeBtns.forEach((btn) => {
+          btn.classList.toggle("active", btn.dataset.retryMode === s.autoRetryMode);
+        });
+        segCountSub.textContent = `最多 ${s.autoRetryMax} 次`;
+        inpMax.value = String(s.autoRetryMax);
+        countBox.classList.toggle("dimmed", s.autoRetryMode !== "count");
+
+        presetBtns.forEach((btn) => {
+          btn.classList.toggle("active", s.autoRetryMode === "count" && Number(btn.dataset.preset) === s.autoRetryMax);
+        });
+
+        scopeRadios.forEach((r) => { r.checked = r.value === s.autoRetryScope; });
+        scopeGoal.classList.toggle("active", s.autoRetryScope === "goal_only");
+        scopeAll.classList.toggle("active", s.autoRetryScope === "all_failures");
+
+        tierBtns.forEach((btn) => {
+          btn.classList.toggle("active", btn.dataset.tier === s.planTier);
+        });
+        const isFree = s.planTier === "free";
+        freeNote.hidden = !isFree;
+        chkBoost.checked = !isFree && Boolean(s.boostEnabled);
+        chkBoost.disabled = isFree;
+        boostSub.textContent = isFree
+          ? "需先切换上方为「Pro / Ultra 会员」才可开启，防止免费号触发报错"
+          : "连续失败/修改震荡时在首行给出可复制 /boost 攻坚口令";
+
+        chkFreeFb.checked = Boolean(s.freeFallbackEnabled);
+        chkPlanFb.checked = Boolean(s.planFallbackEnabled);
+
+        lblSummary.textContent = data.summaryZh || "";
+        lblBoostStatus.textContent = data.boostStatusZh || "";
+        lblTotalRetries.textContent = String(s.stats?.totalAutoRetries ?? 0);
+      }
+
+      async function savePatch(patch, toastText = "设置已实时生效") {
+        try {
+          const data = await callApi("/api/settings", patch);
+          render(data);
+          showToast(toastText);
+        } catch (err) {
+          showToast(`保存失败：${err.message}`);
+        }
+      }
+
+      retryModeBtns.forEach((btn) => {
+        btn.addEventListener("click", () => {
+          savePatch({ autoRetryMode: btn.dataset.retryMode });
+        });
+      });
+
+      presetBtns.forEach((btn) => {
+        btn.addEventListener("click", () => {
+          savePatch({ autoRetryMode: "count", autoRetryMax: Number(btn.dataset.preset) });
+        });
+      });
+
+      btnDec.addEventListener("click", () => {
+        const cur = Number(inpMax.value) || 3;
+        const next = Math.max(1, cur - 1);
+        savePatch({ autoRetryMode: "count", autoRetryMax: next });
+      });
+
+      btnInc.addEventListener("click", () => {
+        const cur = Number(inpMax.value) || 3;
+        const next = Math.min(50, cur + 1);
+        savePatch({ autoRetryMode: "count", autoRetryMax: next });
+      });
+
+      inpMax.addEventListener("change", () => {
+        const raw = Number(inpMax.value);
+        const clamped = Number.isFinite(raw) ? Math.min(50, Math.max(1, Math.floor(raw))) : 3;
+        inpMax.value = String(clamped);
+        savePatch({ autoRetryMode: "count", autoRetryMax: clamped });
+      });
+
+      scopeRadios.forEach((r) => {
+        r.addEventListener("change", () => {
+          if (r.checked) savePatch({ autoRetryScope: r.value });
+        });
+      });
+
+      tierBtns.forEach((btn) => {
+        btn.addEventListener("click", () => {
+          const tier = btn.dataset.tier;
+          const msg = tier === "paid" ? "已切换至会员模式并开启 Boost 接入" : "已切回免费安全模式（关闭 Boost 防报错）";
+          savePatch({ planTier: tier }, msg);
+        });
+      });
+
+      chkBoost.addEventListener("change", () => {
+        savePatch({ boostEnabled: chkBoost.checked });
+      });
+
+      chkFreeFb.addEventListener("change", () => {
+        savePatch({ freeFallbackEnabled: chkFreeFb.checked });
+      });
+
+      chkPlanFb.addEventListener("change", () => {
+        savePatch({ planFallbackEnabled: chkPlanFb.checked });
+      });
+
+      btnAckOnboard.addEventListener("click", async () => {
+        try {
+          const data = await callApi("/api/dismiss-onboarding", {});
+          render(data);
+          showToast("已确认当前设置");
+        } catch (err) {
+          showToast(`操作失败：${err.message}`);
+        }
+      });
+
+      btnResetStats.addEventListener("click", () => {
+        savePatch({ resetStats: true }, "统计已清零");
+      });
+
+      async function refresh() {
+        try {
+          const data = await callApi("/api/state", {});
+          render(data);
+        } catch {}
+      }
+
+      refresh();
+      setInterval(() => {
+        if (!document.hidden && document.activeElement !== inpMax) {
+          refresh();
+        }
+      }, 3000);
+    })();
+  </script>
+</body>
+</html>

@@ -1,0 +1,17 @@
+{
+  "name": "agy-cmd",
+  "displayName": "agy-cmd (自动路由与防停机面板)",
+  "version": "2.1.0",
+  "description": "Antigravity 桌面端/IDE 高阶能力自动路由插件（v2.1）：提供常驻精简路由规则、Stop 防停机自动续跑监工（不重试 / N 次 / 一直重试 + 单句口语覆盖）、默认免费版防报错保护，以及右侧边栏可视化控制面板（安装后请在右侧面板手动确认重试次数与是否开启会员 Boost 自动接入）。",
+  "logo": "assets/logo.svg",
+  "homepage": "https://github.com/zou172866/agy-cmd",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/zou172866/agy-cmd.git"
+  },
+  "suggestedPrompts": [
+    "检查 agy-cmd 当前自动重试次数和 Boost 接入状态",
+    "把 agy-cmd 自动重试改成 5 次",
+    "列出 Antigravity 桌面端全部内置斜杠指令与免费版平替对比"
+  ]
+}

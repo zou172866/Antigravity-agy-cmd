@@ -1,0 +1,87 @@
+#!/usr/bin/env node
+/**
+ * agy-cmd Stop hook:
+ * Enforces the user-configured auto-retry guard (`off` | `count(1..50)` | `infinite`
+ * + single-turn natural-language overrides) when unresolved verification/command
+ * failures remain at turn completion.
+ *
+ * Built-in safety brakes (always active even in `infinite` mode):
+ *   1. Immediate allow on `USER_CANCELED`, `ERROR`, `MAX_FORCED_INVOCATIONS`, `MAX_INVOCATIONS`, `MAX_TOKEN_BUDGET_EXCEEDED`
+ *   2. No-progress stall guard: if a prior continuation produced zero new edit/cmd events, allow stop so questions reach the user
+ *   3. Background task guard: allow when `fullyIdle === false`
+ *   4. Subagent & explicit `/goal` isolation
+ */
+import {
+  isDirectRun,
+  isSubagentPayload,
+  parseHookPayload,
+  readStdin,
+  resolveConversationId,
+  resolveStateDir
+} from "./lib/common.mjs";
+import { evaluateStop } from "./lib/detector.mjs";
+import { readSettings, recordAutoRetryStat } from "./lib/settings.mjs";
+import { readEvents, readState, writeState } from "./lib/state.mjs";
+import {
+  inspectTranscriptTail,
+  isSubagentTranscript,
+  resolveTranscriptPath
+} from "./lib/transcript.mjs";
+
+export async function runStop(rawInput, env = process.env, nowMs = Date.now()) {
+  const payload = parseHookPayload(rawInput);
+  if (!payload || isSubagentPayload(payload, env)) {
+    return { decision: "allow" };
+  }
+
+  const transcriptPath = resolveTranscriptPath(payload);
+  if (transcriptPath && isSubagentTranscript(transcriptPath)) {
+    return { decision: "allow" };
+  }
+
+  const stateDir = resolveStateDir(env);
+  const convId = resolveConversationId(payload, env);
+
+  try {
+    const settings = readSettings(stateDir);
+    const prevState = readState(stateDir, convId);
+    const events = readEvents(stateDir, convId);
+    const transcriptTail = transcriptPath ? inspectTranscriptTail(transcriptPath) : null;
+
+    const verdict = evaluateStop(payload, events, prevState, {
+      nowMs,
+      env,
+      settings,
+      transcriptTail
+    });
+
+    if (verdict.stateChanged) {
+      writeState(stateDir, convId, verdict.nextState);
+    }
+
+    if (verdict.decision === "continue") {
+      recordAutoRetryStat(stateDir, convId, new Date(nowMs).toISOString());
+      return {
+        decision: "continue",
+        reason: verdict.reason
+      };
+    }
+
+    return { decision: "allow" };
+  } catch {
+    // Fail-open: never trap the agent in an unrecoverable loop
+    return { decision: "allow" };
+  }
+}
+
+async function main() {
+  const raw = await readStdin(1000);
+  const out = await runStop(raw, process.env);
+  process.stdout.write(JSON.stringify(out) + "\n");
+}
+
+if (isDirectRun(import.meta.url)) {
+  main().catch(() => {
+    process.stdout.write('{"decision":"allow"}\n');
+  });
+}

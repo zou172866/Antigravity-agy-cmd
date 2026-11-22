@@ -1,0 +1,21 @@
+{
+  "command": "node",
+  "args": ["server.mjs"],
+  "restart_policy": "always",
+  "display_name": "agy-cmd 自动路由",
+  "description": "手动调节 agy-cmd 防停机自动重试次数（不重试 / N 次 / 一直重试）与账号套餐档位（免费防报错模式 / Pro-Ultra 会员 Boost 自动接入）。",
+  "has_web_ui": true,
+  "agent_permissions": {
+    "allows_user_interactions": true
+  },
+  "ui_config": {
+    "display_name": "agy-cmd 自动路由",
+    "views": [
+      {
+        "path": "/",
+        "entrypoint": "SIDECAR_UI_ENTRYPOINT_AUX_PANE",
+        "title": "agy-cmd 自动路由"
+      }
+    ]
+  }
+}

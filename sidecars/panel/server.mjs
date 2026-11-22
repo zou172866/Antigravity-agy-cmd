@@ -1,0 +1,227 @@
+#!/usr/bin/env node
+/**
+ * agy-cmd Right-Hand Auxiliary Sidecar Server:
+ * Runs natively inside Antigravity via `sidecar_sdk` (`SidecarApp` with POST-only
+ * token-authenticated `/api/*` endpoints), and supports standalone loopback HTTP
+ * mode (`127.0.0.1`) for local browser preview and automated integration tests.
+ */
+import crypto from "node:crypto";
+import fs from "node:fs";
+import http from "node:http";
+import os from "node:os";
+import path from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { isDirectRun, resolveStateDir } from "../../hooks/lib/common.mjs";
+import {
+  dispatchPanelApi,
+  isAllowedLocalRequest,
+  NO_STORE_HEADERS,
+  timingSafeEqualStr
+} from "./api-handler.mjs";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const HTML_PATH = path.join(__dirname, "index.html");
+const MAX_BODY_BYTES = 32 * 1024;
+
+export function renderPanelHtml(csrfToken = "") {
+  const tpl = fs.readFileSync(HTML_PATH, "utf8");
+  return tpl.replace(/__AGY_CMD_CSRF__/g, csrfToken);
+}
+
+function readJsonBody(req, maxBytes = MAX_BODY_BYTES) {
+  return new Promise((resolve) => {
+    let raw = "";
+    let bytes = 0;
+    let overflow = false;
+    req.setEncoding("utf8");
+    req.on("data", (chunk) => {
+      bytes += Buffer.byteLength(chunk, "utf8");
+      if (bytes > maxBytes) {
+        overflow = true;
+        req.destroy();
+        return;
+      }
+      raw += chunk;
+    });
+    req.on("end", () => {
+      if (overflow) {
+        resolve({ ok: false, status: 413, error: "Payload too large" });
+        return;
+      }
+      if (!raw.trim()) {
+        resolve({ ok: true, data: {} });
+        return;
+      }
+      try {
+        const parsed = JSON.parse(raw);
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+          resolve({ ok: false, status: 400, error: "Request body must be a JSON object" });
+          return;
+        }
+        resolve({ ok: true, data: parsed });
+      } catch {
+        resolve({ ok: false, status: 400, error: "Malformed JSON body" });
+      }
+    });
+    req.on("error", () => {
+      resolve({ ok: false, status: 400, error: "Request stream error" });
+    });
+  });
+}
+
+export function createStandaloneServer({
+  stateDir = resolveStateDir(process.env),
+  csrfToken = crypto.randomBytes(24).toString("hex")
+} = {}) {
+  const sendJson = (res, status, payload) => {
+    res.writeHead(status, {
+      "Content-Type": "application/json; charset=utf-8",
+      ...NO_STORE_HEADERS
+    });
+    res.end(JSON.stringify(payload));
+  };
+
+  return http.createServer(async (req, res) => {
+    if (!isAllowedLocalRequest(req)) {
+      sendJson(res, 403, { ok: false, error: "Forbidden origin or host" });
+      return;
+    }
+
+    const url = new URL(req.url || "/", "http://127.0.0.1");
+
+    if (req.method === "GET" && url.pathname === "/") {
+      const html = renderPanelHtml(csrfToken);
+      res.writeHead(200, {
+        "Content-Type": "text/html; charset=utf-8",
+        ...NO_STORE_HEADERS
+      });
+      res.end(html);
+      return;
+    }
+
+    if (req.method === "GET" && url.pathname === "/preload.js") {
+      res.writeHead(200, {
+        "Content-Type": "application/javascript; charset=utf-8",
+        ...NO_STORE_HEADERS
+      });
+      res.end("/* standalone noop preload */\n");
+      return;
+    }
+
+    if (url.pathname.startsWith("/api/")) {
+      if (req.method !== "POST") {
+        sendJson(res, 405, { ok: false, error: "Method Not Allowed (use POST)" });
+        return;
+      }
+      const providedToken = String(req.headers["x-agy-cmd-csrf"] || "");
+      if (!timingSafeEqualStr(providedToken, csrfToken)) {
+        sendJson(res, 401, { ok: false, error: "Invalid or missing CSRF token" });
+        return;
+      }
+      const parsed = await readJsonBody(req);
+      if (!parsed.ok) {
+        sendJson(res, parsed.status, { ok: false, error: parsed.error });
+        return;
+      }
+      const out = dispatchPanelApi(url.pathname, parsed.data, { stateDir });
+      sendJson(res, out.status, out.body);
+      return;
+    }
+
+    res.writeHead(404, NO_STORE_HEADERS);
+    res.end("Not Found");
+  });
+}
+
+function shouldUseSidecarSdk(env, hasSidecarApp) {
+  if (!hasSidecarApp) return false;
+  if (env.SIDECAR_FORCE_HTTP === "1") return false;
+  return Boolean(
+    env.ANTIGRAVITY_LS_ADDRESS?.trim() &&
+      env.ANTIGRAVITY_CSRF_TOKEN?.trim() &&
+      env.ANTIGRAVITY_SIDECAR_WEB_PORT?.trim() &&
+      env.ANTIGRAVITY_SIDECAR_UI_TOKEN?.trim()
+  );
+}
+
+async function start() {
+  const stateDir = resolveStateDir(process.env);
+  const csrfToken = crypto.randomBytes(24).toString("hex");
+
+  let SidecarApp = null;
+  let SidecarResponse = null;
+  try {
+    const userSdk = path.join(os.homedir(), ".gemini", "config", "node_modules", "sidecar_sdk", "index.mjs");
+    const mod = await import(pathToFileURL(userSdk).href);
+    SidecarApp = mod.SidecarApp;
+    SidecarResponse = mod.Response || null;
+  } catch {
+    try {
+      const mod = await import("sidecar_sdk");
+      SidecarApp = mod.SidecarApp;
+      SidecarResponse = mod.Response || null;
+    } catch {
+      // Standalone mode
+    }
+  }
+
+  if (shouldUseSidecarSdk(process.env, Boolean(SidecarApp))) {
+    const app = new SidecarApp();
+    const wrapJson = (out) => {
+      const serialized = JSON.stringify(out.body);
+      if (SidecarResponse) {
+        return new SidecarResponse(serialized, {
+          status: out.status,
+          contentType: "application/json; charset=utf-8",
+          headers: NO_STORE_HEADERS
+        });
+      }
+      return out.body;
+    };
+
+    app.page("/", () => {
+      const html = renderPanelHtml(csrfToken);
+      if (SidecarResponse) {
+        return new SidecarResponse(html, {
+          status: 200,
+          contentType: "text/html; charset=utf-8",
+          headers: NO_STORE_HEADERS
+        });
+      }
+      return html;
+    });
+
+    for (const route of ["/api/state", "/api/settings", "/api/dismiss-onboarding"]) {
+      app.api(
+        route,
+        (rawData) =>
+          wrapJson(
+            dispatchPanelApi(route, rawData, {
+              stateDir,
+              defaultConvId: app.config?.conversationId || ""
+            })
+          ),
+        "POST"
+      );
+    }
+
+    await app.run();
+    return;
+  }
+
+  const rawPort = Number.parseInt(process.env.AGY_CMD_PANEL_PORT || "0", 10);
+  const port = Number.isFinite(rawPort) && rawPort >= 0 ? rawPort : 0;
+  const server = createStandaloneServer({ stateDir, csrfToken });
+  server.listen(port, "127.0.0.1", () => {
+    const addr = server.address();
+    const boundPort = typeof addr === "object" && addr ? addr.port : port;
+    console.log(`[agy-cmd panel] listening at http://127.0.0.1:${boundPort}`);
+  });
+}
+
+if (isDirectRun(import.meta.url)) {
+  start().catch((err) => {
+    console.error("[agy-cmd panel] fatal startup error:", err?.message || err);
+    process.exit(1);
+  });
+}
