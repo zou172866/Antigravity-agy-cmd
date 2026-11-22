@@ -6,19 +6,19 @@
   .\install.ps1
 #>
 $ErrorActionPreference = "Stop"
+$ScriptPath = $MyInvocation.MyCommand.Path
 
 if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
-  Write-Error "Node.js >= 20 is required. Install Node.js first: https://nodejs.org/"
-  exit 1
+  $msg = "Node.js >= 20 is required. Install Node.js first: https://nodejs.org/"
+  if ($ScriptPath) { Write-Error $msg; exit 1 } else { throw $msg }
 }
 
 $PythonBin = if (Get-Command python -ErrorAction SilentlyContinue) { "python" } elseif (Get-Command python3 -ErrorAction SilentlyContinue) { "python3" } else { "" }
 if (-not $PythonBin) {
-  Write-Error "Python 3 is required to configure agy-cmd."
-  exit 1
+  $msg = "Python 3 is required to configure agy-cmd."
+  if ($ScriptPath) { Write-Error $msg; exit 1 } else { throw $msg }
 }
 
-$ScriptPath = $MyInvocation.MyCommand.Path
 $ScriptDir = if ($ScriptPath) { Split-Path -Parent $ScriptPath } else { "" }
 $LocalSetup = if ($ScriptDir) { Join-Path $ScriptDir "skills\agy-cmd\scripts\setup_auto_router.py" } else { "" }
 $TempWorkDir = ""
@@ -45,7 +45,9 @@ try {
   }
 
   & $PythonBin $LocalSetup --install @args
-  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+  if ($LASTEXITCODE -ne 0) {
+    if ($ScriptPath) { exit $LASTEXITCODE } else { throw "agy-cmd installer failed with exit code $LASTEXITCODE" }
+  }
 } finally {
   if ($TempWorkDir -and (Test-Path -LiteralPath $TempWorkDir)) {
     Remove-Item -LiteralPath $TempWorkDir -Recurse -Force -ErrorAction SilentlyContinue

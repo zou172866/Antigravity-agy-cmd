@@ -139,7 +139,8 @@ function normalizeBareTool(rawName, args = {}) {
   }
   const suffixMatch = name.match(/(?:^|[_:])(apply_edits|run_checks)$/);
   if (suffixMatch) {
-    return { bareTool: suffixMatch[1], effectiveArgs: args && typeof args === "object" ? args : {} };
+    const parsedDirect = typeof args === "string" ? parseMaybeJson(args) : args;
+    return { bareTool: suffixMatch[1], effectiveArgs: parsedDirect && typeof parsedDirect === "object" ? parsedDirect : {} };
   }
   return { bareTool: name, effectiveArgs: args && typeof args === "object" ? args : {} };
 }
@@ -213,8 +214,9 @@ function extractEditFiles(bareTool, args = {}) {
     if (label && !out.includes(label)) out.push(label);
   };
   if (bareTool === "apply_edits") {
-    if (Array.isArray(args.edits)) {
-      for (const e of args.edits) {
+    const editsArr = Array.isArray(args.edits) ? args.edits : parseMaybeJson(args.edits);
+    if (Array.isArray(editsArr)) {
+      for (const e of editsArr) {
         if (e && e.path) push(e.path);
         if (out.length >= 4) break;
       }
@@ -231,7 +233,8 @@ function extractCommandString(bareTool, args = {}) {
     return unwrapCliFilterCommand(raw);
   }
   if (bareTool === "run_checks") {
-    const cmds = Array.isArray(args.commands) ? args.commands : [];
+    const parsedCmds = Array.isArray(args.commands) ? args.commands : parseMaybeJson(args.commands);
+    const cmds = Array.isArray(parsedCmds) ? parsedCmds : [];
     return cmds
       .map((c) => (typeof c === "string" ? c : c?.name || c?.command || ""))
       .filter(Boolean)
@@ -310,7 +313,7 @@ function classifyEditOutcome(bareTool, hasArtifactMeta, looksLikePlanPath, error
 
   const abortedNoWrite =
     !explicitlyApplied &&
-    /^\s*(?:(?:Atomic edit aborted|Edit aborted|Validation failed)\s*\(0 files modified\)|Write failed \(changes rolled back\)|Encountered error in step execution|Tool error \()/i.test(
+    /^\s*(?:(?:Atomic edit aborted|Edit aborted|Validation failed)\s*\(0 files modified\)|Write failed \(changes rolled back\)|Encountered error in step execution|Tool error \(|Error(?:\s*\[[A-Z0-9_]+\])?:)/i.test(
       body
     );
 

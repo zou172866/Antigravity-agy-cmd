@@ -1239,3 +1239,29 @@ test("hooks.json cross-workspace bootstrapper executes all 4 hooks cleanly from 
     assert.ok(checkFn(parsed), `${evName} unexpected output: ${res.stdout}`);
   }
 });
+
+test("detector classifies stringified apply_edits.edits and Error [HOST_SERIALIZATION_CORRUPTION] zero-write aborts", () => {
+  const okEvents = classifyToolEvents({
+    conversationId: "det-str-1",
+    toolCall: {
+      name: "mcp_agy-dart_fast_apply_edits",
+      args: { edits: JSON.stringify([{ path: "src/app.mjs", create: "export default 1;\n" }]) }
+    },
+    toolResponse: "Applied edits to 1 file(s):\n- src/app.mjs: created, lines +1"
+  });
+  assert.equal(okEvents.length, 1);
+  assert.equal(okEvents[0].failed, false);
+  assert.deepEqual(okEvents[0].files, ["src/app.mjs"]);
+
+  const corruptEvents = classifyToolEvents({
+    conversationId: "det-str-2",
+    toolCall: {
+      name: "call_mcp_tool",
+      args: { ServerName: "agy-dart_fast", ToolName: "apply_edits", Arguments: { edits: [] } }
+    },
+    toolResponse: "Error [HOST_SERIALIZATION_CORRUPTION]: 'edits' must be a non-empty array of file edit objects"
+  });
+  assert.equal(corruptEvents.length, 1);
+  assert.equal(corruptEvents[0].failed, true);
+  assert.equal(corruptEvents[0].abortedNoWrite, true);
+});

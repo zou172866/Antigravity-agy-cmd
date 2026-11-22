@@ -43,8 +43,16 @@ elif command -v curl >/dev/null 2>&1; then
   echo "[agy-cmd] Downloading archive from GitHub..."
   mkdir -p "$REPO_DIR"
   curl -fsSL "https://github.com/zou172866/agy-cmd/archive/refs/heads/main.tar.gz" | tar -xz --strip-components=1 -C "$REPO_DIR"
+elif command -v wget >/dev/null 2>&1; then
+  echo "[agy-cmd] Downloading archive from GitHub..."
+  mkdir -p "$REPO_DIR"
+  wget -qO- "https://github.com/zou172866/agy-cmd/archive/refs/heads/main.tar.gz" | tar -xz --strip-components=1 -C "$REPO_DIR"
+elif command -v tar >/dev/null 2>&1; then
+  echo "[agy-cmd] Downloading archive from GitHub via Node.js..."
+  mkdir -p "$REPO_DIR"
+  node -e 'fetch("https://github.com/zou172866/agy-cmd/archive/refs/heads/main.tar.gz").then(r=>{if(!r.ok)process.exit(1);return r.arrayBuffer()}).then(b=>process.stdout.write(Buffer.from(b))).catch(()=>process.exit(1))' | tar -xz --strip-components=1 -C "$REPO_DIR"
 else
-  echo "Error: Either git or curl is required for remote installation." >&2
+  echo "Error: git, curl, wget, or tar is required for remote installation." >&2
   exit 1
 fi
 
