@@ -215,7 +215,8 @@ export function inspectTranscriptTail(transcriptPath) {
     stepsByIndex: new Map(),
     taskResultsByStepIdx: new Map(),
     latestPlanModeDenial: null,
-    latestUserInput: ""
+    latestUserInput: "",
+    awaitingUserApprovalOrQuestion: false
   };
   if (!transcriptPath) return empty;
 
@@ -227,6 +228,7 @@ export function inspectTranscriptTail(transcriptPath) {
   let latestPlanModeDenial = null;
   let latestUserInput = "";
   let lastPlannerStep = null;
+  let awaitingUserApprovalOrQuestion = false;
 
   for (const step of steps) {
     const idx = Number.isFinite(Number(step.step_index)) ? Math.floor(Number(step.step_index)) : null;
@@ -235,14 +237,31 @@ export function inspectTranscriptTail(transcriptPath) {
       if (typeof step.content === "string" && step.content.trim()) {
         latestUserInput = step.content;
       }
-      // A new user turn supersedes any prior turn's Plan Mode denial
+      // A new user turn supersedes any prior turn's Plan Mode denial or approval wait
       latestPlanModeDenial = null;
       lastPlannerStep = null;
+      awaitingUserApprovalOrQuestion = false;
       continue;
     }
 
     if (step.type === "PLANNER_RESPONSE") {
       lastPlannerStep = step;
+      const pContent = typeof step.content === "string" ? step.content : "";
+      const pCalls = Array.isArray(step.tool_calls)
+        ? step.tool_calls
+        : Array.isArray(step.toolCalls)
+          ? step.toolCalls
+          : [];
+      const calledAskQuestion = pCalls.some((c) => nonEmptyString(c?.name) === "ask_question");
+      const calledPlanWrite = pCalls.some((c) => isPlanWriteToolCall(c));
+      const hasApprovalOrGrillBadge =
+        /\[agy-cmd\s*→\s*\/(?:plan\s*审批|grill-me\s*追问)\]/.test(pContent);
+      if (calledAskQuestion || calledPlanWrite || hasApprovalOrGrillBadge) {
+        awaitingUserApprovalOrQuestion = true;
+      } else if (pCalls.length > 0) {
+        // Subsequent non-plan/non-question tool calls mean execution resumed after user answered
+        awaitingUserApprovalOrQuestion = false;
+      }
       continue;
     }
 
@@ -310,7 +329,8 @@ export function inspectTranscriptTail(transcriptPath) {
     stepsByIndex,
     taskResultsByStepIdx,
     latestPlanModeDenial,
-    latestUserInput
+    latestUserInput,
+    awaitingUserApprovalOrQuestion
   };
 }
 

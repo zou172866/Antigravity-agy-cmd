@@ -45,7 +45,7 @@ class TestPluginManifestsAndSync(unittest.TestCase):
     def test_plugin_json_hooks_json_and_sidecar_schema(self) -> None:
         plugin_meta = json.loads(PLUGIN_JSON_PATH.read_text(encoding="utf-8"))
         self.assertEqual(plugin_meta["name"], "agy-cmd")
-        self.assertEqual(plugin_meta["version"], "2.1.0")
+        self.assertEqual(plugin_meta["version"], "2.1.1")
         self.assertTrue((PLUGIN_ROOT / plugin_meta["logo"]).is_file())
 
         hooks = json.loads(HOOKS_JSON_PATH.read_text(encoding="utf-8"))
@@ -133,15 +133,31 @@ class TestSetupAutoRouterCLI(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             st_dir = Path(tmp) / "state"
 
-            # Set retry to 5
+            # Set retry to 5 (default retry_scope should be smart)
             r1 = run_cli("--auto-retry", "5", "--state-dir", str(st_dir))
             self.assertEqual(r1.returncode, 0, r1.stderr)
+            self.assertIn("智能无感触发", r1.stdout)
             s1 = json.loads((st_dir / "settings.json").read_text(encoding="utf-8"))
             self.assertEqual(s1["autoRetryMode"], "count")
             self.assertEqual(s1["autoRetryMax"], 5)
+            self.assertEqual(s1["autoRetryScope"], "smart")
             self.assertEqual(s1["planTier"], "free")
             self.assertFalse(s1["boostEnabled"])
             self.assertTrue(s1["configuredByUser"])
+
+            # Switch retry-scope explicitly to goal_only and back to smart
+            r_scope = run_cli("--retry-scope", "goal_only", "--state-dir", str(st_dir))
+            self.assertEqual(r_scope.returncode, 0, r_scope.stderr)
+            self.assertEqual(
+                json.loads((st_dir / "settings.json").read_text(encoding="utf-8"))["autoRetryScope"],
+                "goal_only",
+            )
+            r_smart = run_cli("--retry-scope", "smart", "--state-dir", str(st_dir))
+            self.assertEqual(r_smart.returncode, 0, r_smart.stderr)
+            self.assertEqual(
+                json.loads((st_dir / "settings.json").read_text(encoding="utf-8"))["autoRetryScope"],
+                "smart",
+            )
 
             # Set retry to infinite + enable boost (auto-promotes to paid)
             r2 = run_cli("--auto-retry", "infinite", "--boost", "on", "--state-dir", str(st_dir))

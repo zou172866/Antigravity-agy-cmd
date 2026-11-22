@@ -38,9 +38,9 @@ description: Antigravity 桌面端/IDE 高阶能力自动路由与内置斜杠�
   python scripts/setup_auto_router.py --plan-tier paid --boost on
   python scripts/setup_auto_router.py --boost off
   ```
-- **切换重试触发范围**（`goal_only` 仅口令触发 / `all_failures` 所有测试失败均触发）：
+- **切换重试触发范围**（`smart` 默认智能无感触发 / `all_failures` 所有失败均触发 / `goal_only` 仅口令触发）：
   ```bash
-  python scripts/setup_auto_router.py --retry-scope goal_only
+  python scripts/setup_auto_router.py --retry-scope smart
   ```
 - **查看状态 / 安装同步 / 零漂移校验 / 关闭**：
   ```bash
@@ -61,7 +61,7 @@ description: Antigravity 桌面端/IDE 高阶能力自动路由与内置斜杠�
 | ≥5 个对象需语义批处理 | **自动代执行** `[agy-cmd → /run-workflow]` | 读 `run-workflow` 编写并发脚本（`model="inherit"`，3～5 项复用多轮 Worker；套餐受限时降级分批顺序执行） |
 | 动态网页操作或复杂可视化图表 | **自动代执行** `[agy-cmd → /browser]` / `[agy-cmd → /generative_ui]` | 委派 `browser` 子智能体或读取 `generative_ui` |
 | 反复修错未果 / 修改↔失败震荡 ≥2 次 / 连续 ≥3 次命令失败 | **套餐感知兜底** | **默认免费版**：输出 `[agy-cmd → 自动换视角排查]`，派只读 `research` 子智能体独立查根因（禁推 `/boost` 防报错）；**已开启会员 Boost**：输出 `[agy-cmd → 建议 /boost]` + 可复制口令 |
-| 要求修到全绿 / 跑通全部测试 / 中途别停 | **Stop 自动续跑监工** | 结束前实际运行验证命令，由 `Stop` 钩子按设定次数自动拦截未全绿停机并继续修复（支持单句临时说“这次最多重试 5 次 / 这次不用重试 / 一直重试”） |
+| 日常改代码后命令未过 / 要求修错但测试未绿 | **Stop 自动续跑监工** | 免口令免声明：改过源码后命令失败或要求修错但单测/构建未绿时自动拦截续跑；自然问原因（“为什么挂了/分析报错”）、查看状态、环境探测或等待方案审批时自动识别放行 |
 
 ### 模式 C：指令选型参谋与分类速查
 

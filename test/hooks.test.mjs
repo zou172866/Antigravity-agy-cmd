@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url";
 import {
   extractActiveSlashCommands,
   isSubagentPayload,
+  resolveStateDir,
   sanitizeConversationId,
   sanitizeSnippet,
   unwrapUserRequestText
@@ -729,6 +730,14 @@ test("PLUGIN_DATA env var is used by hooks when AGY_CMD_STATE_DIR is unset", () 
   assert.deepEqual(Object.keys(parsed.injectSteps[0].systemMessage), ["systemMessage"]);
   assert.match(parsed.injectSteps[0].systemMessage.systemMessage, /自动换视角排查/);
   assert.ok(fs.existsSync(path.join(dir, "sessions", "shell-e2e.state.json")));
+
+  // Cross-plugin MCP env guard: if invoked under another plugin's MCP server (e.g. PLUGIN_DATA=.../plugin_data/agy-dart),
+  // resolveStateDir redirects to sibling .../plugin_data/agy-cmd instead of polluting agy-dart!
+  const fakeParent = path.join(dir, "plugin_data");
+  assert.equal(
+    resolveStateDir({ PLUGIN_DATA: path.join(fakeParent, "agy-dart"), AGY_CMD_STATE_DIR: "" }),
+    path.join(fakeParent, "agy-cmd")
+  );
 });
 
 test("pure evaluatePreInvocation handles null/missing fields gracefully", () => {

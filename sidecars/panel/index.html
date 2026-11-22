@@ -345,7 +345,7 @@
         <span class="brand-icon">/</span>
         <span>agy-cmd 自动路由</span>
       </div>
-      <span class="ver-pill">v2.1</span>
+      <span class="ver-pill">v2.1.1</span>
     </div>
 
     <div id="onboard-card" class="onboard-card" hidden>
@@ -395,19 +395,26 @@
       </div>
 
       <div class="scope-list">
-        <label id="scope-goal" class="radio-row">
+        <label id="scope-smart" class="radio-row">
           <div class="row-text">
-            <b>仅口令触发（推荐）</b>
-            <small>说出“修到全绿 / 一直修别停”等诉求时激活自动续跑</small>
+            <b>智能无感触发（推荐）</b>
+            <small>免口令免声明：改代码或修错未绿时自动续跑；问原因、排查分析、查看测试或环境自动放行</small>
           </div>
-          <input type="radio" name="retry-scope" value="goal_only">
+          <input type="radio" name="retry-scope" value="smart">
         </label>
         <label id="scope-all" class="radio-row">
           <div class="row-text">
-            <b>所有测试失败均触发</b>
-            <small>只要当轮跑过命令/测试且最后一次仍失败，就自动续跑</small>
+            <b>所有命令失败均触发</b>
+            <small>只要当轮跑过非只读命令且最后一次仍失败，一律强制续跑</small>
           </div>
           <input type="radio" name="retry-scope" value="all_failures">
+        </label>
+        <label id="scope-goal" class="radio-row">
+          <div class="row-text">
+            <b>仅口令按需触发</b>
+            <small>平时不介入，仅在说出“修到全绿 / 一直修别停 / 重试 N 次”时激活</small>
+          </div>
+          <input type="radio" name="retry-scope" value="goal_only">
         </label>
       </div>
 
@@ -553,6 +560,7 @@
       const inpMax = $("inp-max");
       const btnDec = $("btn-dec");
       const btnInc = $("btn-inc");
+      const scopeSmart = $("scope-smart");
       const scopeGoal = $("scope-goal");
       const scopeAll = $("scope-all");
       const freeNote = $("free-note");
@@ -618,6 +626,7 @@
         });
 
         scopeRadios.forEach((r) => { r.checked = r.value === s.autoRetryScope; });
+        scopeSmart.classList.toggle("active", s.autoRetryScope === "smart");
         scopeGoal.classList.toggle("active", s.autoRetryScope === "goal_only");
         scopeAll.classList.toggle("active", s.autoRetryScope === "all_failures");
 

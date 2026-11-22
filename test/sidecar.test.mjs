@@ -31,17 +31,33 @@ function makeEnv(stateDir, extra = {}) {
   };
 }
 
-test("defaults: strictly starts in Free-Tier Safe Mode (boostEnabled=false) with count=3 retries and configuredByUser=false", () => {
+test("defaults: strictly starts in Free-Tier Safe Mode (boostEnabled=false) with smart count=3 retries and configuredByUser=false", () => {
   const dir = makeTmpDir();
   const s = readSettings(dir);
   assert.deepEqual(s, createDefaultSettings());
+  assert.equal(s.version, 2);
   assert.equal(s.planTier, "free");
   assert.equal(s.boostEnabled, false);
   assert.equal(s.autoRetryMode, "count");
   assert.equal(s.autoRetryMax, 3);
-  assert.equal(s.autoRetryScope, "goal_only");
+  assert.equal(s.autoRetryScope, "smart");
   assert.equal(s.configuredByUser, false);
   assert.equal(s.onboardingShown, false);
+
+  // Legacy v1 unconfigured goal_only auto-migrates to smart, whereas explicit user goal_only stays preserved
+  const dirLegacy = makeTmpDir();
+  fs.writeFileSync(
+    path.join(dirLegacy, "settings.json"),
+    JSON.stringify({ version: 1, planTier: "free", autoRetryScope: "goal_only", configuredByUser: false }) + "\n"
+  );
+  assert.equal(readSettings(dirLegacy).autoRetryScope, "smart");
+
+  const dirExplicit = makeTmpDir();
+  fs.writeFileSync(
+    path.join(dirExplicit, "settings.json"),
+    JSON.stringify({ version: 1, planTier: "free", autoRetryScope: "goal_only", configuredByUser: true }) + "\n"
+  );
+  assert.equal(readSettings(dirExplicit).autoRetryScope, "goal_only");
 });
 
 test("parseTurnRetryOverride parses off / count (Arabic & Chinese) / infinite and ignores global config sentences", () => {
@@ -285,6 +301,172 @@ test("Stop hook safety brake: No-Progress Guard allows stopping when model asks 
     6150
   );
   assert.deepEqual(second, { decision: "allow" });
+});
+
+test("Stop hook default smart scope: zero-passphrase auto-retry on code edits & failing tests, zero false positives on read-only/env probes", async () => {
+  const dir = makeTmpDir();
+  const env = makeEnv(dir);
+  // Uses pure out-of-the-box default settings (autoRetryScope = "smart", max = 3)
+
+  // 1. Normal feature/refactor prompt (ZERO magic phrase) + edit + custom script failure -> MUST continue, with 0 PreInvocation noise!
+  const cEdit = "smart-edit-fail";
+  const pre1 = await runPreInvocation(
+    { conversationId: cEdit, invocationNum: 0, initialNumSteps: 1, lastUserInput: "给导出接口加一个字段校验" },
+    env,
+    7000
+  );
+  assert.deepEqual(pre1, {});
+  await runPostToolUse({ conversationId: cEdit, toolCall: { name: "edit_file", args: { Path: "src/export.js" } } }, env, 7020);
+  await runPostToolUse(
+    { conversationId: cEdit, toolCall: { name: "run_command", args: { CommandLine: "node scripts/smoke.js" } }, error: "exit status 1" },
+    env,
+    7040
+  );
+  const stopEdit = await runStop(
+    { conversationId: cEdit, executionNum: 0, terminationReason: "NO_TOOL_CALL", fullyIdle: true, lastUserInput: "给导出接口加一个字段校验" },
+    env,
+    7060
+  );
+  assert.equal(stopEdit.decision, "continue");
+  assert.match(stopEdit.reason, /1\/3/);
+
+  // 2. Normal bugfix / compound "analyze + fix" prompts + failing verify BEFORE edit -> MUST continue!
+  for (const [id, prompt, ts] of [
+    ["smart-verify-1", "不要修改别的文件，修好 auth.py 的报错", 7100],
+    ["smart-verify-2", "分析一下为什么挂了，顺便修好", 7150]
+  ]) {
+    await runPreInvocation({ conversationId: id, invocationNum: 0, initialNumSteps: 1, lastUserInput: prompt }, env, ts);
+    await runPostToolUse(
+      { conversationId: id, toolCall: { name: "run_command", args: { CommandLine: "pytest" } }, error: "exit status 1" },
+      env,
+      ts + 20
+    );
+    const stopRes = await runStop(
+      { conversationId: id, executionNum: 0, terminationReason: "NO_TOOL_CALL", fullyIdle: true, lastUserInput: prompt },
+      env,
+      ts + 40
+    );
+    assert.equal(stopRes.decision, "continue", `Expected continue for "${prompt}"`);
+  }
+
+  // 3. Natural diagnostic / inquiry / status-check prompts WITHOUT any explicit "先别改代码" declaration -> MUST auto-recognize & allow stop!
+  for (const [id, prompt, ts] of [
+    ["smart-ask-why", "为什么 pytest 会挂？", 7200],
+    ["smart-ask-cause", "帮我看看这个报错是什么原因", 7230],
+    ["smart-ask-past-edit", "为什么我刚才修改之后还是挂？", 7260],
+    ["smart-diagnose", "排查一下编译不过的问题出在哪", 7290],
+    ["smart-check-fixed", "看看修好了吗？", 7310],
+    ["smart-pure-run", "跑一下 pytest", 7340]
+  ]) {
+    await runPreInvocation({ conversationId: id, invocationNum: 0, initialNumSteps: 1, lastUserInput: prompt }, env, ts);
+    await runPostToolUse(
+      { conversationId: id, toolCall: { name: "run_command", args: { CommandLine: "pytest" } }, error: "exit status 1" },
+      env,
+      ts + 10
+    );
+    assert.deepEqual(
+      await runStop(
+        { conversationId: id, executionNum: 0, terminationReason: "NO_TOOL_CALL", fullyIdle: true, lastUserInput: prompt },
+        env,
+        ts + 20
+      ),
+      { decision: "allow" },
+      `Natural inquiry "${prompt}" must auto-allow without needing explicit declaration`
+    );
+  }
+
+  // 4. Plan approval pause (`implementation_plan.md` artifact write + `[agy-cmd → /plan 审批]`) -> MUST NOT count plan file as code edit & MUST allow stop!
+  const cPlanWait = "smart-plan-wait";
+  const planTx = path.join(dir, "plan-wait.jsonl");
+  fs.writeFileSync(
+    planTx,
+    [
+      { step_index: 0, source: "USER_EXPLICIT", type: "USER_INPUT", status: "DONE", content: "<USER_REQUEST>\n重构三个核心模块并修好测试\n</USER_REQUEST>" },
+      { step_index: 2, source: "MODEL", type: "GENERIC", status: "DONE", content: "Command exited with code 1.\nFAILED" },
+      {
+        step_index: 3,
+        source: "MODEL",
+        type: "PLANNER_RESPONSE",
+        status: "DONE",
+        tool_calls: [
+          {
+            name: "write_file",
+            args: {
+              Path: "/mock/home/.gemini/antigravity/brain/c1/implementation_plan.md",
+              ArtifactMetadata: { RequestFeedback: true, UserFacing: true, Summary: "Plan" }
+            }
+          }
+        ]
+      },
+      { step_index: 4, source: "MODEL", type: "GENERIC", status: "DONE", content: "Created file." },
+      { step_index: 5, source: "MODEL", type: "PLANNER_RESPONSE", status: "DONE", content: "`[agy-cmd → /plan 审批]`\n请确认方案" }
+    ]
+      .map((x) => JSON.stringify(x))
+      .join("\n") + "\n"
+  );
+  await runPreInvocation(
+    { conversationId: cPlanWait, transcriptPath: planTx, invocationNum: 0, initialNumSteps: 1, lastUserInput: "重构三个核心模块并修好测试" },
+    env,
+    7360
+  );
+  await runPostToolUse(
+    { conversationId: cPlanWait, transcriptPath: planTx, stepIdx: 2, toolCall: { name: "run_command", args: { CommandLine: "pytest" } } },
+    env,
+    7370
+  );
+  await runPostToolUse(
+    {
+      conversationId: cPlanWait,
+      transcriptPath: planTx,
+      stepIdx: 4,
+      toolCall: {
+        name: "write_file",
+        args: {
+          Path: "/mock/home/.gemini/antigravity/brain/c1/implementation_plan.md",
+          ArtifactMetadata: { RequestFeedback: true, UserFacing: true, Summary: "Plan" }
+        }
+      }
+    },
+    env,
+    7380
+  );
+  assert.deepEqual(
+    await runStop(
+      { conversationId: cPlanWait, transcriptPath: planTx, executionNum: 0, terminationReason: "NO_TOOL_CALL", fullyIdle: true, lastUserInput: "重构三个核心模块并修好测试" },
+      env,
+      7390
+    ),
+    { decision: "allow" }
+  );
+
+  // 5. Environment probe ("看看本机装没装 docker" -> `docker info` exit 1, zero edits, non-verify cmd) -> smart allows, all_failures continues!
+  const cProbe = "smart-env-probe";
+  await runPreInvocation(
+    { conversationId: cProbe, invocationNum: 0, initialNumSteps: 1, lastUserInput: "看看本机装没装 docker" },
+    env,
+    7400
+  );
+  await runPostToolUse(
+    { conversationId: cProbe, toolCall: { name: "run_command", args: { CommandLine: "docker info" } }, error: "exit status 1" },
+    env,
+    7420
+  );
+  assert.deepEqual(
+    await runStop(
+      { conversationId: cProbe, executionNum: 0, terminationReason: "NO_TOOL_CALL", fullyIdle: true, lastUserInput: "看看本机装没装 docker" },
+      env,
+      7440
+    ),
+    { decision: "allow" }
+  );
+
+  updateSettings(dir, { autoRetryScope: "all_failures" });
+  const stopAll = await runStop(
+    { conversationId: cProbe, executionNum: 0, terminationReason: "NO_TOOL_CALL", fullyIdle: true, lastUserInput: "看看本机装没装 docker" },
+    env,
+    7460
+  );
+  assert.equal(stopAll.decision, "continue");
 });
 
 test("Sidecar HTTP server: serves UI, persists settings, blocks CSRF/cross-origin/GET-api, and syncs live with hooks", async () => {

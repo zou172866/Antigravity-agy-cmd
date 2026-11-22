@@ -38,7 +38,7 @@ RULE_BODY = """# Antigravity 自动路由 (agy-cmd)
   4. 动态网页/截图 → `[agy-cmd → /browser]` 调 `browser`；复杂图表/交互 → `[agy-cmd → /generative_ui]` 读 `generative_ui`；2～4 模块并行+验收（仅确认付费套餐可用时）→ `[agy-cmd → /swarm]` 读 `swarm`。
 - **防报错套餐感知与自动续跑**（禁推 CLI 专属 `/undo`、`/branch`、`/effort`；本轮已用对应 `/` 指令则不重复提示）：
   1. **卡壳排错（默认免费版防报错）**：同一 Bug 跨 ≥2 轮未解、≥2 次「修改→仍失败」震荡、连续 ≥3 次命令失败或难算法 → **默认严禁主动推荐 `/boost`、`/teamwork` 等付费指令以防免费号报错**；仅当收到 `agy-cmd` 钩子明确指示输出 `[agy-cmd → 建议 /boost]` 时才给 `/boost` 口令，否则统一输出 `[agy-cmd → 自动换视角排查]`，停止盲改并调只读 `research` 子智能体独立核查根因或先列排查假设逐一验证。
-  2. **无人值守全绿（自动续跑监工）**：用户要求「修到全绿 / 跑通全部测试 / 一直修别停」→ 结束前必须实际运行验证命令以便 `agy-cmd` `Stop` 钩子核验并按右侧面板设定次数自动续跑；按钩子提示输出 `[agy-cmd → 自动续跑已启用]` 或 `[agy-cmd → 建议 /goal]`。
+  2. **防停机自动续跑（Stop 监工）**：改代码或修错后若存在现成测试/构建命令，结束前优先实跑验证以便 `agy-cmd` `Stop` 钩子无感核验并在未通过时按面板设定次数自动续跑；仅当收到钩子明确提示时输出 `[agy-cmd → 自动续跑已启用]` 或 `[agy-cmd → 建议 /goal]`。
   3. **调节重试/Boost 与指令选型**：当用户调节自动重试次数、切换会员/Boost 开关，或查询对比指令时，读 `agy-cmd` `SKILL.md`（可附 `[agy-cmd 自动路由](sidecar://agy-cmd/panel/)` 面板入口）。
 """
 
@@ -82,7 +82,10 @@ def resolve_state_dir(custom_state_dir: str | None = None) -> Path:
         return Path(env_custom).expanduser().resolve()
     plugin_data = os.environ.get("PLUGIN_DATA", "").strip()
     if plugin_data:
-        return Path(plugin_data).expanduser().resolve()
+        resolved = Path(plugin_data).expanduser().resolve()
+        if resolved.parent.name.lower() == "plugin_data" and resolved.name.lower() != PLUGIN_NAME:
+            return resolved.parent / PLUGIN_NAME
+        return resolved
     return Path.home() / ".gemini" / "antigravity" / "plugin_data" / PLUGIN_NAME
 
 
@@ -104,12 +107,12 @@ def save_json_atomic(file_path: Path, data: dict) -> None:
 
 def default_settings() -> dict:
     return {
-        "version": 1,
+        "version": 2,
         "planTier": "free",
         "boostEnabled": False,
         "autoRetryMode": "count",
         "autoRetryMax": DEFAULT_RETRY_MAX,
-        "autoRetryScope": "goal_only",
+        "autoRetryScope": "smart",
         "freeFallbackEnabled": True,
         "planFallbackEnabled": True,
         "configuredByUser": False,
@@ -134,8 +137,17 @@ def load_settings(state_dir: Path) -> dict:
             base.update({k: v for k, v in raw.items() if k != "stats"})
             if isinstance(raw.get("stats"), dict):
                 base["stats"].update(raw["stats"])
+            if (
+                raw.get("version") == 1
+                and raw.get("configuredByUser") is False
+                and raw.get("autoRetryScope") == "goal_only"
+            ):
+                base["autoRetryScope"] = "smart"
+            base["version"] = 2
     except Exception:
         return default_settings()
+    if base.get("autoRetryScope") not in ("smart", "all_failures", "goal_only"):
+        base["autoRetryScope"] = "smart"
     if base.get("planTier") != "paid":
         base["planTier"] = "free"
         base["boostEnabled"] = False
@@ -144,7 +156,13 @@ def load_settings(state_dir: Path) -> dict:
 
 def format_settings_summary(settings: dict) -> str:
     mode = settings.get("autoRetryMode", "count")
-    scope = "所有测试失败均触发" if settings.get("autoRetryScope") == "all_failures" else "口令触发"
+    raw_scope = settings.get("autoRetryScope", "smart")
+    if raw_scope == "all_failures":
+        scope = "所有失败均触发"
+    elif raw_scope == "goal_only":
+        scope = "仅口令触发"
+    else:
+        scope = "智能无感触发"
     if mode == "off":
         retry_str = "不用重试（已关闭）"
     elif mode == "infinite":
@@ -398,9 +416,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--retry-scope",
-        choices=["goal_only", "all_failures"],
+        choices=["smart", "all_failures", "goal_only"],
         default=None,
-        help="设置自动重试触发范围：goal_only（仅口令触发）或 all_failures（所有测试失败均触发）",
+        help="设置自动重试触发范围：smart（默认，智能无感触发）、all_failures（所有失败均触发）或 goal_only（仅口令触发）",
     )
     parser.add_argument(
         "--plan-tier",

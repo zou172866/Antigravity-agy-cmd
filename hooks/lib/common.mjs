@@ -122,7 +122,16 @@ export function resolveStateDir(env = process.env) {
   const custom = nonEmptyString(e.AGY_CMD_STATE_DIR);
   if (custom) return path.resolve(custom);
   const pluginData = nonEmptyString(e.PLUGIN_DATA);
-  if (pluginData) return path.resolve(pluginData);
+  if (pluginData) {
+    const resolved = path.resolve(pluginData);
+    if (
+      path.basename(path.dirname(resolved)).toLowerCase() === "plugin_data" &&
+      path.basename(resolved).toLowerCase() !== "agy-cmd"
+    ) {
+      return path.join(path.dirname(resolved), "agy-cmd");
+    }
+    return resolved;
+  }
   try {
     const home = os.homedir();
     if (home) {

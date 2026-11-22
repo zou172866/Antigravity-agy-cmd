@@ -22,6 +22,22 @@ import {
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const HTML_PATH = path.join(__dirname, "index.html");
 const MAX_BODY_BYTES = 32 * 1024;
+const WATCHED_BACKEND_FILES = [
+  fileURLToPath(import.meta.url),
+  path.join(__dirname, "api-handler.mjs"),
+  path.resolve(__dirname, "../../hooks/lib/settings.mjs"),
+  path.resolve(__dirname, "../../hooks/lib/common.mjs")
+];
+
+function snapshotBackendMtimes() {
+  return WATCHED_BACKEND_FILES.map((fp) => {
+    try {
+      return fs.statSync(fp).mtimeMs;
+    } catch {
+      return 0;
+    }
+  }).join("|");
+}
 
 export function renderPanelHtml(csrfToken = "") {
   const tpl = fs.readFileSync(HTML_PATH, "utf8");
@@ -166,6 +182,18 @@ async function start() {
   }
 
   if (shouldUseSidecarSdk(process.env, Boolean(SidecarApp))) {
+    const bootSig = snapshotBackendMtimes();
+    const reloadTimer = setInterval(() => {
+      const nextSig = snapshotBackendMtimes();
+      if (nextSig !== bootSig && !nextSig.split("|").includes("0")) {
+        clearInterval(reloadTimer);
+        // sidecar.json configures `"restart_policy": "always"`, so exiting 0 lets
+        // Antigravity respawn server.mjs with newly synced ESM modules automatically.
+        process.exit(0);
+      }
+    }, 2500);
+    reloadTimer.unref?.();
+
     const app = new SidecarApp();
     const wrapJson = (out) => {
       const serialized = JSON.stringify(out.body);

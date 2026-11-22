@@ -55,6 +55,18 @@ const DEBUG_INITIAL_RE =
 const UNATTENDED_GOAL_RE =
   /(?:无人值守|一直修|修到全绿|跑到全绿|直到(?:全部|所有)?(?:测试|编译|构建|检查)?(?:全部)?通过|修通(?:全部|所有)|中途别停|别停下来|死磕到底|自动修到|全绿为止|全部修好为止|\b(?:fix\s+(?:all|every(?:thing)?|until)\s+(?:tests?\s+)?(?:pass|green)|keep\s+(?:fixing|going|trying)\s+until\s+(?:all\s+)?(?:tests?|build|ci)\s+(?:pass|green|succeed)|don'?t\s+stop\s+until\s+(?:all\s+)?(?:tests?|build)\s+(?:pass|green)|unattended\s+(?:fix|loop|run))\b)/i;
 
+const NEGATED_EDIT_INTENT_RE =
+  /(?:(?:先)?(?:别|不要|不用|不必|勿|禁止)(?:修改|改动|改代码|动代码|写代码|改(?!动|代码)|动(?!代码)|写(?!代码)|修(?!改))(?!\s*(?:别的|其他|其它|无关|其余))|只(?:看|查|分析|解释|排查|定位|跑|运行|看看)|仅(?:分析|排查|查看|解释|定位)|\b(?:do\s+not|don'?t)\s+(?:edit|modify|change|fix)(?!\s+(?:other|unrelated|any\s+other))|\bonly\s+(?:analyze|explain|check|inspect|diagnose|run)\b)/i;
+
+const DIAGNOSTIC_OR_CHECK_INQUIRY_RE =
+  /(?:为什么|为何|怎么回事|什么原因|啥原因|什么问题|哪里(?:有|出了)?(?:问题|错|bug)|哪儿(?:有|出了)?(?:问题|错|bug)|问题出在哪|错在哪|怎么会|什么意思|(?:帮我|先|只)?(?:分析|解释|诊断|评估|定位|查一下|看看)(?:一下)?|(?:跑|运行|执行|测)一下|\b(?:why\s+(?:is|does|did|are|do)|what(?:'s|\s+is)\s+(?:wrong|causing|the\s+(?:cause|error|issue|reason))|how\s+come|explain|analyze|diagnose|investigate)\b)/i;
+
+const IMPERATIVE_FIX_INTENT_RE =
+  /(?:(?:帮我|请|顺便|直接|一起|并|再|去|试着|继续)\s*(?:修(?:复|好|掉|一下|通)?|改(?:好|掉|一下|正)?|解决|修改)|(?!\s*(?:之后|以后|后|前|之前))(?:修(?:复|好|掉|一下|通)|改(?:好|掉|一下|正)|解决(?:一下|掉)|跑通)(?!\s*(?:之后|以后|后|前|之前|了没|了吗))|把[^\n，。；！？,.;!?]{1,24}(?:修(?:复|好|掉|一下|通)|改(?:好|掉|一下|正)|跑通|解决)|\b(?:please\s+|help\s+(?:me\s+)?|and\s+|then\s+)?(?:fix|resolve|repair|patch)\s+(?:it|this|the|all|failing|broken|test|tests|build|bug|error|issue))/i;
+
+const DIRECT_TASK_MUTATE_RE =
+  /(?:^(?:修|改|修复|修改|解决|重构|实现|新增|加上?|补上?)|(?:修复|修好|修一下|修掉|改一下|改好|解决掉?|重构|实现|新增|加上|补上|跑通)|\b(?:fix|resolve|repair|refactor|implement)\b)/i;
+
 const TEAMWORK_MIGRATION_RE =
   /(?:跨天(?:重构|迁移|开发)|仓库级(?:重构|迁移|重写)|全仓库(?:重写|迁移|重构)|整个项目(?:重写|迁移)|大规模框架迁移|\b(?:repo[- ]?wide\s+(?:migration|rewrite|refactor)|multi[- ]?day\s+(?:migration|rewrite|refactor)|full\s+codebase\s+(?:migration|rewrite))\b)/i;
 
@@ -374,7 +386,7 @@ export function classifyToolEvents(payload, nowMs = Date.now(), options = {}) {
     const targetRaw = String(
       effectiveArgs.Path ?? effectiveArgs.path ?? effectiveArgs.TargetFile ?? effectiveArgs.targetFile ?? ""
     );
-    const looksLikePlanPath = /(?:implementation[_ -]?plan|plan\.md)/i.test(targetRaw);
+    const looksLikePlanPath = /(?:implementation[_ -]?plan|plan\.md|[\\/]brain[\\/])/i.test(targetRaw);
     const hasVerify = Boolean(bareTool === "apply_edits" && effectiveArgs.verify);
     const verifyCmd = hasVerify
       ? typeof effectiveArgs.verify === "string"
@@ -697,7 +709,7 @@ function normalizeCmdKey(cmd) {
   return typeof cmd === "string" ? cmd.trim().toLowerCase().replace(/\s+/g, " ") : "";
 }
 
-function analyzeEventMetrics(events) {
+function analyzeEventMetrics(events, turnFloorTs = 0) {
   let consecutiveCmdFailures = 0;
   let editFailOscillations = 0;
   let latestPassTs = 0;
@@ -705,6 +717,8 @@ function analyzeEventMetrics(events) {
   let latestEventTs = 0;
   let latestPlanModeBlock = null;
   let lastFailureCmd = "";
+  let hasTurnEdit = false;
+  let lastFailureIsVerify = false;
   const pendingEditedFiles = new Set();
   const oscillatingFiles = new Map();
   const failedCmds = new Set();
@@ -726,7 +740,11 @@ function analyzeEventMetrics(events) {
     }
 
     if (ev.kind === "edit") {
-      if (!ev.failed && !ev.abortedNoWrite) {
+      const isArtifactOrPlanEdit = Boolean(ev.hasArtifactMeta || ev.looksLikePlanPath);
+      if (!ev.failed && !ev.abortedNoWrite && !isArtifactOrPlanEdit) {
+        if (evTs >= turnFloorTs) {
+          hasTurnEdit = true;
+        }
         const files = Array.isArray(ev.files) && ev.files.length > 0 ? ev.files : ["(edited file)"];
         for (const f of files) pendingEditedFiles.add(f);
       }
@@ -737,7 +755,10 @@ function analyzeEventMetrics(events) {
       const cmdKey = normalizeCmdKey(ev.cmd);
       if (ev.failed) {
         consecutiveCmdFailures += 1;
-        if (evTs > latestFailureTs) latestFailureTs = evTs;
+        if (evTs >= latestFailureTs) {
+          latestFailureTs = evTs;
+          lastFailureIsVerify = Boolean(ev.isVerify);
+        }
         if (ev.cmd) lastFailureCmd = ev.cmd;
         if (cmdKey) failedCmds.add(cmdKey);
         if (pendingEditedFiles.size > 0) {
@@ -754,6 +775,7 @@ function analyzeEventMetrics(events) {
           continue;
         }
         consecutiveCmdFailures = 0;
+        lastFailureIsVerify = false;
         const matchesPriorFailedCmd = Boolean(cmdKey && failedCmds.has(cmdKey));
         if (ev.isVerify || matchesPriorFailedCmd) {
           if (evTs > latestPassTs) latestPassTs = evTs;
@@ -780,15 +802,36 @@ function analyzeEventMetrics(events) {
     latestEventTs,
     latestPlanModeBlock,
     lastFailureCmd,
+    hasTurnEdit,
+    lastFailureIsVerify,
     topOscillatingFiles
   };
+}
+
+function hasDirectFixOrChangeIntent(intentProse) {
+  if (!intentProse) return false;
+  if (NEGATED_EDIT_INTENT_RE.test(intentProse)) {
+    return false;
+  }
+  if (IMPERATIVE_FIX_INTENT_RE.test(intentProse)) {
+    return true;
+  }
+  if (DIAGNOSTIC_OR_CHECK_INQUIRY_RE.test(intentProse)) {
+    return false;
+  }
+  return DIRECT_TASK_MUTATE_RE.test(intentProse);
 }
 
 /**
  * Resolve effective auto-retry policy by combining persistent `settings.json`
  * with optional per-turn natural-language overrides.
  */
-export function resolveEffectiveRetryPolicy(settingsInput = {}, turnRetryOverride = null, turnUnattendedGoal = false) {
+export function resolveEffectiveRetryPolicy(
+  settingsInput = {},
+  turnRetryOverride = null,
+  turnUnattendedGoal = false,
+  smartTriggered = false
+) {
   const settings = normalizeSettings(settingsInput);
   if (turnRetryOverride && typeof turnRetryOverride === "object") {
     if (turnRetryOverride.mode === "off") {
@@ -806,7 +849,10 @@ export function resolveEffectiveRetryPolicy(settingsInput = {}, turnRetryOverrid
   if (settings.autoRetryMode === "off") {
     return { mode: "off", max: settings.autoRetryMax, active: false, overridden: false };
   }
-  const scopeMatched = settings.autoRetryScope === "all_failures" || Boolean(turnUnattendedGoal);
+  const scopeMatched =
+    settings.autoRetryScope === "all_failures" ||
+    Boolean(turnUnattendedGoal) ||
+    (settings.autoRetryScope === "smart" && Boolean(smartTriggered));
   if (!scopeMatched) {
     return { mode: settings.autoRetryMode, max: settings.autoRetryMax, active: false, overridden: false };
   }
@@ -1291,7 +1337,39 @@ export function evaluateStop(payload, events = [], prevStateInput = null, option
       UNATTENDED_GOAL_RE.test(intentProse) ||
       (turnOverride && turnOverride.mode !== "off")
   );
-  const retryPolicy = resolveEffectiveRetryPolicy(effSettings, turnOverride, turnGoal);
+  const turnFloorTs = nextState.lastTurnStartTs > 0 ? nextState.lastTurnStartTs - 1000 : 0;
+  const metrics = analyzeEventMetrics(effectiveEvents, turnFloorTs);
+  const hasUnresolvedTurnFailure =
+    metrics.consecutiveCmdFailures >= 1 && metrics.latestFailureTs >= turnFloorTs;
+
+  // Automatic pause recognition: never interrupt /plan approval or /grill-me ask_question waits
+  if (transcriptTail?.awaitingUserApprovalOrQuestion) {
+    return {
+      decision: "allow",
+      reason: "",
+      reasonCode: "awaiting_user_input",
+      nextState,
+      stateChanged,
+      metrics
+    };
+  }
+
+  // Smart automatic classification (zero explicit user declaration needed):
+  // - If AI edited workspace code in this turn (`hasTurnEdit`), finish until green.
+  // - If AI has NOT edited any code (`!hasTurnEdit`), natural inquiries ("为什么挂了？", "分析报错原因",
+  //   "排查哪里有问题", "跑一下测试", env probes) automatically stop cleanly; only explicit fix/repair
+  //   requests ("帮我修一下报错", "分析原因并修好") push past a lazy pre-edit test failure.
+  const explicitNoEdit = !turnGoal && !metrics.hasTurnEdit && NEGATED_EDIT_INTENT_RE.test(intentProse);
+  const smartTriggered =
+    !explicitNoEdit &&
+    (metrics.hasTurnEdit ||
+      (metrics.lastFailureIsVerify && hasDirectFixOrChangeIntent(intentProse)));
+  const retryPolicy = resolveEffectiveRetryPolicy(
+    effSettings,
+    turnOverride,
+    turnGoal,
+    smartTriggered
+  );
 
   if (!retryPolicy.active) {
     return {
@@ -1300,14 +1378,9 @@ export function evaluateStop(payload, events = [], prevStateInput = null, option
       reasonCode: "retry_inactive",
       nextState,
       stateChanged,
-      metrics: null
+      metrics
     };
   }
-
-  const metrics = analyzeEventMetrics(effectiveEvents);
-  const turnFloorTs = nextState.lastTurnStartTs > 0 ? nextState.lastTurnStartTs - 1000 : 0;
-  const hasUnresolvedTurnFailure =
-    metrics.consecutiveCmdFailures >= 1 && metrics.latestFailureTs >= turnFloorTs;
 
   if (!hasUnresolvedTurnFailure) {
     if (nextState.turnAutoRetries !== 0 || nextState.lastContinueEventSig !== "") {

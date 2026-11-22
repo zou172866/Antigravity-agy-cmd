@@ -5,9 +5,10 @@ import path from "node:path";
 export const MIN_RETRY_MAX = 1;
 export const MAX_RETRY_MAX = 50;
 export const DEFAULT_RETRY_MAX = 3;
+export const SETTINGS_VERSION = 2;
 
 export const VALID_RETRY_MODES = new Set(["off", "count", "infinite"]);
-export const VALID_RETRY_SCOPES = new Set(["goal_only", "all_failures"]);
+export const VALID_RETRY_SCOPES = new Set(["smart", "all_failures", "goal_only"]);
 export const VALID_PLAN_TIERS = new Set(["free", "paid"]);
 
 const CN_DIGIT_MAP = {
@@ -41,13 +42,13 @@ const GLOBAL_CONFIG_MUTATION_RE =
 
 export function createDefaultSettings() {
   return {
-    version: 1,
+    version: SETTINGS_VERSION,
     // Default strictly to Free-Tier Safe Mode so non-subscribers never hit /boost errors.
     planTier: "free",
     boostEnabled: false,
     autoRetryMode: "count",
     autoRetryMax: DEFAULT_RETRY_MAX,
-    autoRetryScope: "goal_only",
+    autoRetryScope: "smart",
     freeFallbackEnabled: true,
     planFallbackEnabled: true,
     configuredByUser: false,
@@ -109,9 +110,15 @@ export function normalizeSettings(raw = {}) {
     ? src.autoRetryMode
     : def.autoRetryMode;
   const autoRetryMax = clampRetryMax(src.autoRetryMax, def.autoRetryMax);
-  const autoRetryScope = VALID_RETRY_SCOPES.has(src.autoRetryScope)
-    ? src.autoRetryScope
-    : def.autoRetryScope;
+  const isLegacyUnconfiguredGoalOnly =
+    Number(src.version) === 1 &&
+    src.configuredByUser === false &&
+    src.autoRetryScope === "goal_only";
+  const autoRetryScope = isLegacyUnconfiguredGoalOnly
+    ? "smart"
+    : VALID_RETRY_SCOPES.has(src.autoRetryScope)
+      ? src.autoRetryScope
+      : def.autoRetryScope;
 
   const freeFallbackEnabled =
     typeof src.freeFallbackEnabled === "boolean" ? src.freeFallbackEnabled : def.freeFallbackEnabled;
@@ -129,7 +136,7 @@ export function normalizeSettings(raw = {}) {
       : 0;
 
   return {
-    version: 1,
+    version: SETTINGS_VERSION,
     planTier,
     boostEnabled,
     autoRetryMode,
@@ -246,7 +253,7 @@ export function updateSettings(stateDir, patch = {}, options = {}) {
   if ("autoRetryScope" in patch) {
     if (!VALID_RETRY_SCOPES.has(patch.autoRetryScope)) {
       const err = new Error(
-        `Invalid autoRetryScope '${patch.autoRetryScope}'. Expected 'goal_only' or 'all_failures'.`
+        `Invalid autoRetryScope '${patch.autoRetryScope}'. Expected 'smart', 'all_failures', or 'goal_only'.`
       );
       err.statusCode = 400;
       throw err;
@@ -369,7 +376,12 @@ export function parseTurnRetryOverride(proseText) {
 
 export function formatRetrySummaryZh(settings = {}) {
   const s = normalizeSettings(settings);
-  const scopeLabel = s.autoRetryScope === "all_failures" ? "所有测试失败均触发" : "口令触发";
+  const scopeLabel =
+    s.autoRetryScope === "all_failures"
+      ? "所有失败均触发"
+      : s.autoRetryScope === "goal_only"
+        ? "仅口令触发"
+        : "智能无感触发";
   if (s.autoRetryMode === "off") {
     return "不用重试（已关闭）";
   }
