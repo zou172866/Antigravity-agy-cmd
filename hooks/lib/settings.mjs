@@ -131,22 +131,90 @@ export function getSettingsFilePath(stateDir) {
   return path.join(stateDir, "settings.json");
 }
 
+const STAR_LOCK_STALE_MS = 2000;
+const STAR_LOCK_MAX_WAIT_MS = 320;
+const STAR_LOCK_STEP_MS = 8;
+const WAIT_BUF = new Int32Array(new SharedArrayBuffer(4));
+
+function sleepSyncMs(ms) {
+  if (ms <= 0) return;
+  try {
+    Atomics.wait(WAIT_BUF, 0, 0, ms);
+  } catch {}
+}
+
+function withSettingsLock(stateDir, fn) {
+  let lockFd = null;
+  const lockPath = path.join(stateDir, ".settings.lock");
+  try {
+    fs.mkdirSync(stateDir, { recursive: true });
+    const deadline = Date.now() + STAR_LOCK_MAX_WAIT_MS;
+    while (true) {
+      try {
+        lockFd = fs.openSync(lockPath, "wx");
+        break;
+      } catch (err) {
+        if (err?.code !== "EEXIST") {
+          break;
+        }
+        try {
+          const st = fs.statSync(lockPath);
+          if (Date.now() - st.mtimeMs > STAR_LOCK_STALE_MS) {
+            fs.unlinkSync(lockPath);
+            continue;
+          }
+        } catch {}
+        if (Date.now() >= deadline) {
+          break;
+        }
+        sleepSyncMs(STAR_LOCK_STEP_MS);
+      }
+    }
+  } catch {
+    // Fail open if stateDir is unwritable
+  }
+
+  try {
+    return fn();
+  } finally {
+    if (lockFd !== null) {
+      try {
+        fs.closeSync(lockFd);
+      } catch {}
+      try {
+        fs.unlinkSync(lockPath);
+      } catch {}
+    }
+  }
+}
+
 function writeFileAtomic(filePath, content) {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
   const tmpName = `${filePath}.${process.pid}.${crypto.randomBytes(4).toString("hex")}.tmp`;
   try {
     fs.writeFileSync(tmpName, content, "utf8");
-    try {
-      fs.renameSync(tmpName, filePath);
-    } catch (err) {
-      if (process.platform === "win32" && (err?.code === "EPERM" || err?.code === "EBUSY")) {
-        fs.writeFileSync(filePath, content, "utf8");
-        try {
-          fs.unlinkSync(tmpName);
-        } catch {}
-      } else {
-        throw err;
+    let lastErr = null;
+    for (let attempt = 0; attempt < 6; attempt++) {
+      try {
+        fs.renameSync(tmpName, filePath);
+        lastErr = null;
+        break;
+      } catch (err) {
+        lastErr = err;
+        const retryable =
+          process.platform === "win32" &&
+          (err?.code === "EPERM" || err?.code === "EBUSY" || err?.code === "EACCES");
+        if (!retryable) {
+          throw err;
+        }
+        sleepSyncMs(10 * (attempt + 1));
       }
+    }
+    if (lastErr) {
+      fs.writeFileSync(filePath, content, "utf8");
+      try {
+        fs.unlinkSync(tmpName);
+      } catch {}
     }
   } catch (err) {
     try {
@@ -224,15 +292,30 @@ export function normalizeSettings(raw = {}) {
 
 export function readSettings(stateDir) {
   const filePath = getSettingsFilePath(stateDir);
-  try {
-    if (!fs.existsSync(filePath)) {
+  for (let attempt = 0; attempt < 4; attempt++) {
+    try {
+      if (!fs.existsSync(filePath)) {
+        return createDefaultSettings();
+      }
+      const text = fs.readFileSync(filePath, "utf8");
+      if (!text.trim() && attempt < 3) {
+        sleepSyncMs(8 * (attempt + 1));
+        continue;
+      }
+      const raw = JSON.parse(text);
+      return normalizeSettings(raw);
+    } catch (err) {
+      const retryable =
+        attempt < 3 &&
+        (err?.code === "EBUSY" || err?.code === "EPERM" || err?.code === "EACCES");
+      if (retryable) {
+        sleepSyncMs(8 * (attempt + 1));
+        continue;
+      }
       return createDefaultSettings();
     }
-    const raw = JSON.parse(fs.readFileSync(filePath, "utf8"));
-    return normalizeSettings(raw);
-  } catch {
-    return createDefaultSettings();
   }
+  return createDefaultSettings();
 }
 
 export function writeSettings(stateDir, settings) {
@@ -253,141 +336,144 @@ export function updateSettings(stateDir, patch = {}, options = {}) {
     throw err;
   }
 
-  const current = readSettings(stateDir);
-  const next = {
-    ...current,
-    stats: { ...current.stats },
-    starPrompt: normalizeStarPromptState(current.starPrompt)
-  };
+  return withSettingsLock(stateDir, () => {
+    const current = readSettings(stateDir);
+    const next = {
+      ...current,
+      stats: { ...current.stats },
+      starPrompt: normalizeStarPromptState(current.starPrompt)
+    };
 
-  if ("planTier" in patch) {
-    if (!VALID_PLAN_TIERS.has(patch.planTier)) {
-      const err = new Error(`Invalid planTier '${patch.planTier}'. Expected 'free' or 'paid'.`);
-      err.statusCode = 400;
-      throw err;
-    }
-    next.planTier = patch.planTier;
-    // If switching to paid and boostEnabled was not explicitly specified, enable boost by default;
-    // if switching to free, force boostEnabled off to prevent free-tier /boost errors.
-    if (patch.planTier === "free") {
-      next.boostEnabled = false;
-    } else if (patch.planTier === "paid" && !("boostEnabled" in patch) && current.planTier === "free") {
-      next.boostEnabled = true;
-    }
-  }
-
-  if ("boostEnabled" in patch) {
-    if (typeof patch.boostEnabled !== "boolean") {
-      const err = new Error("boostEnabled must be a boolean");
-      err.statusCode = 400;
-      throw err;
-    }
-    if (patch.boostEnabled && next.planTier !== "paid") {
-      // Switching boost on automatically upgrades planTier to paid only if explicitly requested via allowTierPromote,
-      // otherwise reject or promote cleanly: promoting to "paid" when user toggles "开启 Boost (需会员)" in UI is ergonomic,
-      // UNLESS planTier: "free" was sent in the exact same patch!
+    if ("planTier" in patch) {
+      if (!VALID_PLAN_TIERS.has(patch.planTier)) {
+        const err = new Error(`Invalid planTier '${patch.planTier}'. Expected 'free' or 'paid'.`);
+        err.statusCode = 400;
+        throw err;
+      }
+      next.planTier = patch.planTier;
+      // If switching to paid and boostEnabled was not explicitly specified, enable boost by default;
+      // if switching to free, force boostEnabled off to prevent free-tier /boost errors.
       if (patch.planTier === "free") {
         next.boostEnabled = false;
-      } else {
-        next.planTier = "paid";
+      } else if (patch.planTier === "paid" && !("boostEnabled" in patch) && current.planTier === "free") {
         next.boostEnabled = true;
       }
-    } else {
-      next.boostEnabled = patch.boostEnabled;
     }
-  }
 
-  if ("autoRetryMode" in patch) {
-    if (!VALID_RETRY_MODES.has(patch.autoRetryMode)) {
-      const err = new Error(
-        `Invalid autoRetryMode '${patch.autoRetryMode}'. Expected 'off', 'count', or 'infinite'.`
-      );
-      err.statusCode = 400;
-      throw err;
+    if ("boostEnabled" in patch) {
+      if (typeof patch.boostEnabled !== "boolean") {
+        const err = new Error("boostEnabled must be a boolean");
+        err.statusCode = 400;
+        throw err;
+      }
+      if (patch.boostEnabled && next.planTier !== "paid") {
+        // Switching boost on automatically upgrades planTier to paid only if explicitly requested via allowTierPromote,
+        // otherwise reject or promote cleanly: promoting to "paid" when user toggles "开启 Boost (需会员)" in UI is ergonomic,
+        // UNLESS planTier: "free" was sent in the exact same patch!
+        if (patch.planTier === "free") {
+          next.boostEnabled = false;
+        } else {
+          next.planTier = "paid";
+          next.boostEnabled = true;
+        }
+      } else {
+        next.boostEnabled = patch.boostEnabled;
+      }
     }
-    next.autoRetryMode = patch.autoRetryMode;
-  }
 
-  if ("autoRetryMax" in patch) {
-    const rawNum = Number(patch.autoRetryMax);
-    if (!Number.isFinite(rawNum) || rawNum < MIN_RETRY_MAX || rawNum > MAX_RETRY_MAX) {
-      const err = new Error(
-        `autoRetryMax must be an integer between ${MIN_RETRY_MAX} and ${MAX_RETRY_MAX}.`
-      );
-      err.statusCode = 400;
-      throw err;
+    if ("autoRetryMode" in patch) {
+      if (!VALID_RETRY_MODES.has(patch.autoRetryMode)) {
+        const err = new Error(
+          `Invalid autoRetryMode '${patch.autoRetryMode}'. Expected 'off', 'count', or 'infinite'.`
+        );
+        err.statusCode = 400;
+        throw err;
+      }
+      next.autoRetryMode = patch.autoRetryMode;
     }
-    next.autoRetryMax = Math.floor(rawNum);
-  }
 
-  if ("autoRetryScope" in patch) {
-    if (!VALID_RETRY_SCOPES.has(patch.autoRetryScope)) {
-      const err = new Error(
-        `Invalid autoRetryScope '${patch.autoRetryScope}'. Expected 'smart', 'all_failures', or 'goal_only'.`
-      );
-      err.statusCode = 400;
-      throw err;
+    if ("autoRetryMax" in patch) {
+      const rawNum = Number(patch.autoRetryMax);
+      if (!Number.isFinite(rawNum) || rawNum < MIN_RETRY_MAX || rawNum > MAX_RETRY_MAX) {
+        const err = new Error(
+          `autoRetryMax must be an integer between ${MIN_RETRY_MAX} and ${MAX_RETRY_MAX}.`
+        );
+        err.statusCode = 400;
+        throw err;
+      }
+      next.autoRetryMax = Math.floor(rawNum);
     }
-    next.autoRetryScope = patch.autoRetryScope;
-  }
 
-  if ("freeFallbackEnabled" in patch) {
-    if (typeof patch.freeFallbackEnabled !== "boolean") {
-      const err = new Error("freeFallbackEnabled must be a boolean");
-      err.statusCode = 400;
-      throw err;
+    if ("autoRetryScope" in patch) {
+      if (!VALID_RETRY_SCOPES.has(patch.autoRetryScope)) {
+        const err = new Error(
+          `Invalid autoRetryScope '${patch.autoRetryScope}'. Expected 'smart', 'all_failures', or 'goal_only'.`
+        );
+        err.statusCode = 400;
+        throw err;
+      }
+      next.autoRetryScope = patch.autoRetryScope;
     }
-    next.freeFallbackEnabled = patch.freeFallbackEnabled;
-  }
 
-  if ("planFallbackEnabled" in patch) {
-    if (typeof patch.planFallbackEnabled !== "boolean") {
-      const err = new Error("planFallbackEnabled must be a boolean");
-      err.statusCode = 400;
-      throw err;
+    if ("freeFallbackEnabled" in patch) {
+      if (typeof patch.freeFallbackEnabled !== "boolean") {
+        const err = new Error("freeFallbackEnabled must be a boolean");
+        err.statusCode = 400;
+        throw err;
+      }
+      next.freeFallbackEnabled = patch.freeFallbackEnabled;
     }
-    next.planFallbackEnabled = patch.planFallbackEnabled;
-  }
 
-  if ("configuredByUser" in patch && typeof patch.configuredByUser === "boolean") {
-    next.configuredByUser = patch.configuredByUser;
-  } else if (options.markConfigured !== false) {
-    next.configuredByUser = true;
-    next.onboardingShown = true;
-  }
+    if ("planFallbackEnabled" in patch) {
+      if (typeof patch.planFallbackEnabled !== "boolean") {
+        const err = new Error("planFallbackEnabled must be a boolean");
+        err.statusCode = 400;
+        throw err;
+      }
+      next.planFallbackEnabled = patch.planFallbackEnabled;
+    }
 
-  if ("onboardingShown" in patch && typeof patch.onboardingShown === "boolean") {
-    next.onboardingShown = patch.onboardingShown;
-  }
+    if ("configuredByUser" in patch && typeof patch.configuredByUser === "boolean") {
+      next.configuredByUser = patch.configuredByUser;
+    } else if (options.markConfigured !== false) {
+      next.configuredByUser = true;
+      next.onboardingShown = true;
+    }
 
-  if (patch.resetStats === true) {
-    next.stats = {
-      totalAutoRetries: 0,
-      lastAutoRetryAt: "",
-      lastAutoRetryConvId: ""
-    };
-  }
+    if ("onboardingShown" in patch && typeof patch.onboardingShown === "boolean") {
+      next.onboardingShown = patch.onboardingShown;
+    }
 
-  next.updatedAt = options.nowIso || new Date().toISOString();
-  return writeSettings(stateDir, next);
+    if (patch.resetStats === true) {
+      next.stats = {
+        totalAutoRetries: 0,
+        lastAutoRetryAt: "",
+        lastAutoRetryConvId: ""
+      };
+    }
+
+    next.updatedAt = options.nowIso || new Date().toISOString();
+    return writeSettings(stateDir, next);
+  });
 }
 
 export function recordAutoRetryStat(stateDir, convId, nowIso = new Date().toISOString()) {
   try {
-    const current = readSettings(stateDir);
-    current.stats = {
-      totalAutoRetries: (current.stats?.totalAutoRetries || 0) + 1,
-      lastAutoRetryAt: nowIso,
-      lastAutoRetryConvId: typeof convId === "string" ? convId.slice(0, 36) : ""
-    };
-    writeSettings(stateDir, current);
+    withSettingsLock(stateDir, () => {
+      const current = readSettings(stateDir);
+      current.stats = {
+        totalAutoRetries: (current.stats?.totalAutoRetries || 0) + 1,
+        lastAutoRetryAt: nowIso,
+        lastAutoRetryConvId: typeof convId === "string" ? convId.slice(0, 36) : ""
+      };
+      writeSettings(stateDir, current);
+    });
   } catch {
     // Non-critical telemetry; never fail Stop hook
   }
 }
 
-export function evaluateStarPrompt(stateDir, { markTriggered = false, nowIso = null } = {}) {
-  const settings = readSettings(stateDir);
+function buildStarPromptEvalFromSettings(settings) {
   const current = normalizeStarPromptState(settings.starPrompt);
   const totalAutoRetries = Math.max(0, Math.floor(Number(settings.stats?.totalAutoRetries || 0)));
 
@@ -408,38 +494,50 @@ export function evaluateStarPrompt(stateDir, { markTriggered = false, nowIso = n
   }
 
   const milestoneReached = totalAutoRetries >= STAR_PROMPT_MIN_AUTO_RETRIES;
-  const shouldShow = current.state === "pending" && milestoneReached;
-  const triggerReason = milestoneReached ? "auto_retry_milestone" : null;
-
-  let effective = current;
-  if (shouldShow && markTriggered && !current.triggeredAt) {
-    const ts = typeof nowIso === "string" && nowIso.trim() ? nowIso.trim() : new Date().toISOString();
-    const next = {
-      state: "pending",
-      triggeredAt: ts,
-      resolvedAt: null,
-      milestoneAutoRetries: Math.max(current.milestoneAutoRetries, totalAutoRetries)
-    };
-    try {
-      writeSettings(stateDir, { ...settings, starPrompt: next });
-      effective = next;
-    } catch {
-      effective = next;
-    }
-  }
-
   return {
-    state: effective.state,
-    triggeredAt: effective.triggeredAt,
-    resolvedAt: effective.resolvedAt,
-    milestoneAutoRetries: effective.milestoneAutoRetries,
-    shouldShow,
-    triggerReason,
+    state: current.state,
+    triggeredAt: current.triggeredAt,
+    resolvedAt: current.resolvedAt,
+    milestoneAutoRetries: current.milestoneAutoRetries,
+    shouldShow: milestoneReached,
+    triggerReason: milestoneReached ? "auto_retry_milestone" : null,
     totalAutoRetries,
     thresholds: {
       minAutoRetries: STAR_PROMPT_MIN_AUTO_RETRIES
     }
   };
+}
+
+export function evaluateStarPrompt(stateDir, { markTriggered = false, nowIso = null } = {}) {
+  const initialSettings = readSettings(stateDir);
+  const initialEval = buildStarPromptEvalFromSettings(initialSettings);
+
+  if (initialEval.shouldShow && markTriggered && !initialEval.triggeredAt) {
+    const ts = typeof nowIso === "string" && nowIso.trim() ? nowIso.trim() : new Date().toISOString();
+    return withSettingsLock(stateDir, () => {
+      const freshSettings = readSettings(stateDir);
+      const freshCur = normalizeStarPromptState(freshSettings.starPrompt);
+      const freshRetries = Math.max(0, Math.floor(Number(freshSettings.stats?.totalAutoRetries || 0)));
+      if (freshCur.state !== "pending" || freshRetries < STAR_PROMPT_MIN_AUTO_RETRIES || freshCur.triggeredAt) {
+        return buildStarPromptEvalFromSettings(freshSettings);
+      }
+      const next = {
+        state: "pending",
+        triggeredAt: ts,
+        resolvedAt: null,
+        milestoneAutoRetries: Math.max(freshCur.milestoneAutoRetries, freshRetries)
+      };
+      const merged = { ...freshSettings, starPrompt: next };
+      try {
+        const saved = writeSettings(stateDir, merged);
+        return buildStarPromptEvalFromSettings(saved);
+      } catch {
+        return buildStarPromptEvalFromSettings(merged);
+      }
+    });
+  }
+
+  return initialEval;
 }
 
 export function setStarPromptState(stateDir, nextState, { nowIso = null } = {}) {
@@ -450,30 +548,32 @@ export function setStarPromptState(stateDir, nextState, { nowIso = null } = {}) 
     };
   }
 
-  const settings = readSettings(stateDir);
-  const current = normalizeStarPromptState(settings.starPrompt);
-  if (current.state !== "pending") {
+  return withSettingsLock(stateDir, () => {
+    const settings = readSettings(stateDir);
+    const current = normalizeStarPromptState(settings.starPrompt);
+    if (current.state !== "pending") {
+      return {
+        ok: true,
+        starPrompt: buildStarPromptEvalFromSettings(settings),
+        alreadyResolved: true
+      };
+    }
+
+    const ts = typeof nowIso === "string" && nowIso.trim() ? nowIso.trim() : new Date().toISOString();
+    const totalAutoRetries = Math.max(0, Math.floor(Number(settings.stats?.totalAutoRetries || 0)));
+    const saved = {
+      state: nextState,
+      triggeredAt: current.triggeredAt || ts,
+      resolvedAt: ts,
+      milestoneAutoRetries: Math.max(current.milestoneAutoRetries, totalAutoRetries)
+    };
+    const written = writeSettings(stateDir, { ...settings, starPrompt: saved });
     return {
       ok: true,
-      starPrompt: evaluateStarPrompt(stateDir, { markTriggered: false }),
-      alreadyResolved: true
+      starPrompt: buildStarPromptEvalFromSettings(written),
+      alreadyResolved: false
     };
-  }
-
-  const ts = typeof nowIso === "string" && nowIso.trim() ? nowIso.trim() : new Date().toISOString();
-  const totalAutoRetries = Math.max(0, Math.floor(Number(settings.stats?.totalAutoRetries || 0)));
-  const saved = {
-    state: nextState,
-    triggeredAt: current.triggeredAt || ts,
-    resolvedAt: ts,
-    milestoneAutoRetries: Math.max(current.milestoneAutoRetries, totalAutoRetries)
-  };
-  writeSettings(stateDir, { ...settings, starPrompt: saved });
-  return {
-    ok: true,
-    starPrompt: evaluateStarPrompt(stateDir, { markTriggered: false }),
-    alreadyResolved: false
-  };
+  });
 }
 
 export function parseChineseOrArabicInt(token) {

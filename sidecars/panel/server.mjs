@@ -26,6 +26,7 @@ const WATCHED_BACKEND_FILES = [
   fileURLToPath(import.meta.url),
   path.join(__dirname, "api-handler.mjs"),
   path.resolve(__dirname, "../../hooks/lib/settings.mjs"),
+  path.resolve(__dirname, "../../hooks/lib/state.mjs"),
   path.resolve(__dirname, "../../hooks/lib/common.mjs")
 ];
 
@@ -132,67 +133,85 @@ export function createStandaloneServer({
   };
 
   return http.createServer(async (req, res) => {
-    if (!isAllowedLocalRequest(req)) {
-      sendJson(res, 403, { ok: false, error: "Forbidden origin or host" });
-      return;
-    }
-
-    const url = new URL(req.url || "/", "http://127.0.0.1");
-
-    if (req.method === "GET" && url.pathname === "/") {
-      const html = renderPanelHtml(csrfToken);
-      res.writeHead(200, {
-        "Content-Type": "text/html; charset=utf-8",
-        ...NO_STORE_HEADERS
-      });
-      res.end(html);
-      return;
-    }
-
-    if (req.method === "GET" && url.pathname === "/preload.js") {
-      res.writeHead(200, {
-        "Content-Type": "application/javascript; charset=utf-8",
-        ...NO_STORE_HEADERS
-      });
-      res.end("/* standalone noop preload */\n");
-      return;
-    }
-
-    if (url.pathname.startsWith("/api/")) {
-      if (req.method !== "POST") {
-        sendJson(res, 405, { ok: false, error: "Method Not Allowed (use POST)" }, { Allow: "POST" });
+    try {
+      if (!isAllowedLocalRequest(req)) {
+        sendJson(res, 403, { ok: false, error: "Forbidden origin or host" });
         return;
       }
-      const providedToken = String(req.headers["x-agy-cmd-csrf"] || "");
-      if (!timingSafeEqualStr(providedToken, csrfToken)) {
-        sendJson(res, 401, { ok: false, error: "Invalid or missing CSRF token" });
-        return;
-      }
-      const contentType = String(req.headers["content-type"] || "").trim();
-      if (!/^application\/json(?:\s*;.*)?$/i.test(contentType)) {
-        sendJson(res, 415, { ok: false, error: "Unsupported Media Type (expected application/json)" });
-        return;
-      }
-      const parsed = await readJsonBody(req);
-      if (!parsed.ok) {
-        if (parsed.status === 413) {
-          scheduleOversizedSocketClose(req, res);
+
+      const rawUrl = typeof req.url === "string" ? req.url : "/";
+      let url;
+      try {
+        if (!rawUrl.startsWith("/")) {
+          throw new Error("Origin-form request target required");
         }
-        sendJson(
-          res,
-          parsed.status,
-          { ok: false, error: parsed.error },
-          parsed.status === 413 ? { Connection: "close" } : {}
-        );
+        url = new URL(rawUrl, "http://127.0.0.1");
+      } catch {
+        sendJson(res, 400, { ok: false, error: "Malformed request URL" });
         return;
       }
-      const out = dispatchPanelApi(url.pathname, parsed.data, { stateDir });
-      sendJson(res, out.status, out.body);
-      return;
-    }
 
-    res.writeHead(404, NO_STORE_HEADERS);
-    res.end("Not Found");
+      if (req.method === "GET" && url.pathname === "/") {
+        const html = renderPanelHtml(csrfToken);
+        res.writeHead(200, {
+          "Content-Type": "text/html; charset=utf-8",
+          ...NO_STORE_HEADERS
+        });
+        res.end(html);
+        return;
+      }
+
+      if (req.method === "GET" && url.pathname === "/preload.js") {
+        res.writeHead(200, {
+          "Content-Type": "application/javascript; charset=utf-8",
+          ...NO_STORE_HEADERS
+        });
+        res.end("/* standalone noop preload */\n");
+        return;
+      }
+
+      if (url.pathname.startsWith("/api/")) {
+        if (req.method !== "POST") {
+          sendJson(res, 405, { ok: false, error: "Method Not Allowed (use POST)" }, { Allow: "POST" });
+          return;
+        }
+        const providedToken = String(req.headers["x-agy-cmd-csrf"] || "");
+        if (!timingSafeEqualStr(providedToken, csrfToken)) {
+          sendJson(res, 401, { ok: false, error: "Invalid or missing CSRF token" });
+          return;
+        }
+        const contentType = String(req.headers["content-type"] || "").trim();
+        if (!/^application\/json(?:\s*;.*)?$/i.test(contentType)) {
+          sendJson(res, 415, { ok: false, error: "Unsupported Media Type (expected application/json)" });
+          return;
+        }
+        const parsed = await readJsonBody(req);
+        if (!parsed.ok) {
+          if (parsed.status === 413) {
+            scheduleOversizedSocketClose(req, res);
+          }
+          sendJson(
+            res,
+            parsed.status,
+            { ok: false, error: parsed.error },
+            parsed.status === 413 ? { Connection: "close" } : {}
+          );
+          return;
+        }
+        const out = dispatchPanelApi(url.pathname, parsed.data, { stateDir });
+        sendJson(res, out.status, out.body);
+        return;
+      }
+
+      res.writeHead(404, NO_STORE_HEADERS);
+      res.end("Not Found");
+    } catch {
+      if (!res.headersSent) {
+        sendJson(res, 500, { ok: false, error: "Internal server error" });
+      } else if (!res.writableEnded) {
+        res.end();
+      }
+    }
   });
 }
 

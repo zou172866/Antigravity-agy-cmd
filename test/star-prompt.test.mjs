@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import http from "node:http";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -819,6 +820,232 @@ test("star-5: /api/star-prompt security hardening, SidecarApp contract & zero AI
     if (!pyCheck.error && pyCheck.status === 0) {
       assert.equal(readSettings(tmpDir).starPrompt.state, "clicked");
       assert.equal(readSettings(tmpDir).autoRetryMax, 6);
+    }
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("star-6: Sidecar UI retries transient /api/star-prompt failures on header re-click and background poll", async () => {
+  const htmlSource = fs.readFileSync(path.join(ROOT, "sidecars", "panel", "index.html"), "utf8");
+  const scriptBlocks = [...htmlSource.matchAll(/<script>([\s\S]*?)<\/script>/gi)];
+  const mainScript = scriptBlocks[scriptBlocks.length - 1][1].replace(/__AGY_CMD_CSRF__/g, "vm-retry-csrf");
+
+  const bootVmWithFlakyStarPost = async () => {
+    const elements = new Map();
+    const getEl = (id) => {
+      if (!elements.has(id)) {
+        const listeners = new Map();
+        const hiddenInit =
+          id === "onboard-card" ||
+          id === "star-milestone-banner" ||
+          id === "star-banner-feedback" ||
+          id === "toast";
+        elements.set(id, {
+          id,
+          hidden: hiddenInit,
+          value: id === "inp-max" ? "3" : "",
+          checked: false,
+          disabled: false,
+          textContent: "",
+          style: { getPropertyValue: () => "" },
+          dataset: {},
+          classList: {
+            _s: new Set(id === "star-milestone-banner" || id === "star-banner-feedback" ? ["hidden"] : []),
+            add(c) { this._s.add(c); },
+            remove(c) { this._s.delete(c); },
+            toggle(c, force) {
+              const on = force === undefined ? !this._s.has(c) : Boolean(force);
+              if (on) this._s.add(c); else this._s.delete(c);
+              return on;
+            },
+            contains(c) { return this._s.has(c); }
+          },
+          setAttribute() {},
+          addEventListener(type, fn) {
+            if (!listeners.has(type)) listeners.set(type, []);
+            listeners.get(type).push(fn);
+          },
+          async click() {
+            for (const fn of listeners.get("click") || []) {
+              await fn({ preventDefault() {} });
+            }
+          }
+        });
+      }
+      return elements.get(id);
+    };
+
+    let failNextStarPost = true;
+    let currentSp = { state: "pending", shouldShow: true, totalAutoRetries: 3 };
+    const starAttempts = [];
+    const intervals = [];
+
+    const handleFetch = async (urlPath, opts = {}) => {
+      const mkJson = (obj, status = 200) => ({
+        ok: status >= 200 && status < 300,
+        status,
+        json: async () => structuredClone(obj)
+      });
+      if (urlPath === "/api/star-prompt") {
+        const body = JSON.parse(opts.body);
+        starAttempts.push(body);
+        if (failNextStarPost) {
+          failNextStarPost = false;
+          return mkJson({ ok: false, error: "Sidecar restarting" }, 503);
+        }
+        currentSp = { ...currentSp, state: body.state, shouldShow: false };
+        return mkJson({ ok: true, starPrompt: currentSp });
+      }
+      if (urlPath === "/api/state") {
+        return mkJson({
+          ok: true,
+          settings: {
+            version: 2,
+            planTier: "free",
+            boostEnabled: false,
+            autoRetryMode: "count",
+            autoRetryMax: 3,
+            autoRetryScope: "smart",
+            freeFallbackEnabled: true,
+            planFallbackEnabled: true,
+            configuredByUser: true,
+            onboardingShown: true,
+            stats: { totalAutoRetries: 3 },
+            starPrompt: currentSp
+          },
+          starPrompt: currentSp
+        });
+      }
+      return mkJson({ ok: true });
+    };
+
+    const sandbox = {
+      window: { location: { search: "" }, addEventListener() {}, fetch: handleFetch, sidecar: null },
+      document: {
+        hidden: false,
+        activeElement: null,
+        documentElement: { style: { getPropertyValue: () => "" }, setAttribute() {} },
+        body: { appendChild() {}, removeChild() {} },
+        createElement: () => ({ value: "", style: {}, setAttribute() {}, focus() {}, select() {} }),
+        execCommand: () => true,
+        getElementById: getEl,
+        querySelectorAll: () => []
+      },
+      navigator: { clipboard: { writeText: async () => {} } },
+      requestAnimationFrame: (fn) => fn(),
+      setInterval: (fn) => { intervals.push(fn); return intervals.length; },
+      clearInterval: () => {},
+      setTimeout: () => 1,
+      clearTimeout: () => {}
+    };
+    vm.createContext(sandbox);
+    vm.runInContext(mainScript, sandbox);
+    await new Promise((r) => setTimeout(r, 20));
+    return { getEl, starAttempts, intervals, getServerState: () => currentSp.state };
+  };
+
+  // Case A: First header click hits 503 -> second header click retries and persists 'clicked'
+  const headerCase = await bootVmWithFlakyStarPost();
+  await headerCase.getEl("github-star-link").click();
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(headerCase.getServerState(), "pending");
+  await headerCase.getEl("github-star-link").click();
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(headerCase.getServerState(), "clicked");
+  assert.deepEqual(headerCase.starAttempts, [{ state: "clicked" }, { state: "clicked" }]);
+
+  // Case B: Banner dismiss hits 503 -> banner stays hidden & next background poll flushes 'dismissed'
+  const dismissCase = await bootVmWithFlakyStarPost();
+  await dismissCase.getEl("star-banner-dismiss-btn").click();
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(dismissCase.getEl("star-milestone-banner").hidden, true);
+  assert.equal(dismissCase.getServerState(), "pending");
+  for (const poll of dismissCase.intervals) await poll();
+  await new Promise((r) => setTimeout(r, 30));
+  assert.equal(dismissCase.getServerState(), "dismissed");
+  assert.equal(dismissCase.getEl("star-milestone-banner").hidden, true);
+});
+
+test("star-7: Multi-process lock prevents lost updates; SidecarApp blocks __proto__ smuggling; HTTP server handles malformed URLs", async () => {
+  const tmpDir = makeTmpDir("agy-cmd-race-");
+  try {
+    // 1. Multi-process stress test: 5 workers x 8 retry increments + 1 concurrent starPrompt writer
+    const workerCode = `
+      import { recordAutoRetryStat, setStarPromptState } from "./hooks/lib/settings.mjs";
+      const [mode, dir] = process.argv.slice(1);
+      if (mode === "star") {
+        setStarPromptState(dir, "clicked");
+      } else {
+        for (let i = 0; i < 8; i++) {
+          recordAutoRetryStat(dir, "conv-" + i);
+        }
+      }
+    `;
+    const procs = [];
+    for (let i = 0; i < 6; i++) {
+      const mode = i === 3 ? "star" : "retry";
+      procs.push(
+        new Promise((resolve, reject) => {
+          const child = spawn(process.execPath, ["--input-type=module", "-e", workerCode, mode, tmpDir], {
+            cwd: ROOT,
+            stdio: "ignore",
+            windowsHide: true
+          });
+          child.on("error", reject);
+          child.on("exit", (code) =>
+            code === 0 ? resolve() : reject(new Error(`worker ${mode} exited ${code}`))
+          );
+        })
+      );
+    }
+    await Promise.all(procs);
+    const finalSettings = readSettings(tmpDir);
+    assert.equal(finalSettings.stats.totalAutoRetries, 40, "Zero retry increments may be lost under concurrency");
+    assert.equal(finalSettings.starPrompt.state, "clicked", "Terminal starPrompt must survive concurrent retry writes");
+
+    // 2. SidecarApp Object.assign(__proto__) smuggling must return 400
+    const routes = new Map();
+    registerSidecarRoutes(
+      {
+        config: { conversationId: "proto-conv" },
+        api(p, fn) {
+          routes.set(p, fn);
+        }
+      },
+      { stateDir: path.join(tmpDir, "proto-state") }
+    );
+    const protoSmuggled = Object.assign({}, JSON.parse('{"__proto__":{"state":"clicked","evil":1}}'));
+    const protoRes = await routes.get("/api/star-prompt")(protoSmuggled);
+    assert.equal(protoRes?.status, 400, "__proto__ smuggled state must be rejected with 400");
+
+    // 3. Standalone HTTP server rejects malformed request targets (400) & missing Host (403) without crashing
+    const srv = createStandaloneServer({ stateDir: tmpDir, csrfToken: "url-guard-token" });
+    await new Promise((r) => srv.listen(0, "127.0.0.1", r));
+    const port = srv.address().port;
+    try {
+      const sendRawHttp = (rawReq) =>
+        new Promise((resolve, reject) => {
+          const sock = net.connect(port, "127.0.0.1", () => sock.write(rawReq));
+          let resp = "";
+          sock.on("data", (d) => {
+            resp += d.toString("utf8");
+          });
+          sock.on("end", () => resolve(resp));
+          sock.on("error", reject);
+        });
+
+      const badUrlResp = await sendRawHttp(
+        `GET http://[::1 HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\nConnection: close\r\n\r\n`
+      );
+      assert.match(badUrlResp, /^HTTP\/1\.1 400 /);
+
+      const emptyHostResp = await sendRawHttp(
+        `GET / HTTP/1.1\r\nHost: \r\nConnection: close\r\n\r\n`
+      );
+      assert.match(emptyHostResp, /^HTTP\/1\.1 403 /);
+    } finally {
+      await new Promise((r) => srv.close(r));
     }
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });

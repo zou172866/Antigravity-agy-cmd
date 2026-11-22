@@ -18,7 +18,7 @@ export const NO_STORE_HEADERS = Object.freeze({
 });
 
 const LOCAL_HOST_RE = /^(?:127\.0\.0\.1|localhost|\[::1\])(?::\d{1,5})?$/i;
-const LOCAL_ORIGIN_RE = /^https?:\/\/(?:127\.0\.0\.1|localhost|\[::1\])(?::\d{1,5})?$/i;
+const LOCAL_HTTP_ORIGIN_RE = /^http:\/\/(?:127\.0\.0\.1|localhost|\[::1\])(?::\d{1,5})?$/i;
 const VSCODE_WEBVIEW_RE = /^vscode-webview:\/\/[a-z0-9._-]+(?:\/.*)?$/i;
 const STAR_PROMPT_ALLOWED_KEYS = new Set(["state"]);
 const STAR_PROMPT_ALLOWED_STATES = new Set(STAR_PROMPT_TERMINAL_STATES);
@@ -26,16 +26,17 @@ const STAR_PROMPT_ALLOWED_STATES = new Set(STAR_PROMPT_TERMINAL_STATES);
 function matchesSameLoopbackHostPort(headerUrlStr, hostHeader) {
   try {
     const parsed = new URL(headerUrlStr);
-    if (!LOCAL_ORIGIN_RE.test(parsed.origin)) {
+    if (parsed.protocol !== "http:" || !LOCAL_HTTP_ORIGIN_RE.test(parsed.origin)) {
       return false;
     }
-    if (hostHeader) {
-      const hUrl = new URL(`http://${hostHeader}`);
-      if (parsed.hostname.toLowerCase() !== hUrl.hostname.toLowerCase()) return false;
-      const pPort = parsed.port || (parsed.protocol === "https:" ? "443" : "80");
-      const hPort = hUrl.port || "80";
-      if (pPort !== hPort) return false;
+    if (!hostHeader) {
+      return false;
     }
+    const hUrl = new URL(`http://${hostHeader}`);
+    if (parsed.hostname.toLowerCase() !== hUrl.hostname.toLowerCase()) return false;
+    const pPort = parsed.port || "80";
+    const hPort = hUrl.port || "80";
+    if (pPort !== hPort) return false;
     return true;
   } catch {
     return false;
@@ -45,7 +46,7 @@ function matchesSameLoopbackHostPort(headerUrlStr, hostHeader) {
 export function isAllowedLocalRequest(req) {
   if (!req?.headers) return true;
   const host = String(req.headers.host || "").trim();
-  if (host && !LOCAL_HOST_RE.test(host)) {
+  if (!host || !LOCAL_HOST_RE.test(host)) {
     return false;
   }
 
@@ -126,7 +127,13 @@ export function buildPanelStatePayload(stateDir, rawConvId = "", { markStarTrigg
 }
 
 export function handleStarPromptMutation(stateDir, rawData) {
-  if (!rawData || typeof rawData !== "object" || Array.isArray(rawData)) {
+  const proto = rawData && typeof rawData === "object" ? Object.getPrototypeOf(rawData) : null;
+  if (
+    !rawData ||
+    typeof rawData !== "object" ||
+    Array.isArray(rawData) ||
+    (proto !== Object.prototype && proto !== null)
+  ) {
     return {
       status: 400,
       body: { ok: false, error: "Request body must be a JSON object" }
@@ -140,7 +147,8 @@ export function handleStarPromptMutation(stateDir, rawData) {
       };
     }
   }
-  if (typeof rawData.state !== "string" || !STAR_PROMPT_ALLOWED_STATES.has(rawData.state)) {
+  const stateVal = Object.prototype.hasOwnProperty.call(rawData, "state") ? rawData.state : undefined;
+  if (typeof stateVal !== "string" || !STAR_PROMPT_ALLOWED_STATES.has(stateVal)) {
     return {
       status: 400,
       body: {
@@ -149,7 +157,7 @@ export function handleStarPromptMutation(stateDir, rawData) {
       }
     };
   }
-  const res = setStarPromptState(stateDir, rawData.state);
+  const res = setStarPromptState(stateDir, stateVal);
   if (!res.ok) {
     return {
       status: 400,

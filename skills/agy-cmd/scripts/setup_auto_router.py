@@ -4,13 +4,16 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 from datetime import datetime, timezone
 import json
+import math
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 PLUGIN_NAME = "agy-cmd"
@@ -95,6 +98,46 @@ def resolve_state_dir(custom_state_dir: str | None = None) -> Path:
     return Path.home() / ".gemini" / "antigravity" / "plugin_data" / PLUGIN_NAME
 
 
+@contextmanager
+def _with_settings_lock(state_dir: Path):
+    lock_fd: int | None = None
+    lock_path = state_dir / ".settings.lock"
+    try:
+        state_dir.mkdir(parents=True, exist_ok=True)
+        deadline = time.monotonic() + 0.32
+        while True:
+            try:
+                lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                break
+            except FileExistsError:
+                try:
+                    if time.time() - lock_path.stat().st_mtime > 2.0:
+                        lock_path.unlink()
+                        continue
+                except OSError:
+                    pass
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(0.008)
+            except OSError:
+                break
+    except OSError:
+        pass
+
+    try:
+        yield
+    finally:
+        if lock_fd is not None:
+            try:
+                os.close(lock_fd)
+            except OSError:
+                pass
+            try:
+                lock_path.unlink()
+            except OSError:
+                pass
+
+
 def save_json_atomic(file_path: Path, data: dict) -> None:
     file_path.parent.mkdir(parents=True, exist_ok=True)
     serialized = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
@@ -102,7 +145,23 @@ def save_json_atomic(file_path: Path, data: dict) -> None:
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
             fh.write(serialized)
-        os.replace(tmp_name, file_path)
+        last_err: Exception | None = None
+        for attempt in range(6):
+            try:
+                os.replace(tmp_name, file_path)
+                last_err = None
+                break
+            except PermissionError as exc:
+                last_err = exc
+                if os.name != "nt":
+                    raise
+                time.sleep(0.01 * (attempt + 1))
+        if last_err is not None:
+            file_path.write_text(serialized, encoding="utf-8", newline="\n")
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
     except Exception:
         try:
             os.unlink(tmp_name)
@@ -130,6 +189,20 @@ def is_gh_cli_authenticated(
     base_env = dict(os.environ if env is None else env)
     base_env["GH_PROMPT_DISABLED"] = "1"
     base_env["NO_COLOR"] = "1"
+
+    has_sep = ("/" in bin_name) or (os.sep in bin_name) or bool(os.altsep and os.altsep in bin_name)
+    if has_sep:
+        resolved_bin: str | None = bin_name
+    else:
+        env_path = ""
+        for key, val in base_env.items():
+            if key.upper() == "PATH" and isinstance(val, str):
+                env_path = val
+                break
+        resolved_bin = shutil.which(bin_name, path=env_path)
+        if not resolved_bin:
+            return False
+
     run_kwargs: dict = {
         "stdin": subprocess.DEVNULL,
         "stdout": subprocess.DEVNULL,
@@ -141,7 +214,7 @@ def is_gh_cli_authenticated(
     if os.name == "nt":
         run_kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     try:
-        res = subprocess.run([bin_name, *args], **run_kwargs)
+        res = subprocess.run([resolved_bin, *args], **run_kwargs)
         return bool(res.returncode == 0)
     except Exception:
         return False
@@ -199,14 +272,15 @@ def normalize_star_prompt_state(raw: object) -> dict:
     milestone = 0
     raw_count = src.get("milestoneAutoRetries")
     if isinstance(raw_count, (int, float)) and not isinstance(raw_count, bool):
-        if raw_count >= 0:
-            milestone = int(raw_count)
+        num_val = float(raw_count)
+        if math.isfinite(num_val) and num_val >= 0:
+            milestone = int(num_val)
     elif isinstance(raw_count, str) and raw_count.strip():
         try:
             parsed_num = float(raw_count.strip())
-            if parsed_num >= 0:
+            if math.isfinite(parsed_num) and parsed_num >= 0:
                 milestone = int(parsed_num)
-        except ValueError:
+        except (ValueError, OverflowError):
             pass
 
     return {
@@ -322,33 +396,36 @@ def apply_settings_cli(
     plan_tier: str | None,
     boost_flag: str | None,
 ) -> dict:
-    current = load_settings(state_dir)
-    if auto_retry is not None:
-        mode, count_val = parse_auto_retry_arg(auto_retry)
-        current["autoRetryMode"] = mode
-        if count_val is not None:
-            current["autoRetryMax"] = count_val
-    if retry_scope is not None:
-        current["autoRetryScope"] = retry_scope
-    if plan_tier is not None:
-        current["planTier"] = plan_tier
-        if plan_tier == "free":
-            current["boostEnabled"] = False
-        elif plan_tier == "paid" and boost_flag is None:
-            current["boostEnabled"] = True
-    if boost_flag is not None:
-        want_on = boost_flag == "on"
-        if want_on and current["planTier"] != "paid":
+    with _with_settings_lock(state_dir):
+        current = load_settings(state_dir)
+        if auto_retry is not None:
+            mode, count_val = parse_auto_retry_arg(auto_retry)
+            current["autoRetryMode"] = mode
+            if count_val is not None:
+                current["autoRetryMax"] = count_val
+        if retry_scope is not None:
+            current["autoRetryScope"] = retry_scope
+        if plan_tier is not None:
+            current["planTier"] = plan_tier
             if plan_tier == "free":
-                raise SystemExit("ERROR：免费版模式（--plan-tier free）下不能开启 --boost on，以防触发权限报错。")
-            current["planTier"] = "paid"
-        current["boostEnabled"] = want_on
+                current["boostEnabled"] = False
+            elif plan_tier == "paid" and boost_flag is None:
+                current["boostEnabled"] = True
+        if boost_flag is not None:
+            want_on = boost_flag == "on"
+            if want_on and current["planTier"] != "paid":
+                if plan_tier == "free":
+                    raise SystemExit(
+                        "ERROR：免费版模式（--plan-tier free）下不能开启 --boost on，以防触发权限报错。"
+                    )
+                current["planTier"] = "paid"
+            current["boostEnabled"] = want_on
 
-    current["configuredByUser"] = True
-    current["onboardingShown"] = True
-    current["updatedAt"] = datetime.now(timezone.utc).isoformat()
-    save_json_atomic(state_dir / "settings.json", current)
-    return current
+        current["configuredByUser"] = True
+        current["onboardingShown"] = True
+        current["updatedAt"] = datetime.now(timezone.utc).isoformat()
+        save_json_atomic(state_dir / "settings.json", current)
+        return current
 
 
 def load_config_json(config_path: Path) -> tuple[dict, bool]:
@@ -436,6 +513,69 @@ def validate_sidecar(plugin_dir: Path) -> list[str]:
         fp = panel_dir / req_name
         if not fp.is_file():
             issues.append(f"缺少右侧边栏面板文件：{fp}")
+    server_fp = panel_dir / "server.mjs"
+    if server_fp.is_file():
+        try:
+            srv_src = server_fp.read_text(encoding="utf-8", errors="replace")
+            if "api-handler.mjs" in srv_src and not (panel_dir / "api-handler.mjs").is_file():
+                issues.append(f"缺少右侧边栏面板文件：{panel_dir / 'api-handler.mjs'}")
+        except OSError:
+            pass
+    return issues
+
+
+def validate_bundle_sync(plugin_dir: Path) -> list[str]:
+    source_root = Path(__file__).resolve().parents[3]
+    if not (source_root / "plugin.json").is_file():
+        return []
+    if source_root.resolve() == plugin_dir.resolve():
+        return []
+    manifest_fp = plugin_dir / "plugin.json"
+    if not manifest_fp.is_file():
+        return []
+    try:
+        manifest_obj = json.loads(manifest_fp.read_text(encoding="utf-8"))
+    except Exception:
+        return [f"插件清单 JSON 无效：{manifest_fp}"]
+    if not isinstance(manifest_obj, dict) or "version" not in manifest_obj:
+        # Synthetic minimal skeleton without version metadata
+        return []
+
+    issues: list[str] = []
+    for rel_file in ("plugin.json", "hooks.json", "package.json"):
+        src_fp = source_root / rel_file
+        dst_fp = plugin_dir / rel_file
+        if not src_fp.is_file():
+            continue
+        if not dst_fp.is_file():
+            issues.append(f"缺少插件运行文件：{dst_fp}")
+        elif normalize_lf(src_fp.read_text(encoding="utf-8")) != normalize_lf(
+            dst_fp.read_text(encoding="utf-8")
+        ):
+            issues.append(f"插件运行文件与源码仓库存在漂移：{dst_fp}")
+
+    for dir_name in ("hooks", "sidecars", "skills"):
+        src_dir = source_root / dir_name
+        if not src_dir.is_dir():
+            continue
+        for src_fp in sorted(src_dir.rglob("*")):
+            if not src_fp.is_file():
+                continue
+            if "__pycache__" in src_fp.parts or src_fp.suffix in (".pyc", ".pyo"):
+                continue
+            rel = src_fp.relative_to(source_root)
+            dst_fp = plugin_dir / rel
+            if not dst_fp.is_file():
+                issues.append(f"缺少插件运行文件：{dst_fp}")
+                continue
+            try:
+                src_txt = normalize_lf(src_fp.read_text(encoding="utf-8"))
+                dst_txt = normalize_lf(dst_fp.read_text(encoding="utf-8"))
+                if src_txt != dst_txt:
+                    issues.append(f"插件运行文件与源码仓库存在漂移：{dst_fp}")
+            except UnicodeDecodeError:
+                if src_fp.read_bytes() != dst_fp.read_bytes():
+                    issues.append(f"插件运行文件与源码仓库存在漂移：{dst_fp}")
     return issues
 
 
@@ -481,6 +621,14 @@ def set_plugin_enabled(config_dir: Path, enabled: bool) -> Path:
     return config_path
 
 
+def _clean_pycache_dirs(root_dir: Path) -> None:
+    if not root_dir.is_dir():
+        return
+    for cache_dir in list(root_dir.rglob("__pycache__")):
+        if cache_dir.is_dir():
+            shutil.rmtree(cache_dir, ignore_errors=True)
+
+
 def sync_plugin_bundle_if_needed(target_plugin_dir: Path) -> bool:
     """When invoked from a cloned source checkout containing plugin.json, sync runtime files into target_plugin_dir."""
     source_root = Path(__file__).resolve().parents[3]
@@ -489,15 +637,22 @@ def sync_plugin_bundle_if_needed(target_plugin_dir: Path) -> bool:
     if source_root.resolve() == target_plugin_dir.resolve():
         return True
 
+    ignore_fn = shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo")
     target_plugin_dir.mkdir(parents=True, exist_ok=True)
     for item_name in ("plugin.json", "hooks.json", "package.json", "README.md"):
         src_file = source_root / item_name
         if src_file.is_file():
             shutil.copy2(src_file, target_plugin_dir / item_name)
-    for dir_name in ("assets", "rules", "hooks", "sidecars", "skills"):
+    for dir_name in ("assets", "rules", "hooks", "sidecars", "skills", "test"):
         src_dir = source_root / dir_name
         if src_dir.is_dir():
-            shutil.copytree(src_dir, target_plugin_dir / dir_name, dirs_exist_ok=True)
+            shutil.copytree(
+                src_dir,
+                target_plugin_dir / dir_name,
+                dirs_exist_ok=True,
+                ignore=ignore_fn,
+            )
+    _clean_pycache_dirs(target_plugin_dir)
     return True
 
 
@@ -508,7 +663,12 @@ def sync_skill_if_needed(config_dir: Path) -> str | None:
         return None
     if (skill_source / "SKILL.md").is_file() and not (target_skill_dir / "SKILL.md").is_file():
         target_skill_dir.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copytree(skill_source, target_skill_dir, dirs_exist_ok=True)
+        shutil.copytree(
+            skill_source,
+            target_skill_dir,
+            dirs_exist_ok=True,
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"),
+        )
         return str(target_skill_dir)
     return None
 
@@ -594,10 +754,12 @@ def main(argv: list[str] | None = None) -> int:
             plan_tier=args.plan_tier,
             boost_flag=args.boost,
         )
-        if not (args.json and (args.status or args.sync_check)):
+        if not args.json:
             print(f"已更新 agy-cmd 运行设置（{state_dir / 'settings.json'}）：")
             print(f"  {format_settings_summary(updated)}")
         if not has_lifecycle_action:
+            if args.json:
+                print(json.dumps({"ok": True, "settings": updated}, ensure_ascii=False))
             return 0
 
     if args.status:
@@ -609,7 +771,8 @@ def main(argv: list[str] | None = None) -> int:
             ) == normalize_lf(RULE_BODY)
             hook_issues = validate_hooks_json(plugin_dir, plugin_hooks_path)
             sidecar_issues = validate_sidecar(plugin_dir)
-            warnings = list(hook_issues) + list(sidecar_issues)
+            drift_issues = validate_bundle_sync(plugin_dir)
+            warnings = list(hook_issues) + list(sidecar_issues) + list(drift_issues)
             if cfg_warning:
                 warnings.insert(0, cfg_warning)
             if standalone_rule_path.is_file():
@@ -648,7 +811,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"当前策略：{format_settings_summary(settings)}")
             if not settings.get("configuredByUser"):
                 print(POST_INSTALL_REMINDER)
-            for issue in [*hook_issues, *sidecar_issues]:
+            for issue in [*hook_issues, *sidecar_issues, *drift_issues]:
                 print(f"警告：{issue}")
             if standalone_rule_path.is_file():
                 print(f"警告：检测到旧版独立规则，可能造成重复注入：{standalone_rule_path}")
@@ -715,6 +878,7 @@ def main(argv: list[str] | None = None) -> int:
                 issues.append(f"存在重复的旧版独立 Skill：{legacy_skill_path.parent}")
             issues.extend(validate_hooks_json(plugin_dir, plugin_hooks_path))
             issues.extend(validate_sidecar(plugin_dir))
+            issues.extend(validate_bundle_sync(plugin_dir))
             if args.json:
                 print(
                     json.dumps(
@@ -791,13 +955,46 @@ def main(argv: list[str] | None = None) -> int:
     if args.remove:
         if has_plugin and not args.standalone:
             cfg = set_plugin_enabled(config_dir, False)
-            print(f"已在配置中停用 {PLUGIN_NAME} 插件：{cfg}")
+            removed_legacy = False
             if standalone_rule_path.is_file():
                 standalone_rule_path.unlink()
+                removed_legacy = True
+            if args.json:
+                print(
+                    json.dumps(
+                        {
+                            "ok": True,
+                            "mode": "plugin",
+                            "enabled": False,
+                            "configPath": str(cfg),
+                            "removedLegacyRule": removed_legacy,
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+                return 0
+            print(f"已在配置中停用 {PLUGIN_NAME} 插件：{cfg}")
+            if removed_legacy:
                 print(f"已同时清理旧版独立规则：{standalone_rule_path}")
             return 0
-        if standalone_rule_path.is_file():
+        existed = standalone_rule_path.is_file()
+        if existed:
             standalone_rule_path.unlink()
+        if args.json:
+            print(
+                json.dumps(
+                    {
+                        "ok": True,
+                        "mode": "standalone",
+                        "enabled": False,
+                        "removed": existed,
+                        "rulePath": str(standalone_rule_path),
+                    },
+                    ensure_ascii=False,
+                )
+            )
+            return 0
+        if existed:
             print(f"已移除全局自动路由规则：{standalone_rule_path}")
         else:
             print(f"无需移除，规则文件不存在：{standalone_rule_path}")
@@ -809,14 +1006,31 @@ def main(argv: list[str] | None = None) -> int:
             plugin_rule_path.parent.mkdir(parents=True, exist_ok=True)
             plugin_rule_path.write_text(RULE_BODY, encoding="utf-8", newline="\n")
             cfg = set_plugin_enabled(config_dir, True)
+            had_legacy_rule = standalone_rule_path.is_file()
+            if had_legacy_rule:
+                standalone_rule_path.unlink()
+            removed_skill = remove_legacy_duplicate_skill(config_dir, plugin_dir)
+            if args.json:
+                print(
+                    json.dumps(
+                        {
+                            "ok": True,
+                            "mode": "plugin",
+                            "enabled": True,
+                            "pluginDir": str(plugin_dir),
+                            "configPath": str(cfg),
+                            "syncedBundle": synced_bundle,
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+                return 0
             if synced_bundle and Path(__file__).resolve().parents[3].resolve() != plugin_dir.resolve():
                 print(f"已将完整插件包同步安装至：{plugin_dir}")
             print(f"已同步并启用插件规则：{plugin_rule_path}")
             print(f"已确认插件启用状态：{cfg}")
-            if standalone_rule_path.is_file():
-                standalone_rule_path.unlink()
+            if had_legacy_rule:
                 print(f"已清理旧版独立规则以防重复加载：{standalone_rule_path}")
-            removed_skill = remove_legacy_duplicate_skill(config_dir, plugin_dir)
             if removed_skill is not None:
                 print(f"已清理旧版独立 Skill 以防重复加载：{removed_skill}")
             print()
@@ -827,6 +1041,20 @@ def main(argv: list[str] | None = None) -> int:
         standalone_rule_path.parent.mkdir(parents=True, exist_ok=True)
         standalone_rule_path.write_text(RULE_CONTENT, encoding="utf-8", newline="\n")
         synced = sync_skill_if_needed(config_dir)
+        if args.json:
+            print(
+                json.dumps(
+                    {
+                        "ok": True,
+                        "mode": "standalone",
+                        "enabled": True,
+                        "rulePath": str(standalone_rule_path),
+                        "syncedSkillDir": synced,
+                    },
+                    ensure_ascii=False,
+                )
+            )
+            return 0
         print(f"已启用全局常驻自动路由规则（独立模式）：{standalone_rule_path}")
         if synced:
             print(f"已同步桌面端 Skill 目录：{synced}")

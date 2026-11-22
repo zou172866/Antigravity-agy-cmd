@@ -92,7 +92,8 @@
       display: flex;
       align-items: center;
       justify-content: space-between;
-      gap: 8px;
+      flex-wrap: wrap;
+      gap: 6px 8px;
       padding-bottom: 2px;
     }
 
@@ -100,6 +101,7 @@
       display: flex;
       align-items: center;
       gap: 8px;
+      min-width: 0;
       font-weight: 700;
       font-size: 15px;
       color: var(--text-primary);
@@ -108,6 +110,7 @@
     .brand-icon {
       width: 24px;
       height: 24px;
+      flex-shrink: 0;
       border-radius: 7px;
       background: linear-gradient(135deg, #0ea5e9, #4f46e5, #7c3aed);
       color: #ffffff;
@@ -121,6 +124,8 @@
     .header-actions {
       display: inline-flex;
       align-items: center;
+      flex-shrink: 0;
+      margin-left: auto;
       gap: 6px;
     }
 
@@ -159,6 +164,7 @@
       border: 1px solid var(--accent-border);
       color: var(--accent);
       font-weight: 700;
+      white-space: nowrap;
     }
 
     .star-banner {
@@ -658,6 +664,8 @@
       let cachedStarPrompt = null;
       let starPromptResolvedLocally = false;
       let starPromptPersisted = false;
+      let starPromptInFlight = false;
+      let pendingStarResolution = null;
       let starCopyHideTimer = null;
 
       // Sync theme strictly from Antigravity's actual host --background luminance
@@ -777,6 +785,7 @@
         const res = await fetchFn(pathname, {
           method: "POST",
           headers,
+          keepalive: true,
           body: JSON.stringify(bodyObj)
         });
         const data = await res.json().catch(() => ({}));
@@ -796,9 +805,18 @@
         if (sp.state && sp.state !== "pending") {
           starPromptResolvedLocally = true;
           starPromptPersisted = true;
+          pendingStarResolution = sp.state;
         }
         if (starPromptResolvedLocally || !sp.shouldShow || sp.state !== "pending") {
           if (starCopyHideTimer === null) setElementHidden(starBannerEl, true);
+          if (
+            sp.state === "pending" &&
+            pendingStarResolution &&
+            !starPromptPersisted &&
+            !starPromptInFlight
+          ) {
+            persistStarPromptState(pendingStarResolution);
+          }
           return;
         }
         if (starBannerMsgEl) {
@@ -812,15 +830,22 @@
       }
 
       async function persistStarPromptState(state) {
-        if (starPromptPersisted) return;
-        starPromptPersisted = true;
+        if (!pendingStarResolution) {
+          pendingStarResolution = state;
+        }
+        if (starPromptPersisted || starPromptInFlight) return;
+        const targetState = pendingStarResolution;
+        starPromptInFlight = true;
         try {
-          const data = await callApi("/api/star-prompt", { state }, { includeConvId: false });
+          const data = await callApi("/api/star-prompt", { state: targetState }, { includeConvId: false });
+          starPromptPersisted = true;
           if (data?.starPrompt) {
             cachedStarPrompt = data.starPrompt;
           }
         } catch {
           starPromptPersisted = false;
+        } finally {
+          starPromptInFlight = false;
         }
       }
 
@@ -829,14 +854,14 @@
       }
 
       function handleHeaderStarClick() {
-        if (!starPromptResolvedLocally && (!cachedStarPrompt || cachedStarPrompt.state === "pending")) {
+        if (!starPromptPersisted && (!cachedStarPrompt || cachedStarPrompt.state === "pending")) {
           starPromptResolvedLocally = true;
           if (starCopyHideTimer !== null) {
             clearTimeout(starCopyHideTimer);
             starCopyHideTimer = null;
           }
           hideStarBannerNow();
-          persistStarPromptState("clicked");
+          persistStarPromptState(pendingStarResolution || "clicked");
         }
       }
 
