@@ -1,126 +1,114 @@
-# agy-cmd (v2.1)
+# agy-cmd 是什么？
 
-Google Antigravity 桌面端（App）与 IDE 高阶能力自动路由插件、防停机自动续跑监工与内置斜杠指令参谋。
+`agy-cmd` 是 Google Antigravity 桌面版的辅助插件。
 
-> [!IMPORTANT]
-> **安装后首次必做确认**：为防止非会员账号误输 `/boost` 触发套餐权限报错，插件初始默认运行在 **「免费版安全模式（关闭 `/boost` 自动接入）」** 且 **「智能无感触发最多自动重试 3 次」**。
-> 安装完成后，请务必打开右侧辅助边栏 **「agy-cmd 自动路由」** 面板（或在聊天中点击胶囊链接 `sidecar://agy-cmd/panel/`）手动确认两项设置：
-> 1. **自动重试次数**：按需切换「不用重试 (0) / 指定次数 (1~50) / 一直重试 (∞)」；
-> 2. **Boost 自动接入**：若你已开通 Google AI Pro / Ultra 会员，请在面板中手动切换至「Pro / Ultra 会员」以开启 `/boost` 自动接入提示。
+安装以后，它会在你和 AI 对话时自动处理四件事：按任务大小安排做事步骤、在测试没通过时让 AI 接着修、在免费账号下屏蔽会报错的付费口令，以及在软件右侧提供一个随时点选的控制面板。
 
----
+## 怎么安装 agy-cmd？
 
-## 解决什么问题
+需要电脑已安装 Google Antigravity 桌面版、Node.js（20 及以上版本）和 Python 3。
 
-Google Antigravity 将需求追问、先审施工图、多智能体并发、防停机闭环等能力分散在 19 个内置斜杠指令与底层工具中，普通对话容易漏触发，或在多轮修错时半途停机、陷入原地盲改死循环。`agy-cmd v2.1` 采用主流 Coding Agent 最佳实践的 **「极薄常驻规则 + 零稳态开销生命周期钩子 + 右侧可视化面板 + 按需渐进 Skill」** 混合架构：
+打开终端，复制对应系统的两行命令运行，完成后重启或刷新 Antigravity 窗口即可使用。
 
-1. **原生能力全自动代执行（轻量直出零打扰）**
-   - **轻量小改零打扰**：1～2 个文件的明确修改、解释代码、本地确定性查找直接执行，**不加徽标、不建计划、不推指令**。
-   - **高阶能力自动路由**：遇到模糊需求自动调起 `ask_question` 单题追问（`[agy-cmd → /grill-me 追问]`）；跨 ≥3 文件改动先只读扫描并生成 `Implementation Plan` 等批准再改代码（`[agy-cmd → /plan 审批]`，含只读 Plan Mode 拒写自动正文兜底）；≥5 对象语义批处理自动调用 `run_workflow` 并发脚本；网页交互与可视化自动调度 `browser` / `generative_ui`。
-2. **`Stop` 防停机自动续跑监工（免口令免声明，替代手动敲 `/goal`）**
-   - 默认启用 **「智能无感触发 (`smart`)」**：改过源码后验证命令失败、或要求修错但单测/构建未绿而 AI 试图提前收工时自动拦截续跑；当你只是自然提问（如 *“为什么单测挂了 / 排查下报错原因 / 跑一下测试 / 看看环境”*）或处于 `/plan` 方案等待审批时，**无需声明“先别改代码”即可自动识别放行**，支持 **不用重试 (0) / 指定 1~50 次 / 一直重试 (∞)**。
-   - 支持**单句口语临时覆盖**：提问时顺带说 `这次最多重试 5 次`、`这次一直重试` 或 `这次不用重试` 即可仅对当轮生效。
-   - **4 道安全刹车始终生效**：手动点击停止按钮（`USER_CANCELED`）立即放行、AI 停下向你提问（无新改动/命令）防死锁放行、后台异步任务避让、子智能体零干扰。
-3. **默认免费版防报错保护 + 卡壳自动换视角重查**
-   - 默认屏蔽 `/boost`、`/swarm`、`/teamwork` 付费口令提示，杜绝免费档用户复制后遭遇权限报错；当连续命令失败 ≥3 次或出现 ≥2 次「修改→仍失败」震荡时，自动指示 AI 停止原地打补丁，委派独立只读 `research` 子智能体换全新上下文核查根因。
-   - Pro / Ultra 会员在右侧面板开启后，自动解锁首行可复制 `/boost` 攻坚口令推荐。
-4. **右侧边栏可视化控制面板 + 自然语言参谋**
-   - 内置 Antigravity 原生辅助边栏面板（`agy-cmd 自动路由`），鼠标一点即存、秒级生效；也支持直接在聊天框对 AI 说 *“把自动重试改成 5 次 / 开启 Boost 接入”* 或查询对比全部 19 项桌面端指令。
+**Windows（PowerShell）：**
 
----
+```powershell
+git clone https://github.com/zou172866/agy-cmd "$HOME\.gemini\config\plugins\agy-cmd"
+python "$HOME\.gemini\config\plugins\agy-cmd\skills\agy-cmd\scripts\setup_auto_router.py" --install
+```
 
-## 安装方式
+**macOS / Linux：**
 
-### 方式一：完整插件安装（推荐，含自动续跑钩子 + 右侧可视化面板）
+```bash
+git clone https://github.com/zou172866/agy-cmd ~/.gemini/config/plugins/agy-cmd
+python3 ~/.gemini/config/plugins/agy-cmd/skills/agy-cmd/scripts/setup_auto_router.py --install
+```
 
-**一行克隆直装**（重启或刷新 Antigravity 窗口即自动加载）：
-
-- **Windows (PowerShell)**：
-  ```powershell
-  git clone https://github.com/zou172866/agy-cmd "$HOME\.gemini\config\plugins\agy-cmd"
-  python "$HOME\.gemini\config\plugins\agy-cmd\skills\agy-cmd\scripts\setup_auto_router.py" --install
-  ```
-- **macOS / Linux**：
-  ```bash
-  git clone https://github.com/zou172866/agy-cmd ~/.gemini/config/plugins/agy-cmd
-  python3 ~/.gemini/config/plugins/agy-cmd/skills/agy-cmd/scripts/setup_auto_router.py --install
-  ```
-
-*(也可克隆到任意本地目录后运行 `python skills/agy-cmd/scripts/setup_auto_router.py --install`，脚本会自动将完整插件包同步安装至 `~/.gemini/config/plugins/agy-cmd/` 并清理旧版重复规则。)*
-
-### 方式二：仅安装轻量 Skill 与静态规则（兼容 `skills` CLI）
+如果只安装基础文字规则（不含自动重试和右侧面板），可以运行：
 
 ```bash
 npx -y skills add zou172866/agy-cmd -g --all
 python ~/.agents/skills/agy-cmd/scripts/setup_auto_router.py --install --standalone
 ```
 
----
+## 装好后先看哪两项设置？
 
-## 常用管理与配置命令
+为了防止免费账号误输付费口令报错，插件刚装好时默认开启「免费版保护」和「最多自动重试 3 次」。
 
-除在右侧 **「agy-cmd 自动路由」** 面板可视化点选外，也可通过聊天口令或命令行管理：
+安装完成后，请打开软件右侧边栏的「agy-cmd 自动路由」面板（也可以在聊天框点击 `sidecar://agy-cmd/panel/` 打开），确认两项设置：
+
+1. **自动重试次数**：选择「不用重试（0 次）」「指定次数（1～50 次）」或「一直重试」。
+2. **账号档位**：如果你开通了 Google AI Pro / Ultra 会员，可以切换到「Pro / Ultra 会员」，开启 `/boost` 口令提醒。
+
+## agy-cmd 有哪些功能？
+
+### 1. 按任务大小自动分步骤
+
+这项功能用于省去手动挑选内置命令的步骤。
+
+- 改动 1～2 个文件、解释代码或查找内容时，AI 直接给出结果，不额外弹窗打扰。
+- 需求没说清时，AI 先出一个选择题向你确认方向。
+- 需要改动 3 个及以上文件时，AI 先把修改方案列出来，等你确认后再动手改代码。即使当前处于只读模式无法新建方案文件，AI 也会直接在对话框里写出方案等你点头。
+- 需要同时处理 5 个及以上同类文件或任务时，AI 会自动分头同时处理，节省等待时间。
+- 需要操作网页或展示可点击的图表时，AI 会自动打开内置浏览器或生成交互画面。
+
+### 2. 测试没过自动接着修
+
+这项功能用于防止 AI 在报错还没修好时提前停工。
+
+当你让 AI 改代码或修错，但测试、运行验证还没通过时，插件会自动让 AI 继续排查修改，直到验证通过或达到设定的重试上限。
+
+在下面几种情况下，插件会自动放行并立即停下：
+
+- 你只是提问（例如“为什么报错了”“帮我查查原因”“跑一下测试看看”），没有要求改代码；
+- AI 刚把修改方案发给你，正在等你确认；
+- AI 缺少必要信息，需要停下来问你；
+- 你手动点击了停止按钮。
+
+如果某一次提问想临时换用别的重试次数，直接在话里加上 `这次最多重试 5 次`、`这次一直重试` 或 `这次不用重试`，就只对当次提问生效。
+
+### 3. 免费账号防报错与卡壳换思路
+
+这项功能用于避免免费账号误触付费功能报错，并防止 AI 在同一个错上反复打转。
+
+- **免费账号防报错**：Antigravity 中的 `/boost`、`/swarm`、`/teamwork` 属于付费会员口令，免费账号输入会报错。插件在默认免费模式下会自动隐藏这些口令提醒；切换到会员模式后才会提示。
+- **卡壳换思路**：当命令连续失败 3 次，或者连改两次还是报同一个错时，插件会让 AI 先停下反复试错，重新检查报错原因后再给出办法。
+
+### 4. 右侧面板与口令查询
+
+这项功能用于随时查看和修改插件设置，或查询软件自带口令的用法。
+
+- 在软件右侧「agy-cmd 自动路由」面板中点击按钮即可修改重试次数、触发方式和会员档位，点完立即生效。
+- 在面板右上角可以点击 `★ Star` 前往 GitHub 仓库关注版本更新；累计帮你自动接着修满 3 次后也会提示一次，点击或关闭后不再重复弹出。
+- 在聊天框直接输入“把自动重试改成 5 次”“开启 Boost 接入”或“列出 Antigravity 所有内置斜杠指令的区别”，AI 也会直接帮你改好或列出对比说明。
+
+## 怎么用命令行管理？
+
+除了点选右侧面板和在聊天框直接说以外，也可以在终端运行脚本管理设置：
 
 ```bash
-# 查看插件、钩子、面板与当前重试/套餐状态
+# 查看插件状态与当前设置
 python skills/agy-cmd/scripts/setup_auto_router.py --status
 
-# 调节自动重试档位（off / 1..50 / infinite）
+# 修改自动重试次数（可选 off / 1..50 / infinite）
 python skills/agy-cmd/scripts/setup_auto_router.py --auto-retry off
 python skills/agy-cmd/scripts/setup_auto_router.py --auto-retry 5
 python skills/agy-cmd/scripts/setup_auto_router.py --auto-retry infinite
 
-# 切换套餐档位与 Boost 自动接入（默认 free 关闭 Boost 防报错；Pro/Ultra 会员可设为 paid）
+# 切换免费版或会员版
 python skills/agy-cmd/scripts/setup_auto_router.py --plan-tier free
 python skills/agy-cmd/scripts/setup_auto_router.py --plan-tier paid --boost on
 
-# 校验规则、钩子与面板完整性（零漂移检查）
+# 检查插件文件是否完整
 python skills/agy-cmd/scripts/setup_auto_router.py --sync-check
 
 # 停用插件
 python skills/agy-cmd/scripts/setup_auto_router.py --remove
 ```
 
----
+运行自带测试：
 
-## 自检与测试
-
-- 运行依赖：Google Antigravity 桌面端 App / IDE、Node.js ≥ 20、Python 3
-- 执行全套单元测试（钩子、面板安全、Star 里程碑与 CLI 测试）：
-  ```bash
-  node --test test/hooks.test.mjs test/sidecar.test.mjs test/star-prompt.test.mjs
-  python -m unittest discover -s test -p "test_*.py" -v
-  ```
-
-## 仓库目录结构
-
-```text
-.
-├── plugin.json                              # Antigravity 插件清单
-├── hooks.json                               # 生命周期钩子配置 (SessionStart / PostToolUse / PreInvocation / Stop)
-├── package.json
-├── assets/
-│   └── logo.svg                             # 插件图标
-├── rules/
-│   └── AGENTS.md                            # 极薄常驻路由规则（零稳态干扰 + 免费版默认防报错）
-├── hooks/
-│   ├── session-start.mjs                    # 首次启用一次性面板引导钩子（之后永久返回 {}）
-│   ├── post-tool-use.mjs                    # 编辑与命令事件轻量记账钩子
-│   ├── pre-invocation.mjs                   # 客观卡壳阈值与只读 Plan Mode 兜底钩子
-│   ├── stop.mjs                             # 防停机自动续跑监工钩子（含 4 道安全刹车）
-│   └── lib/                                 # 真实退出码对账、配置与状态核心库
-├── sidecars/
-│   └── panel/                               # 右侧辅助边栏可视化控制面板 (agy-cmd/panel)
-│       ├── sidecar.json
-│       ├── server.mjs
-│       ├── api-handler.mjs
-│       └── index.html
-├── skills/
-│   └── agy-cmd/                             # 19 项指令选型参谋 Skill 与 CLI 管理脚本
-│       ├── SKILL.md
-│       ├── references/
-│       │   └── desktop-commands-matrix.md
-│       └── scripts/
-│           └── setup_auto_router.py
-└── test/                                    # Node 与 Python 自动化测试套件
+```bash
+npm test
+python -m unittest discover -s test -p "test_*.py" -v
 ```
