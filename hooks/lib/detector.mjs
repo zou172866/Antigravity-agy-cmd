@@ -1133,8 +1133,8 @@ export function evaluatePreInvocation(payload, events = [], prevStateInput = nul
         nextState,
         injectStep: buildInjectStep({
           uiOnly,
-          userMarkdown: `> **[agy-cmd → 自动换视角排查]** 检测到${reasonsZh.join("、")}（当前为免费安全模式，已屏蔽 \`/boost\` 防报错，自动切换内置子智能体深度排查）。`,
-          systemMessage: `[agy-cmd] Objective stuck threshold reached (${reasonsEn.join("; ")}) in Free-Tier Safe Mode. IMPORTANT: Do NOT suggest /boost, /swarm, or /teamwork (prevents free-tier entitlement errors). Start line 1 of your reply with "[agy-cmd → 自动换视角排查]", stop repetitive blind patching, delegate a read-only "research" subagent (invoke_subagent) to inspect the root cause with fresh context (or list 2-3 falsifiable hypotheses first), and verify systematically.`
+          userMarkdown: `> **[agy-cmd → 自动换视角排查]** 检测到${reasonsZh.join("、")}（当前为免费安全模式，已屏蔽 \`/boost\` 防报错，按可用角色派发只读排查）。`,
+          systemMessage: `[agy-cmd] Objective stuck threshold reached (${reasonsEn.join("; ")}) in Free-Tier Safe Mode. IMPORTANT: Do NOT suggest /boost, /swarm, or /teamwork (prevents free-tier entitlement errors). Start line 1 of your reply with "[agy-cmd → 自动换视角排查]", stop repetitive blind patching, delegate to "dart-reviewer" when listed, otherwise use the read-only "research" subagent (invoke_subagent) to inspect the root cause with fresh context (or list 2-3 falsifiable hypotheses first), and verify systematically.`
         }),
         shouldResetEvents,
         reasonCode: "free_stuck_fallback",

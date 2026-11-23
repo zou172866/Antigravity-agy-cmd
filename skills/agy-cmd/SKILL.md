@@ -14,7 +14,7 @@ description: Antigravity 桌面端/IDE 高阶能力自动路由与内置斜杠�
 
 ## 关键不变量
 
-1. **默认免费版防报错**：初始默认 `planTier = "free"`、`boostEnabled = false`，自动屏蔽 `/boost`、`/swarm`、`/teamwork` 口令推销以防非会员触发权限报错，卡壳时自动切换为内置只读 `research` 子智能体换视角重查；仅当用户在右侧面板或 CLI 手动开启会员 Boost 接入后才推 `/boost`。
+1. **默认免费版防报错**：初始默认 `planTier = "free"`、`boostEnabled = false`，自动屏蔽 `/boost`、`/swarm`、`/teamwork` 口令推销以防非会员触发权限报错，卡壳时优先派可用的 `dart-reviewer`，否则派内置只读 `research` 子智能体换视角重查；仅当用户在右侧面板或 CLI 手动开启会员 Boost 接入后才推 `/boost`。
 2. **安装后必提醒手动确认**：每当执行安装/初始化或用户首次询问状态且尚未确认面板配置时，必须提醒用户打开右侧 **[agy-cmd 自动路由](sidecar://agy-cmd/panel/)** 面板手动确认 **① 自动重试次数** 与 **② 是否开启 Boost（Pro/Ultra 会员）自动接入**。
 3. **Plan Mode 审批不可绕过**：若只读 Plan Mode 拒绝 `write_file` 写方案产物，必须在正文直接输出精简方案并停止等待确认，严禁调用 `exit_plan_mode` 绕过审批。
 4. **轻量任务零打扰**：1～2 文件明确修改、普通问答、本地确定性查找直接执行，**不加徽标、不建计划、不推指令**。
@@ -58,9 +58,9 @@ description: Antigravity 桌面端/IDE 高阶能力自动路由与内置斜杠�
 | --- | --- | --- |
 | 新功能只有模糊方向，边界未定 | **自动代执行** `[agy-cmd → /grill-me 追问]` | 调用 `ask_question` 每次只问 1 个关键决策问题并置顶 `(Recommended)` 推荐项 |
 | 改动 ≥3 个文件或调整核心架构 | **自动代执行** `[agy-cmd → /plan 审批]` | 先只读扫描，创建 `RequestFeedback: true` 的 `Implementation Plan` 获批再改；只读 Plan Mode 拒写时正文输出方案并停下等确认 |
-| ≥5 个对象需语义批处理 | **自动代执行** `[agy-cmd → /run-workflow]` | 读 `run-workflow` 编写并发脚本（`model="inherit"`，3～5 项复用多轮 Worker；套餐受限时降级分批顺序执行） |
+| ≥5 个对象需语义批处理 | **自动代执行** `[agy-cmd → /run-workflow]` | 读 `run-workflow` 编写并发脚本（`model="inherit"`，3～5 项复用多轮 Worker（编码优先选可用的 `dart-coder`，否则选 `self`）；套餐受限时降级分批顺序执行） |
 | 动态网页操作或复杂可视化图表 | **自动代执行** `[agy-cmd → /browser]` / `[agy-cmd → /generative_ui]` | 委派 `browser` 子智能体或读取 `generative_ui` |
-| 反复修错未果 / 修改↔失败震荡 ≥2 次 / 连续 ≥3 次命令失败 | **套餐感知兜底** | **默认免费版**：输出 `[agy-cmd → 自动换视角排查]`，派只读 `research` 子智能体独立查根因（禁推 `/boost` 防报错）；**已开启会员 Boost**：输出 `[agy-cmd → 建议 /boost]` + 可复制口令 |
+| 反复修错未果 / 修改↔失败震荡 ≥2 次 / 连续 ≥3 次命令失败 | **套餐感知兜底** | **默认免费版**：输出 `[agy-cmd → 自动换视角排查]`，优先派可用的 `dart-reviewer`，否则派只读 `research` 子智能体独立查根因（禁推 `/boost` 防报错）；**已开启会员 Boost**：输出 `[agy-cmd → 建议 /boost]` + 可复制口令 |
 | 日常改代码后命令未过 / 要求修错但测试未绿 | **Stop 自动续跑监工** | 免口令免声明：改过源码后命令失败或要求修错但单测/构建未绿时自动拦截续跑；自然问原因（“为什么挂了/分析报错”）、查看状态、环境探测或等待方案审批时自动识别放行 |
 
 ### 模式 C：指令选型参谋与分类速查

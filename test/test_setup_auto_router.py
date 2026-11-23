@@ -40,6 +40,7 @@ class TestPluginManifestsAndSync(unittest.TestCase):
         self.assertIn("[agy-cmd → 自动换视角排查]", disk)
         self.assertIn("sidecar://agy-cmd/panel/", disk)
         self.assertIn('model="inherit"', disk)
+        self.assertIn("编码优先选可用的 `dart-coder`，否则选 `self`", disk)
         self.assertFalse(disk.startswith("---"))
 
     def test_plugin_json_hooks_json_and_sidecar_schema(self) -> None:

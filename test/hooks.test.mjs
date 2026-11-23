@@ -239,6 +239,7 @@ test("Trigger 2a: >=2 edit<->fail oscillations trigger /boost once, and passing 
   assert.equal(out1.injectSteps?.length, 1);
   assert.deepEqual(Object.keys(out1.injectSteps[0].systemMessage), ["systemMessage"]);
   assert.match(out1.injectSteps[0].systemMessage.systemMessage, /agy-cmd → 自动换视角排查/);
+  assert.match(out1.injectSteps[0].systemMessage.systemMessage, /"dart-reviewer" when listed, otherwise use the read-only "research"/);
   assert.match(out1.injectSteps[0].systemMessage.systemMessage, /src\/auth\.ts/);
 
   // Cooldown: must NOT fire again immediately during same episode
