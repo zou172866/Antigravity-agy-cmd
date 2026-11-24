@@ -4,7 +4,7 @@
 
 # agy-cmd
 
-**Google Antigravity plugin: auto-route commands · Stop-hook auto-retry · multi-agent Boost on plan approval · fresh-perspective stuck recovery · anti-bypass plan guard**
+**Automatically choose and invoke a multi-agent workflow in Google Antigravity based on the task. Simple tasks stay in the main conversation.**
 
 [简体中文](README.zh-CN.md) · English · [How to Install](#how-to-install) · [Features](#features) · [CLI Management](#cli-management)
 
@@ -18,7 +18,7 @@
 
 Once installed, it runs automatically in the background during every chat to handle these things:
 
-- **Auto-route built-in workflows by task**: matches `/grill-me`, `/plan`, `/run-workflow`, and related workflows based on scope;
+- **Delegate by task.** For example, the main agent can ask one subagent to trace a complex call chain. With the panel set to a paid tier and the corresponding command available in the Antigravity App, the plugin can use `/run-workflow` to run the same check across packages or `/swarm` to coordinate an interface change across modules. Free mode processes batches sequentially by default.
 - **Stop-hook auto-retry guard**: keeps the agent investigating and fixing when tests or build checks fail instead of stopping early;
 - **Auto-dispatch multi-agent execution on plan approval**: with Pro / Ultra Boost enabled, approving a plan automatically launches `DeepCoder` / `DeepInvestigator` to execute and verify;
 - **Fresh-perspective stuck recovery (all tiers)**: when repeated fixes fail, gives one available investigator a read-only diagnosis task. The main agent checks the proposed fix.
@@ -70,16 +70,15 @@ After installing, open the right-hand **agy-cmd Auto-Router** Sidecar panel (or 
 
 ## Features
 
-### 1. Automatic workflow routing by task scope
-
-No need to memorize or manually pick built-in Antigravity slash commands for every turn:
+### 1. When does the plugin invoke multiple agents?
 
 - **1–2 files, explanations, or local lookups**: responds directly with zero extra prompts or banners.
 - **Ambiguous requirements**: asks a focused multiple-choice clarification question first.
 - **3+ files or higher-risk edits**: drafts an implementation plan for your approval before touching project files (even in read-only plan mode, it writes the plan inline and waits for confirmation); when Pro / Ultra Boost is enabled, approving the plan displays `[agy-cmd → 计划获批，自动 Boost]` and dispatches `DeepCoder` / `DeepInvestigator` strictly once while preserving `Stop` auto-retry state across background-task wakeups.
 - **A self-contained side task**, such as tracing a call chain or inspecting a UI, can go to one subagent. Simple lookups stay in the main session.
 - **Repeated work** on five or more similar items runs in batches by default. With the panel set to a paid tier and the command available in the App, the plugin can choose `/run-workflow` to apply the same check to each item and collect structured results.
-- **Separate modules that need to agree on an interface** can use `/swarm` in the App. Set the interface, give each writer distinct files and name the integration check. A single recurring failure fits `/boost`. A multi-day migration with separately verifiable milestones fits `/teamwork`. [Routing examples](skills/agy-cmd/references/desktop-commands-matrix.md)
+- **Modules that need to agree on an interface** can use `/swarm` under the same App and tier conditions. Set the interface, give each writer distinct files and name the integration check.
+- **Repeated failures on one problem** prompt a `/boost` suggestion when paid Boost is enabled. A multi-day repository migration prompts a `/teamwork` suggestion on the paid tier. The separate **Use Boost after plan approval** setting dispatches a worker automatically when you approve a plan. [Routing examples](skills/agy-cmd/references/desktop-commands-matrix.md)
 - **Dynamic web pages or interactive visuals**: automatically triggers the built-in browser or interactive UI renderer.
 
 ### 2. Stop-hook auto-retry guard
