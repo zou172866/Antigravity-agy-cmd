@@ -9,7 +9,7 @@ import {
 } from "./common.mjs";
 import { createDefaultState } from "./state.mjs";
 import { normalizeSettings, parseTurnRetryOverride } from "./settings.mjs";
-import { stripTranscriptStepHeaders } from "./transcript.mjs";
+import { isPlanApprovalNotice, stripTranscriptStepHeaders } from "./transcript.mjs";
 
 const EDIT_TOOL_NAMES = new Set([
   "edit_file",
@@ -21,6 +21,16 @@ const EDIT_TOOL_NAMES = new Set([
 ]);
 
 const WRITE_ONLY_TOOLS = new Set(["write_file", "write_to_file"]);
+
+// Match the whole reply so a question, rejection, or request to revise the plan stays with the main agent.
+function confirmsPlan(reply) {
+  const text = reply.replace(/[。.!！\s]+$/, "");
+  if (/^(?:ok(?:ay)?|yes|approved?|proceed|go ahead|implement (?:the|this) plan)$/i.test(text)) return true;
+  const approval = /^(?:确认|同意|批准|通过|可以|好的?|没问题)(?:该?(?:方案|计划))?/.exec(text);
+  if (approval?.[0] === text) return true;
+  const action = text.slice(approval?.[0].length ?? 0).replace(/^[，,、\s]+/, "");
+  return /^(?:请)?(?:按(?:照)?(?:此|该)?(?:计划|方案)(?:执行|实施)|继续(?:执行|实施|推进)?|开始(?:执行|实施)|执行|实施)$/.test(action);
+}
 
 // Note: ctx_execute is intentionally excluded (it is a read/analysis sandbox, not a build/test runner)
 const CMD_TOOL_NAMES = new Set(["run_command", "run_checks"]);
@@ -903,10 +913,9 @@ export function evaluatePreInvocation(payload, events = [], prevStateInput = nul
 
   const initialNumSteps = parseNonNegInt(payload.initialNumSteps ?? payload.initial_num_steps);
   const invocationNum = parseNonNegInt(payload.invocationNum ?? payload.invocation_num);
-  const rawLastUserInput = unwrapUserRequestText(
-    nonEmptyString(payload.lastUserInput ?? payload.last_user_input) ||
-      nonEmptyString(transcriptTail?.latestUserInput)
-  );
+  const latestTranscriptInput = nonEmptyString(transcriptTail?.latestUserInput);
+  const inputEnvelope = nonEmptyString(payload.lastUserInput ?? payload.last_user_input) || latestTranscriptInput;
+  const rawLastUserInput = unwrapUserRequestText(inputEnvelope);
   const isMidTurn = invocationNum !== null && invocationNum >= 1;
 
   let nextState = { ...prevState };
@@ -1058,6 +1067,27 @@ export function evaluatePreInvocation(payload, events = [], prevStateInput = nul
     };
   }
 
+  const paidBoostActive = effSettings.planTier === "paid" && effSettings.boostEnabled === true;
+  if (paidBoostActive && isNewUserTurn && activeSlash.size === 0) {
+    const sameInput = inputEnvelope === latestTranscriptInput || inputEnvelope === unwrapUserRequestText(latestTranscriptInput);
+    const clickedApproval = isPlanApprovalNotice(inputEnvelope) || (sameInput && isPlanApprovalNotice(latestTranscriptInput));
+    const confirmedInChat = confirmsPlan(rawLastUserInput);
+    if ((clickedApproval && (!rawLastUserInput || confirmedInChat)) ||
+        (sameInput && transcriptTail?.latestInputFollowsPlan && confirmedInChat)) {
+      return {
+        nextState,
+        injectStep: buildInjectStep({
+          uiOnly,
+          systemMessage: "[agy-cmd → 计划获批，自动 Boost] For this approval turn, execute the approved implementation plan now. If still in read-only Plan Mode, use the host's approved transition to execution first. Call invoke_subagent with TypeName='DeepCoder' and Workspace='inherit'. Pass the approved plan or its path, scope, user constraints and verification criteria. For a read-only investigation plan use DeepInvestigator instead. Follow the worker to completion and independently verify the result. If the host does not provide the role, carry out the approved plan with the available tools. Do not ask the user to type /boost."
+        }),
+        shouldResetEvents,
+        reasonCode: "approved_plan_boost",
+        stateChanged,
+        metrics
+      };
+    }
+  }
+
   // 4. Priority 2: Stuck debugging / repeated failures
   //    - Paid + Boost enabled: suggest `/boost` + independent subagent check
   //    - Free tier (DEFAULT) or Boost disabled: NEVER suggest `/boost` (prevents permission errors!);
@@ -1069,7 +1099,6 @@ export function evaluatePreInvocation(payload, events = [], prevStateInput = nul
   const failStreakHit =
     !isCleanNonDebugTurnEntry && metrics.consecutiveCmdFailures >= 3 && hasFreshFailureSinceAlert;
   const multiTurnDebugHit = isNewUserTurn && (nextState.debugTurnStreak || 0) >= 2;
-  const paidBoostActive = effSettings.planTier === "paid" && effSettings.boostEnabled === true;
 
   if (
     (oscHit || failStreakHit || multiTurnDebugHit) &&

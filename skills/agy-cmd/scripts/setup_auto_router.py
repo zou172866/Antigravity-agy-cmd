@@ -365,7 +365,7 @@ def format_settings_summary(settings: dict) -> str:
     if boost_on:
         tier_str = "Pro/Ultra 会员（已开启 /boost 自动接入）"
     elif tier == "paid":
-        tier_str = "Pro/Ultra 会员（已关闭 /boost 提示）"
+        tier_str = "Pro/Ultra 会员（已关闭 /boost 自动接入）"
     else:
         tier_str = "免费版默认（已关闭 /boost 防报错）"
     return f"自动重试={retry_str} | 套餐档位={tier_str}"
@@ -723,7 +723,7 @@ def main(argv: list[str] | None = None) -> int:
         "--boost",
         choices=["on", "off"],
         default=None,
-        help="开启或关闭 /boost 高阶指令自动接入提示（开启时自动切至 paid 档位）",
+        help="开启或关闭计划获批后的 Boost 自动执行与卡壳提示（开启时自动切至 paid 档位）",
     )
     parser.add_argument(
         "--standalone",

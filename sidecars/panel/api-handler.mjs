@@ -119,7 +119,7 @@ export function buildPanelStatePayload(stateDir, rawConvId = "", { markStarTrigg
       settings.planTier === "paid" && settings.boostEnabled
         ? "Pro/Ultra 会员 · 已开启 /boost 自动接入"
         : settings.planTier === "paid"
-          ? "Pro/Ultra 会员 · 已手动关闭 /boost 提示"
+          ? "Pro/Ultra 会员 · 已手动关闭 /boost 自动接入"
           : "免费版安全模式 · 已屏蔽付费口令防报错",
     trackedSessions,
     activeSession

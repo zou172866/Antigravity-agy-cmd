@@ -57,7 +57,7 @@ python ~/.agents/skills/agy-cmd/scripts/setup_auto_router.py --install --standal
 安装完成后，请打开软件右侧边栏的「agy-cmd 自动路由」面板（也可以在聊天框点击 `sidecar://agy-cmd/panel/` 打开），确认两项设置：
 
 1. **自动重试次数**：选择「不用重试（0 次）」「指定次数（1～50 次）」或「一直重试」。
-2. **账号档位**：如果你开通了 Google AI Pro / Ultra 会员，可以切换到「Pro / Ultra 会员」，开启 `/boost` 口令提醒。
+2. **账号档位**：如果你开通了 Google AI Pro / Ultra 会员，可以切换到「Pro / Ultra 会员」，开启 Boost 自动接入。批准实施计划，或在方案后回复“按计划执行”，插件就会调度 Boost 执行和验证。
 
 ## agy-cmd 有哪些功能？
 

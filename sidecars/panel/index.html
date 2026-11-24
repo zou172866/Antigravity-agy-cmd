@@ -608,8 +608,8 @@
       <div class="toggle-list">
         <label class="toggle-row" id="row-boost">
           <div class="row-text">
-            <b>开启 <code>/boost</code> 自动接入提示</b>
-            <small id="boost-sub">连续失败/修改震荡时在首行给出可复制 <code>/boost</code> 攻坚口令</small>
+            <b>开启 <code>/boost</code> 自动接入</b>
+            <small id="boost-sub">批准实施计划后自动用 Boost 执行；连续失败时提供攻坚口令</small>
           </div>
           <input id="chk-boost" type="checkbox">
         </label>
@@ -958,7 +958,7 @@
         chkBoost.disabled = isFree;
         boostSub.textContent = isFree
           ? "需先切换上方为「Pro / Ultra 会员」才可开启，防止免费号触发报错"
-          : "连续失败/修改震荡时在首行给出可复制 /boost 攻坚口令";
+          : "批准实施计划后自动用 Boost 执行；连续失败时提供攻坚口令";
 
         chkFreeFb.checked = Boolean(s.freeFallbackEnabled);
         chkPlanFb.checked = Boolean(s.planFallbackEnabled);

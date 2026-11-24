@@ -57,7 +57,7 @@ To prevent free accounts from hitting errors on paid-only commands, `agy-cmd` sh
 After installing, open the right-hand **agy-cmd Auto-Router** Sidecar panel (or click `sidecar://agy-cmd/panel/` in chat) and confirm:
 
 1. **Auto-retry limit**: choose **Off (0)**, **Fixed count (1–50)**, or **Unlimited**.
-2. **Account tier**: if you subscribe to **Google AI Pro / Ultra**, switch to **Pro / Ultra** to enable `/boost` reminders.
+2. **Account tier**: if you subscribe to **Google AI Pro / Ultra**, switch to **Pro / Ultra** to enable Boost. Approve the implementation plan or reply “implement the plan” to run it with Boost and verify the result.
 
 ## Features
 

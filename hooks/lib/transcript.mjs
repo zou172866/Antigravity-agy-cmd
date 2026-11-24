@@ -11,6 +11,18 @@ const PLAN_MODE_DENY_RE =
 const PLAN_MODE_OFF_RE = /^Plan mode is off\.?$/i;
 const PLAN_WRITE_TOOL_RE = /\b(?:write_file|write_to_file)\b/i;
 const PLAN_ARTIFACT_PATH_RE = /(?:implementation[_ -]?plan|plan\.md|[\\/]brain[\\/])/i;
+const IMPLEMENTATION_PLAN_FILE_RE = /(?:^|[\\/])(?:implementation[_ -]plan(?:[_ -][^\\/]*)?|plan)\.md$/i;
+
+// The desktop approval button sends a preamble outside the (usually empty) USER_REQUEST.
+export function isPlanApprovalNotice(input) {
+  const preamble = /^Comments on artifact URI: (file:\/\/[^\r\n]+)\r?\n\s*The user has approved this document\.\s*<USER_REQUEST>/i.exec(input);
+  if (!preamble) return false;
+  try {
+    return IMPLEMENTATION_PLAN_FILE_RE.test(decodeURIComponent(new URL(preamble[1]).pathname));
+  } catch {
+    return false;
+  }
+}
 
 function parseJsonLines(text) {
   const out = [];
@@ -203,6 +215,15 @@ function isPlanWriteToolCall(call) {
   return PLAN_ARTIFACT_PATH_RE.test(rawPath);
 }
 
+function requestsPlanFeedback(call) {
+  if (!PLAN_WRITE_TOOL_RE.test(nonEmptyString(call?.name))) return false;
+  const args = parseToolCallArgs(call.args);
+  const meta = parseToolCallArgs(args.ArtifactMetadata ?? args.artifactMetadata);
+  const target = String(args.Path ?? args.path ?? args.TargetFile ?? args.targetFile ?? "").replace(/^"|"$/g, "");
+  return (meta.RequestFeedback ?? meta.requestFeedback) === true &&
+    (IMPLEMENTATION_PLAN_FILE_RE.test(target) || (meta.ArtifactType ?? meta.artifactType) === "IMPLEMENTATION_PLAN");
+}
+
 /**
  * Single bounded tail scan of `transcript.jsonl` returning:
  * - stepsByIndex: Map<step_index, step> for GENERIC tool result steps
@@ -216,6 +237,7 @@ export function inspectTranscriptTail(transcriptPath) {
     taskResultsByStepIdx: new Map(),
     latestPlanModeDenial: null,
     latestUserInput: "",
+    latestInputFollowsPlan: false,
     awaitingUserApprovalOrQuestion: false
   };
   if (!transcriptPath) return empty;
@@ -229,11 +251,15 @@ export function inspectTranscriptTail(transcriptPath) {
   let latestUserInput = "";
   let lastPlannerStep = null;
   let awaitingUserApprovalOrQuestion = false;
+  let waitingForPlanReply = false;
+  let latestInputFollowsPlan = false;
 
   for (const step of steps) {
     const idx = Number.isFinite(Number(step.step_index)) ? Math.floor(Number(step.step_index)) : null;
 
     if (step.type === "USER_INPUT") {
+      latestInputFollowsPlan = waitingForPlanReply;
+      waitingForPlanReply = false;
       if (typeof step.content === "string" && step.content.trim()) {
         latestUserInput = step.content;
       }
@@ -253,6 +279,10 @@ export function inspectTranscriptTail(transcriptPath) {
           ? step.toolCalls
           : [];
       const calledAskQuestion = pCalls.some((c) => nonEmptyString(c?.name) === "ask_question");
+      const showsPlan = /^\s*(?:\*\*)?\[agy-cmd\s*→\s*\/plan\s*审批\]/.test(pContent);
+      if (calledAskQuestion || pCalls.length > 0 || showsPlan) {
+        waitingForPlanReply = !calledAskQuestion && (showsPlan || pCalls.some(requestsPlanFeedback));
+      }
       const calledPlanWrite = pCalls.some((c) => isPlanWriteToolCall(c));
       const hasApprovalOrGrillBadge =
         /\[agy-cmd\s*→\s*\/(?:plan\s*审批|grill-me\s*追问)\]/.test(pContent);
@@ -330,6 +360,7 @@ export function inspectTranscriptTail(transcriptPath) {
     taskResultsByStepIdx,
     latestPlanModeDenial,
     latestUserInput,
+    latestInputFollowsPlan,
     awaitingUserApprovalOrQuestion
   };
 }

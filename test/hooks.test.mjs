@@ -23,6 +23,7 @@ import { maybeGcStaleSessions, readEvents } from "../hooks/lib/state.mjs";
 import { isSubagentTranscript } from "../hooks/lib/transcript.mjs";
 import { runPostToolUse } from "../hooks/post-tool-use.mjs";
 import { runPreInvocation } from "../hooks/pre-invocation.mjs";
+import { updateSettings } from "../hooks/lib/settings.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PLUGIN_ROOT = path.resolve(__dirname, "..");
@@ -41,6 +42,52 @@ function makeEnv(stateDir, extra = {}) {
     ...extra
   };
 }
+
+test("paid Boost hands an approved plan to the executor once through the desktop hook", async (t) => {
+  const dir = makeTmpDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const env = makeEnv(dir);
+  const transcriptPath = path.join(dir, "transcript.jsonl");
+  const plan = { type: "PLANNER_RESPONSE", content: "[agy-cmd → /plan 审批]\n请审阅方案。" };
+  const artifact = { type: "PLANNER_RESPONSE", tool_calls: [{ name: "write_file", args: {
+    Path: '"C:\\brain\\implementation_plan_v2.md"', ArtifactMetadata: '{"RequestFeedback":true}'
+  } }] };
+  const question = { type: "PLANNER_RESPONSE", tool_calls: [{ name: "ask_question" }] };
+  const approval = "Comments on artifact URI: file:///c%3A/brain/implementation_plan_v2.md\n\nThe user has approved this document.\n\n<USER_REQUEST>\n\n</USER_REQUEST>";
+  const request = (content) => ({ type: "USER_INPUT", content });
+  async function run(conversationId, steps, extra = {}) {
+    const log = [request("帮我重构"), ...steps].map((s, step_index) => JSON.stringify({ step_index, ...s }));
+    fs.writeFileSync(transcriptPath, log.join("\n") + "\n");
+    return runPreInvocation({ conversationId, transcriptPath, invocationNum: 0, initialNumSteps: log.length, ...extra }, env);
+  }
+  assert.deepEqual(await run("free", [request(approval)]), {});
+  updateSettings(dir, { planTier: "paid", boostEnabled: false });
+  assert.deepEqual(await run("disabled", [request(approval)]), {});
+  updateSettings(dir, { boostEnabled: true });
+  for (const [name, steps] of [
+    ["button", [request(approval)]],
+    ["inline", [plan, request("按计划执行")]],
+    ["artifact", [artifact, request("继续")]]
+  ]) {
+    const result = await run(name, steps);
+    assert.match(result.injectSteps[0].systemMessage.systemMessage, /invoke_subagent.*DeepCoder.*Workspace='inherit'/);
+    assert.deepEqual(await run(name, steps), {});
+    assert.deepEqual(await run(name, steps, { invocationNum: 1 }), {});
+  }
+  for (const [name, steps] of [
+    ["waiting", [plan]],
+    ["question", [plan, question, request("同意")]],
+    ["revision", [plan, request("可以先改一下计划吗？")]],
+    ["manual", [plan, request("按计划执行 /boost")]],
+    ["unrelated", [request("继续")]],
+    ["superseded", [plan, request("先等等"), request("继续")]],
+    ["other-artifact", [request(approval.replace("implementation_plan_v2", "walkthrough"))]],
+    ["quoted", [request("<USER_REQUEST>\n" + approval + "\n</USER_REQUEST>")]],
+    ["qualified", [plan, request(approval.replace("<USER_REQUEST>\n\n", "<USER_REQUEST>\n先别执行\n"))]]
+  ]) {
+    assert.deepEqual(await run(name, steps), {}, name);
+  }
+});
 
 test("common: extractActiveSlashCommands detects prefix/suffix/quoted commands and ignores URLs/paths", () => {
   assert.deepEqual([...extractActiveSlashCommands("/boost fix race condition")], ["boost"]);

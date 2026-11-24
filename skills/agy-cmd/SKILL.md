@@ -57,7 +57,7 @@ description: Antigravity 桌面端/IDE 高阶能力自动路由与内置斜杠�
 | 任务特征 | 调度轨道与徽标 | Agent 立即执行的动作 |
 | --- | --- | --- |
 | 新功能只有模糊方向，边界未定 | **自动代执行** `[agy-cmd → /grill-me 追问]` | 调用 `ask_question` 每次只问 1 个关键决策问题并置顶 `(Recommended)` 推荐项 |
-| 预计改 ≥3 个文件、变更公共接口或涉及高风险 | **自动代执行** `[agy-cmd → /plan 审批]` | 只读确认范围，批量编辑按文件计。提交 `RequestFeedback: true` 的 `Implementation Plan`，获批后再写项目文件（含 `apply_edits`）。只读 Plan Mode 拒写方案时在正文提交并等待确认。 |
+| 预计改 ≥3 个文件、变更公共接口或涉及高风险 | **自动代执行** `[agy-cmd → /plan 审批]` | 只读确认范围，批量编辑按文件计。提交 `RequestFeedback: true` 的 `Implementation Plan`，获批后再写项目文件（含 `apply_edits`）。只读 Plan Mode 拒写方案时在正文提交并等待确认。会员开启 Boost 后，收到钩子的计划获批指令时直接调度 Boost 执行并验证。 |
 | ≥5 个对象需语义批处理 | **自动代执行** `[agy-cmd → /run-workflow]` | 读 `run-workflow` 编写并发脚本（`model="inherit"`，3～5 项复用多轮 Worker（编码优先选可用的 `dart-coder`，否则选 `self`）；套餐受限时降级分批顺序执行） |
 | 动态网页操作或复杂可视化图表 | **自动代执行** `[agy-cmd → /browser]` / `[agy-cmd → /generative_ui]` | 委派 `browser` 子智能体或读取 `generative_ui` |
 | 反复修错未果 / 修改↔失败震荡 ≥2 次 / 连续 ≥3 次命令失败 | **套餐感知兜底** | **默认免费版**：输出 `[agy-cmd → 自动换视角排查]`，优先派可用的 `dart-reviewer`，否则派只读 `research` 子智能体独立查根因（禁推 `/boost` 防报错）；**已开启会员 Boost**：输出 `[agy-cmd → 建议 /boost]` + 可复制口令 |
