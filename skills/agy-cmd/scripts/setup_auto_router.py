@@ -23,8 +23,8 @@ MIN_RETRY_MAX = 1
 MAX_RETRY_MAX = 50
 DEFAULT_RETRY_MAX = 3
 
-GITHUB_REPO_URL = "https://github.com/zou172866/agy-cmd"
-GH_STAR_COMMAND = "gh api -X PUT /user/starred/zou172866/agy-cmd"
+GITHUB_REPO_URL = "https://github.com/zou172866/Antigravity-agy-cmd"
+GH_STAR_COMMAND = "gh api -X PUT /user/starred/zou172866/Antigravity-agy-cmd"
 GH_AUTH_CHECK_TIMEOUT_SEC = 1.5
 STAR_PROMPT_STATES = ("pending", "clicked", "dismissed", "copied_cli")
 

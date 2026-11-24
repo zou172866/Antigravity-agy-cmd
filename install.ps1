@@ -2,7 +2,7 @@
 .SYNOPSIS
   One-command Windows installer for agy-cmd (supports both `irm ... | iex` and local repo runs).
 .EXAMPLE
-  irm https://raw.githubusercontent.com/zou172866/agy-cmd/main/install.ps1 | iex
+  irm https://raw.githubusercontent.com/zou172866/Antigravity-agy-cmd/main/install.ps1 | iex
   .\install.ps1
 #>
 $ErrorActionPreference = "Stop"
@@ -30,14 +30,14 @@ try {
     $RepoDir = Join-Path $TempWorkDir "repo"
     if (Get-Command git -ErrorAction SilentlyContinue) {
       Write-Host "[agy-cmd] Fetching latest release from GitHub..."
-      & git clone --depth 1 --quiet "https://github.com/zou172866/agy-cmd.git" $RepoDir
+      & git clone --depth 1 --quiet "https://github.com/zou172866/Antigravity-agy-cmd.git" $RepoDir
       if ($LASTEXITCODE -ne 0) { throw "git clone failed with exit code $LASTEXITCODE" }
     } else {
       Write-Host "[agy-cmd] Downloading archive from GitHub..."
       $ZipFile = Join-Path $TempWorkDir "agy-cmd.zip"
-      Invoke-WebRequest -Uri "https://github.com/zou172866/agy-cmd/archive/refs/heads/main.zip" -OutFile $ZipFile -UseBasicParsing
+      Invoke-WebRequest -Uri "https://github.com/zou172866/Antigravity-agy-cmd/archive/refs/heads/main.zip" -OutFile $ZipFile -UseBasicParsing
       Expand-Archive -Path $ZipFile -DestinationPath $TempWorkDir -Force
-      $Extracted = Get-ChildItem -Path $TempWorkDir -Directory -Filter "agy-cmd-*" | Select-Object -First 1
+      $Extracted = Get-ChildItem -Path $TempWorkDir -Directory -Filter "*agy-cmd-*" | Select-Object -First 1
       if (-not $Extracted) { throw "Failed to unpack agy-cmd archive." }
       $RepoDir = $Extracted.FullName
     }

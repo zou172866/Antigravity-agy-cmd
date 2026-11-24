@@ -4,10 +4,10 @@
   "version": "2.1.1",
   "description": "Antigravity 桌面端/IDE 高阶能力自动路由插件（v2.1.1）：提供常驻精简路由规则、免口令智能无感 Stop 防停机自动续跑监工（不重试 / N 次 / 一直重试 + 单句口语覆盖）、默认免费版防报错保护，以及右侧边栏可视化控制面板。",
   "logo": "assets/logo.svg",
-  "homepage": "https://github.com/zou172866/agy-cmd",
+  "homepage": "https://github.com/zou172866/Antigravity-agy-cmd",
   "repository": {
     "type": "git",
-    "url": "https://github.com/zou172866/agy-cmd.git"
+    "url": "https://github.com/zou172866/Antigravity-agy-cmd.git"
   },
   "suggestedPrompts": [
     "检查 agy-cmd 当前自动重试次数和 Boost 接入状态",

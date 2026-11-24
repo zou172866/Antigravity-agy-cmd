@@ -778,7 +778,7 @@ test("star-5: /api/star-prompt security hardening, SidecarApp contract & zero AI
     }
 
     const rulesMd = fs.readFileSync(path.join(ROOT, "rules", "AGENTS.md"), "utf8");
-    assert.equal(rulesMd.includes("zou172866/agy-cmd"), false);
+    assert.equal(rulesMd.includes("zou172866/Antigravity-agy-cmd"), false);
     assert.equal(rulesMd.includes("gh api"), false);
 
     const hookDir = path.join(tmpDir, "hook-audit");
@@ -801,7 +801,7 @@ test("star-5: /api/star-prompt security hardening, SidecarApp contract & zero AI
       await runStop({ conversationId: "ha-main", executionNum: 0, terminationReason: "NO_TOOL_CALL", fullyIdle: true, lastUserInput: "修好 pytest" }, env)
     );
     for (const blob of [hStart, hPre, hStop]) {
-      assert.equal(blob.includes("zou172866/agy-cmd"), false, "Hooks must emit zero GitHub URL context pollution");
+      assert.equal(blob.includes("zou172866/Antigravity-agy-cmd"), false, "Hooks must emit zero GitHub URL context pollution");
       assert.equal(blob.includes("gh api"), false, "Hooks must emit zero gh CLI context pollution");
     }
 

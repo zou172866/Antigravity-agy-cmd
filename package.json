@@ -4,13 +4,13 @@
   "private": true,
   "type": "module",
   "description": "Antigravity desktop/IDE auto-router plugin with Stop auto-retry guard, tier-safe defaults, and right-hand Sidecar control panel.",
-  "homepage": "https://github.com/zou172866/agy-cmd#readme",
+  "homepage": "https://github.com/zou172866/Antigravity-agy-cmd#readme",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/zou172866/agy-cmd.git"
+    "url": "git+https://github.com/zou172866/Antigravity-agy-cmd.git"
   },
   "bugs": {
-    "url": "https://github.com/zou172866/agy-cmd/issues"
+    "url": "https://github.com/zou172866/Antigravity-agy-cmd/issues"
   },
   "scripts": {
     "test": "node --test test/hooks.test.mjs test/sidecar.test.mjs test/star-prompt.test.mjs"

@@ -7,8 +7,8 @@ export const MAX_RETRY_MAX = 50;
 export const DEFAULT_RETRY_MAX = 3;
 export const SETTINGS_VERSION = 2;
 
-export const GITHUB_REPO_URL = "https://github.com/zou172866/agy-cmd";
-export const GH_STAR_COMMAND = "gh api -X PUT /user/starred/zou172866/agy-cmd";
+export const GITHUB_REPO_URL = "https://github.com/zou172866/Antigravity-agy-cmd";
+export const GH_STAR_COMMAND = "gh api -X PUT /user/starred/zou172866/Antigravity-agy-cmd";
 export const STAR_PROMPT_STATES = Object.freeze(["pending", "clicked", "dismissed", "copied_cli"]);
 export const STAR_PROMPT_TERMINAL_STATES = Object.freeze(["clicked", "dismissed", "copied_cli"]);
 export const STAR_PROMPT_MIN_AUTO_RETRIES = 3;

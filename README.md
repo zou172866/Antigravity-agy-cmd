@@ -27,26 +27,26 @@ Run the one-line installer for your OS, then restart or reload your Antigravity 
 **Windows (PowerShell):**
 
 ```powershell
-irm https://raw.githubusercontent.com/zou172866/agy-cmd/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/zou172866/Antigravity-agy-cmd/main/install.ps1 | iex
 ```
 
 **macOS / Linux:**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zou172866/agy-cmd/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/zou172866/Antigravity-agy-cmd/main/install.sh | sh
 ```
 
 **Manual clone install:**
 
 ```powershell
-git clone https://github.com/zou172866/agy-cmd "$HOME\.gemini\config\plugins\agy-cmd"
+git clone https://github.com/zou172866/Antigravity-agy-cmd "$HOME\.gemini\config\plugins\agy-cmd"
 python "$HOME\.gemini\config\plugins\agy-cmd\skills\agy-cmd\scripts\setup_auto_router.py" --install
 ```
 
 **Standalone rules only** (text routing rules without Stop auto-retry or the Sidecar panel):
 
 ```bash
-npx -y skills add zou172866/agy-cmd -g --all
+npx -y skills add zou172866/Antigravity-agy-cmd -g --all
 python ~/.agents/skills/agy-cmd/scripts/setup_auto_router.py --install --standalone
 ```
 

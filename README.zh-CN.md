@@ -27,26 +27,26 @@
 **Windows（PowerShell 一行直装）：**
 
 ```powershell
-irm https://raw.githubusercontent.com/zou172866/agy-cmd/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/zou172866/Antigravity-agy-cmd/main/install.ps1 | iex
 ```
 
 **macOS / Linux（一行直装）：**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zou172866/agy-cmd/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/zou172866/Antigravity-agy-cmd/main/install.sh | sh
 ```
 
 也可以手动克隆仓库安装：
 
 ```powershell
-git clone https://github.com/zou172866/agy-cmd "$HOME\.gemini\config\plugins\agy-cmd"
+git clone https://github.com/zou172866/Antigravity-agy-cmd "$HOME\.gemini\config\plugins\agy-cmd"
 python "$HOME\.gemini\config\plugins\agy-cmd\skills\agy-cmd\scripts\setup_auto_router.py" --install
 ```
 
 如果只安装基础文字规则（不含自动重试和右侧面板），可以运行：
 
 ```bash
-npx -y skills add zou172866/agy-cmd -g --all
+npx -y skills add zou172866/Antigravity-agy-cmd -g --all
 python ~/.agents/skills/agy-cmd/scripts/setup_auto_router.py --install --standalone
 ```
 
