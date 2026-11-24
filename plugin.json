@@ -1,8 +1,8 @@
 {
   "name": "agy-cmd",
   "displayName": "agy-cmd (自动路由与防停机面板)",
-  "version": "2.2.0",
-  "description": "Antigravity 桌面端/IDE 高阶能力自动路由插件（v2.2.0）：提供常驻精简路由规则、免口令智能无感 Stop 防停机自动续跑监工（不重试 / N 次 / 一直重试 + 单句口语覆盖）、默认免费版防报错保护，以及右侧边栏可视化控制面板。",
+  "version": "2.2.1",
+  "description": "Antigravity 桌面端/IDE 高阶能力自动路由插件（v2.2.1）：提供常驻精简路由规则、免口令智能无感 Stop 防停机自动续跑监工（不重试 / N 次 / 一直重试 + 单句口语覆盖）、默认免费版防报错保护，以及右侧边栏可视化控制面板。",
   "logo": "assets/logo.svg",
   "homepage": "https://github.com/zou172866/Antigravity-agy-cmd",
   "repository": {
