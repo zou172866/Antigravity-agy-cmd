@@ -27,6 +27,7 @@ export function createDefaultState() {
     lastPlanBoostKey: "",
     lastPlanBoostNoticeHash: "",
     lastPlanBoostPromptKey: "",
+    freePlan: null,
     lastTurnUserInputKey: "",
     lastTurnStartTs: 0,
     turnUnattendedGoal: false,

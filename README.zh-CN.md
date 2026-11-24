@@ -21,7 +21,7 @@
 - **按不同任务自动路由指令**：根据任务范围自动匹配 `/grill-me`、`/plan`、`/run-workflow` 等内置能力；
 - **测试未过自动续跑**：在测试或验证还没通过时让 AI 接着排查修复，不提前停工；
 - **确认计划实施自动调用多智能体**：会员开启 Boost 后，批准方案或回复“按计划执行”即自动调度 `DeepCoder` / `DeepInvestigator` 执行与验收；
-- **卡壳时自动换视角排查（全套餐可用）**：反复修错未果时，指示 AI 停止盲改并派独立只读子智能体（`dart-reviewer` / `research`）核查根因；
+- **卡壳时自动换视角排查（全套餐可用）**：反复修错未果时，将只读诊断任务交给一个可用的调查角色，由主 Agent 验证修复结果。
 - **只读模式防绕过审批**：在只读模式拒绝写方案文件时，强制正文直接输出方案等你确认，严禁自动跳过审批偷偷改代码；
 - **右侧可视化控制面板**：提供随时点选的控制面板，同时内置免费账号防报错保护，默认屏蔽未开通套餐的付费口令。
 
@@ -77,7 +77,9 @@ python ~/.agents/skills/agy-cmd/scripts/setup_auto_router.py --install --standal
 - 改动 1～2 个文件、解释代码或查找内容时，AI 直接给出结果，不额外弹窗打扰。
 - 需求没说清时，AI 先出一个选择题向你确认方向。
 - 需要改动 3 个及以上文件时，AI 先把修改方案列出来，等你确认后再动手改代码。即使当前处于只读模式无法新建方案文件，AI 也会直接在对话框里写出方案等你点头；在会员 Boost 模式下，方案获批后会自动提示 `[agy-cmd → 计划获批，自动 Boost]` 并单次触发 `DeepCoder` / `DeepInvestigator` 执行，同时在后台任务唤醒时保留 `Stop` 自动续跑状态。
-- 需要同时处理 5 个及以上同类文件或任务时，AI 会自动分头同时处理，节省等待时间。
+- 查一条复杂调用链、验一个页面，可以各自作为单点旁支交给一个子智能体。简单查找直接在主会话完成。
+- 给 5 个及以上同类对象做相同检查时，默认顺序分批。面板已选付费档且当前 App 提供该命令时，插件可选用 `/run-workflow` 逐项检查、汇总结构化结果。
+- 多个模块要协商接口、相互审查时，App 可用 `/swarm`。先定接口、各写手负责的文件和整体验证命令。单个反复失败的难题适合 `/boost`，跨天且能分里程碑验收的工程适合 `/teamwork`。[选型与可复制示例](skills/agy-cmd/references/desktop-commands-matrix.md)
 - 需要操作网页或展示可点击的图表时，AI 会自动打开内置浏览器或生成交互画面。
 
 ### 2. 测试没过自动接着修
@@ -85,6 +87,8 @@ python ~/.agents/skills/agy-cmd/scripts/setup_auto_router.py --install --standal
 这项功能用于防止 AI 在报错还没修好时提前停工。
 
 当你让 AI 改代码或修错，但测试、运行验证还没通过时，插件会自动让 AI 继续排查修改，直到验证通过或达到设定的重试上限。
+
+免费模式下，执行已批准的实施计划时，如果主 Agent 确实写了源码，且漏跑了可识别的项目检查，插件可在现有重试额度内提醒补跑一次。纯文档修改、用户取消和等待批准均不会触发这次提醒。
 
 在下面几种情况下，插件会自动放行并立即停下：
 
@@ -99,8 +103,11 @@ python ~/.agents/skills/agy-cmd/scripts/setup_auto_router.py --install --standal
 
 这项功能用于避免免费账号误触付费功能报错，并防止 AI 在同一个错上反复打转。
 
-- **免费账号防报错**：Antigravity 中的 `/boost`、`/swarm`、`/teamwork` 属于付费会员口令，免费账号输入会报错。插件在默认免费模式下会自动隐藏这些口令提醒；切换到会员模式后才会提示。
+- **套餐与配额**。Google 将 `/boost`、`/teamwork` 列为付费功能。App 的 `/swarm`、`/run-workflow` 对所有套餐开放。插件在免费模式下默认顺序执行以节省周配额，用户可以在支持的 App 会话里明确要求本次使用后两项。在 IDE 或宿主能力未知时，自动路由留在主会话。[官方套餐对照](https://antigravity.google/docs/boost/) · [工作流说明](https://antigravity.google/docs/dynamic-workflows/)
+- **可选独立复核**。免费用户可在侧栏打开计划实施后的独立复核，默认关闭。主 Agent 负责改代码、跑验证，再把本次改动路径、关键 diff 和验证证据交给一位仅可读文件的 `cmd-verifier`。宿主未提供该角色时，主 Agent 会说明独立复核未完成。
 - **卡壳换思路**：当命令连续失败 3 次，或者连改两次还是报同一个错时，插件会让 AI 先停下反复试错，重新检查报错原因后再给出办法。
+
+Hook 和安装流程已通过本地测试，真实免费账号在 App 和 IDE 中调度复核角色仍待验证。[多智能体路由调研](docs/research/multi-agent-routing-best-practices.md) · [免费档设计提案](docs/proposals/free-tier-v2.3.md)
 
 ### 4. 右侧面板与口令查询
 
@@ -126,6 +133,9 @@ python skills/agy-cmd/scripts/setup_auto_router.py --auto-retry infinite
 # 切换免费版或会员版
 python skills/agy-cmd/scripts/setup_auto_router.py --plan-tier free
 python skills/agy-cmd/scripts/setup_auto_router.py --plan-tier paid --boost on
+
+# 免费档在实施已批准的计划后进行一次独立复核
+python skills/agy-cmd/scripts/setup_auto_router.py --free-plan-review on
 
 # 检查插件文件是否完整
 python skills/agy-cmd/scripts/setup_auto_router.py --sync-check

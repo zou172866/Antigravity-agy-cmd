@@ -609,35 +609,43 @@
     <!-- 卡片 2：账号套餐与 Boost 接入 -->
     <section class="card">
       <div class="card-head">
-        <h2 class="card-title">2. 账号档位与 Boost 自动接入</h2>
+        <h2 class="card-title">2. 账号档位与计划执行</h2>
       </div>
-      <p class="card-sub">默认免费版以防非会员输入 <code>/boost</code> 报套餐权限错误，会员请手动切换</p>
+      <p class="card-sub">按当前账号选择档位，设置计划实施后的复核方式。</p>
 
       <div class="seg-grid-2" role="radiogroup" aria-label="账号套餐档位">
         <button class="seg-btn" data-tier="free" type="button">
           <strong>免费版 (默认)</strong>
-          <span>屏蔽付费口令防报错</span>
+          <span>默认单会话实施</span>
         </button>
         <button class="seg-btn" data-tier="paid" type="button">
           <strong>Pro / Ultra 会员</strong>
-          <span>解锁高阶指令推荐</span>
+          <span>可接入会员 Boost</span>
         </button>
       </div>
 
       <div id="free-note" class="free-lock-note">
-        🛡️ 当前为<strong>免费版安全模式</strong>：已自动关闭 <code>/boost</code>、<code>/swarm</code>、<code>/teamwork</code> 提示防报错，卡壳时自动改用内置只读子智能体换视角重查。
+        <strong>免费版安全模式</strong>默认由主会话实施。插件跳过付费指令，并按顺序分批处理任务，节省多代理并发消耗的配额。
       </div>
 
       <div class="toggle-list">
-        <label class="toggle-row" id="row-boost">
+        <label class="toggle-row" id="row-free-plan-review" hidden>
+          <div class="row-text">
+            <b id="free-plan-review-label">计划实施后独立复核</b>
+            <small id="free-plan-review-help">每份已批准的实施计划最多调用一位只读审阅者，会额外消耗配额。</small>
+          </div>
+          <input id="chk-free-plan-review" type="checkbox" role="switch" aria-labelledby="free-plan-review-label" aria-describedby="free-plan-review-help">
+        </label>
+
+        <label class="toggle-row" id="row-boost" hidden>
           <div class="row-text">
             <b>开启 <code>/boost</code> 自动接入</b>
-            <small id="boost-sub">允许插件使用会员 Boost，并在连续失败时提供攻坚口令</small>
+            <small>允许插件使用会员 Boost，并在连续失败时提供攻坚口令</small>
           </div>
           <input id="chk-boost" type="checkbox">
         </label>
 
-        <label class="toggle-row">
+        <label class="toggle-row" id="row-plan-boost" hidden>
           <div class="row-text">
             <b id="plan-boost-label">计划获批后自动使用 Boost</b>
             <small id="plan-boost-help">默认开启。会员 Boost 接入开启时，点「批准」或回复「按计划执行」即可触发。</small>
@@ -765,7 +773,7 @@
       const freeNote = $("free-note");
       const chkBoost = $("chk-boost");
       const chkPlanBoost = $("chk-plan-boost");
-      const boostSub = $("boost-sub");
+      const chkFreePlanReview = $("chk-free-plan-review");
       const chkFreeFb = $("chk-free-fb");
       const chkPlanFb = $("chk-plan-fb");
       const lblSummary = $("lbl-summary");
@@ -986,11 +994,12 @@
         });
         const isFree = s.planTier === "free";
         freeNote.hidden = !isFree;
+        $("row-free-plan-review").hidden = !isFree;
+        $("row-boost").hidden = isFree;
+        $("row-plan-boost").hidden = isFree;
+        chkFreePlanReview.checked = s.freePlanReviewEnabled === true;
         chkBoost.checked = !isFree && Boolean(s.boostEnabled);
         chkBoost.disabled = isFree;
-        boostSub.textContent = isFree
-          ? "需先切换上方为「Pro / Ultra 会员」才可开启，防止免费号触发报错"
-          : "允许插件使用会员 Boost，并在连续失败时提供攻坚口令";
         chkPlanBoost.checked = s.boostAfterPlanApproval !== false;
 
         chkFreeFb.checked = Boolean(s.freeFallbackEnabled);
@@ -1063,6 +1072,10 @@
 
       chkPlanBoost.addEventListener("change", () => {
         savePatch({ boostAfterPlanApproval: chkPlanBoost.checked });
+      });
+
+      chkFreePlanReview.addEventListener("change", () => {
+        savePatch({ freePlanReviewEnabled: chkFreePlanReview.checked });
       });
 
       chkFreeFb.addEventListener("change", () => {

@@ -44,10 +44,11 @@ RULE_BODY = """# Antigravity 自动路由 (agy-cmd)
 - **原生调度**：
   1. 需求/边界未定 → 标注 `[agy-cmd → /grill-me 追问]` 并调 `ask_question` 单题追问，推荐项置顶 `(Recommended)`。
   2. 首次写项目文件前，按本次任务预计改动的文件数判断范围（`agy-dart` 的 `apply_edits` 批量修改按文件计）。范围不明时先只读扫描。预计改 ≥3 个文件、变更公共接口或涉及高风险 → 输出 `[agy-cmd → /plan 审批]`，提交 `RequestFeedback: true` 的 Implementation Plan，获批后再写项目文件。**若只读 Plan Mode 拒绝 `write_file` 写方案产物，在回复正文给出方案并等待确认，严禁调用 `exit_plan_mode` 绕过审批**。
-  3. ≥5 对象语义批处理 → `[agy-cmd → /run-workflow]`，读 `run-workflow`（`parallel()`/`pipeline()`；纯正则用本地命令；高精度批处理显式 `model="inherit"` 禁擅自降级，共享长前缀时按 3～5 项复用多轮 Worker（编码优先选可用的 `dart-coder`，否则选 `self`） 命中 KV 缓存并做单项异常隔离；若套餐不支持则自动分批顺序处理）。
-  4. 动态网页/截图 → `[agy-cmd → /browser]` 调 `browser`；复杂图表/交互 → `[agy-cmd → /generative_ui]` 读 `generative_ui`；2～4 模块并行+验收（仅确认付费套餐可用时）→ `[agy-cmd → /swarm]` 读 `swarm`。
+  3. 批处理或多模块协作才检查重型路由。默认在主会话顺序分批，纯正则用本地命令。主动调度须同时确认面板 `planTier=paid`、当前是 Antigravity App 且宿主开放目标能力（取证见 `agy-cmd` 技能）。免费、未知或 IDE 直接走默认路径，不亮重型徽标。用户本次明确要求运行 App 已开放的 Swarm 或 Workflow 时可单次使用，保留其设置。
+  4. 准入后，≥5 个同质对象独立交回结果 → `[agy-cmd → /run-workflow]`，读 `run-workflow`。2～4 个模块须协调接口或交叉审查 → `[agy-cmd → /swarm]`，先定接口、互不重叠的写入路径与验证命令，每组设独立 Verifier，账户可选时用不同模型。共享文件交单人顺序改。
+  5. 有一项独立调查且主会话有其他工作可继续时，可派一个可用的 `research` 查证，主会话核对。动态网页/截图 → `[agy-cmd → /browser]` 调 `browser`；App 开放交互图表工具时 → `[agy-cmd → /generative_ui]` 读 `generative_ui`。
 - **防报错套餐感知与自动续跑**（禁推 CLI 专属 `/undo`、`/branch`、`/effort`；本轮已用对应 `/` 指令则不重复提示）：
-  1. **卡壳排错（默认免费版防报错）**：同一 Bug 跨 ≥2 轮未解、≥2 次「修改→仍失败」震荡、连续 ≥3 次命令失败或难算法 → **默认严禁主动推荐 `/boost`、`/teamwork` 等付费指令以防免费号报错**；仅当收到 `agy-cmd` 钩子明确指示输出 `[agy-cmd → 建议 /boost]` 时才给 `/boost` 口令，否则统一输出 `[agy-cmd → 自动换视角排查]`，停止盲改并优先调可用的 `dart-reviewer`，否则派只读 `research` 子智能体独立核查根因或先列排查假设逐一验证。
+  1. **卡壳排错**：同一 Bug 跨 ≥2 轮未解、≥2 次「修改→仍失败」震荡、连续 ≥3 次命令失败或难算法 → 仅在钩子明确提示 `[agy-cmd → 建议 /boost]` 时给付费口令。否则输出 `[agy-cmd → 自动换视角排查]`，给可用的 `dart-reviewer` 派只读排查任务，备选 `research`；都不可用时由主会话逐一验证假设。
   2. **防停机自动续跑（Stop 监工）**：改代码或修错后若存在现成测试/构建命令，结束前优先实跑验证以便 `agy-cmd` `Stop` 钩子无感核验并在未通过时按面板设定次数自动续跑；仅当收到钩子明确提示时输出 `[agy-cmd → 自动续跑已启用]` 或 `[agy-cmd → 建议 /goal]`。
   3. **调节重试/Boost 与指令选型**：当用户调节自动重试次数、切换会员/Boost 开关，或查询对比指令时，读 `agy-cmd` `SKILL.md`（可附 `[agy-cmd 自动路由](sidecar://agy-cmd/panel/)` 面板入口）。
 """
@@ -298,6 +299,7 @@ def default_settings() -> dict:
         "planTier": "free",
         "boostEnabled": False,
         "boostAfterPlanApproval": True,
+        "freePlanReviewEnabled": False,
         "autoRetryMode": "count",
         "autoRetryMax": DEFAULT_RETRY_MAX,
         "autoRetryScope": "smart",
@@ -341,6 +343,7 @@ def load_settings(state_dir: Path) -> dict:
     if base.get("planTier") != "paid":
         base["planTier"] = "free"
         base["boostEnabled"] = False
+    base["freePlanReviewEnabled"] = base.get("freePlanReviewEnabled") is True
     base["starPrompt"] = normalize_star_prompt_state(base.get("starPrompt"))
     return base
 
@@ -368,7 +371,8 @@ def format_settings_summary(settings: dict) -> str:
     elif tier == "paid":
         tier_str = "Pro/Ultra 会员（已关闭 /boost 自动接入）"
     else:
-        tier_str = "免费版默认（已关闭 /boost 防报错）"
+        review = "开启" if settings.get("freePlanReviewEnabled") is True else "关闭"
+        tier_str = f"免费版默认（独立复核{review}）"
     return f"自动重试={retry_str} | 套餐档位={tier_str}"
 
 
@@ -397,6 +401,7 @@ def apply_settings_cli(
     retry_scope: str | None,
     plan_tier: str | None,
     boost_flag: str | None,
+    free_plan_review: str | None = None,
 ) -> dict:
     with _with_settings_lock(state_dir):
         current = load_settings(state_dir)
@@ -422,6 +427,8 @@ def apply_settings_cli(
                     )
                 current["planTier"] = "paid"
             current["boostEnabled"] = want_on
+        if free_plan_review is not None:
+            current["freePlanReviewEnabled"] = free_plan_review == "on"
 
         current["configuredByUser"] = True
         current["onboardingShown"] = True
@@ -556,7 +563,7 @@ def validate_bundle_sync(plugin_dir: Path) -> list[str]:
         ):
             issues.append(f"插件运行文件与源码仓库存在漂移：{dst_fp}")
 
-    for dir_name in ("hooks", "sidecars", "skills"):
+    for dir_name in ("agents", "hooks", "sidecars", "skills"):
         src_dir = source_root / dir_name
         if not src_dir.is_dir():
             continue
@@ -579,6 +586,39 @@ def validate_bundle_sync(plugin_dir: Path) -> list[str]:
                 if src_fp.read_bytes() != dst_fp.read_bytes():
                     issues.append(f"插件运行文件与源码仓库存在漂移：{dst_fp}")
     return issues
+
+
+def validate_verifier(plugin_dir: Path) -> list[str]:
+    role = plugin_dir / "agents" / "cmd-verifier.md"
+    try:
+        contents = role.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return [f"无法读取独立复核角色：{role}"]
+
+    # The bundled role uses one field per line and a JSON-style YAML tools list.
+    # Reject extensions and duplicate keys that could grant shell, MCP or writes.
+    header, divider, _ = contents.removeprefix("---\n").partition("\n---\n")
+    lines = header.splitlines()
+    fields = dict(line.split(": ", 1) for line in lines if ": " in line)
+    description = fields.pop("description", "")
+    required = {
+        "name": "cmd-verifier",
+        "mainAgent": "false",
+        "subagent": "true",
+        "model": "inherit",
+        "inheritMcp": "false",
+        "inheritCustomizations": "true",
+        "tools": '["read_file"]',
+    }
+    if (
+        not contents.startswith("---\n")
+        or not divider
+        or not description
+        or len(lines) != len(required) + 1
+        or fields != required
+    ):
+        return [f"独立复核角色的只读工具或权限配置无效：{role}"]
+    return []
 
 
 def _check_hook_script_exists(plugin_dir: Path, command: str, hook_name: str, issues: list[str]) -> None:
@@ -662,7 +702,7 @@ def sync_plugin_bundle_if_needed(target_plugin_dir: Path) -> bool:
         src_file = source_root / item_name
         if src_file.is_file():
             shutil.copy2(src_file, target_plugin_dir / item_name)
-    for dir_name in ("assets", "rules", "hooks", "sidecars", "skills", "test"):
+    for dir_name in ("assets", "rules", "agents", "hooks", "sidecars", "skills", "test"):
         src_dir = source_root / dir_name
         if src_dir.is_dir():
             shutil.copytree(
@@ -727,6 +767,11 @@ def main(argv: list[str] | None = None) -> int:
         help="开启或关闭计划获批后的 Boost 自动执行与卡壳提示（开启时自动切至 paid 档位）",
     )
     parser.add_argument(
+        "--free-plan-review",
+        choices=["on", "off"],
+        help="开启或关闭免费档计划实施后的单次独立复核",
+    )
+    parser.add_argument(
         "--standalone",
         action="store_true",
         help="强制使用独立规则模式（~/.gemini/config/rules/agy-auto-router.md）",
@@ -749,7 +794,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     has_settings_mutation = any(
-        x is not None for x in (args.auto_retry, args.retry_scope, args.plan_tier, args.boost)
+        x is not None for x in (args.auto_retry, args.retry_scope, args.plan_tier, args.boost, args.free_plan_review)
     )
     has_lifecycle_action = any((args.install, args.remove, args.status, args.sync_check))
     if not has_settings_mutation and not has_lifecycle_action:
@@ -772,6 +817,7 @@ def main(argv: list[str] | None = None) -> int:
             retry_scope=args.retry_scope,
             plan_tier=args.plan_tier,
             boost_flag=args.boost,
+            free_plan_review=args.free_plan_review,
         )
         if not args.json:
             print(f"已更新 agy-cmd 运行设置（{state_dir / 'settings.json'}）：")
@@ -790,7 +836,7 @@ def main(argv: list[str] | None = None) -> int:
             ) == normalize_lf(RULE_BODY)
             hook_issues = validate_hooks_json(plugin_dir, plugin_hooks_path)
             sidecar_issues = validate_sidecar(plugin_dir)
-            drift_issues = validate_bundle_sync(plugin_dir)
+            drift_issues = validate_verifier(plugin_dir) + validate_bundle_sync(plugin_dir)
             warnings = list(hook_issues) + list(sidecar_issues) + list(drift_issues)
             if cfg_warning:
                 warnings.insert(0, cfg_warning)
@@ -897,6 +943,7 @@ def main(argv: list[str] | None = None) -> int:
                 issues.append(f"存在重复的旧版独立 Skill：{legacy_skill_path.parent}")
             issues.extend(validate_hooks_json(plugin_dir, plugin_hooks_path))
             issues.extend(validate_sidecar(plugin_dir))
+            issues.extend(validate_verifier(plugin_dir))
             issues.extend(validate_bundle_sync(plugin_dir))
             if args.json:
                 print(
@@ -1020,7 +1067,16 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.install:
-        if not args.standalone and (has_plugin or (Path(__file__).resolve().parents[3] / "plugin.json").is_file()):
+        source_root = Path(__file__).resolve().parents[3]
+        has_source_bundle = (source_root / "plugin.json").is_file()
+        if not args.standalone and (has_plugin or has_source_bundle):
+            role_issues = validate_verifier(source_root if has_source_bundle else plugin_dir)
+            if role_issues:
+                if args.json:
+                    print(json.dumps({"ok": False, "issues": role_issues}, ensure_ascii=False))
+                else:
+                    print(role_issues[0], file=sys.stderr)
+                return 2
             synced_bundle = sync_plugin_bundle_if_needed(plugin_dir)
             plugin_rule_path.parent.mkdir(parents=True, exist_ok=True)
             plugin_rule_path.write_text(RULE_BODY, encoding="utf-8", newline="\n")

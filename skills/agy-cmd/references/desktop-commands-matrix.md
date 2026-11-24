@@ -14,15 +14,27 @@
 | **触发后行为** | 每次只问你 1 个问题并附带推荐选项，持续追问直到消灭盲区 | 先只读扫描代码库与依赖，必要时少量提问，产出可审阅的 `Implementation Plan` 产物 |
 | **何时切换** | 访谈完需求清晰后，可紧接 `/plan` 生成具体代码修改清单 | 若 `/plan` 扫描时发现核心业务规则全空，应退回先跑 `/grill-me` |
 
-### 2. 自治与多智能体组（5 档火力对比）
+### 2. 单会话、后台委派和五条自治命令
 
-| 指令 | 并发形态 | 最对症的任务画像 | 套餐要求 | 无对应套餐时的平替方案 |
+| 能力 | 适用场景 | 支持端 | 平台套餐 | 默认或低配额路径 |
 | --- | --- | --- | --- | --- |
-| `/goal` | 单智能体闭环死磕 | 目标和验收条件明确（如修通全部报错、跑出成品），不想中途点确认 | 全部套餐 | 直接可用 |
-| `/boost` | 三层推理多假设验证 | 单个极难啃的硬骨头：偶发诡异 Bug、死锁竞态、复杂算法性能优化 | 付费计划 | 先用 `/plan` 列出排查假设，再逐一验证 |
-| `/swarm` | 具名 Worker + Verifier 留言板协作 | 2～5 个不同模块可同时改（如前端、后端、测试拆开）且需专人验收 | Google AI Pro / Ultra | 拆成独立步骤在当前窗口配合 `/goal` 顺序执行 |
-| `/run-workflow` | 动态 Python 脚本调度大批量子智能体 | 10 个以上**同质对象**做相同动作（批量检查 20 期文案、并行审查 30 个文件） | Google AI Pro / Ultra | 按每批 3～5 个文件分批挂载 `@文件` 检查 |
-| `/teamwork` | Sentinel 立规 + 多角色长线团队 | 数小时到数天的仓库级框架迁移、子系统重写、大型科研模拟 | 付费计划 | 先 `/grill-me` + `/plan` 拆出里程碑，分会话推进 |
+| 当前会话 / Orchestrator 模型选项 | 日常开发留在主会话。已选 Orchestrator 时由规划模型审阅，执行模型负责工具操作 | 普通会话各端；Orchestrator 查询当前模型选择器 | 普通会话全套餐；Orchestrator 见下方说明 | 沿用用户当前模型 |
+| Subagents（`invoke_subagent`） | 将一条调用链、一次 UI 核验等独立旁支交给一个角色，由主会话复核 | App、CLI、IDE 扩展、Antigravity IDE | 全套餐 | 用宿主列出的角色；不可用则主会话完成 |
+| `/goal` | 一个明确目标持续实施，按测试或产物判断完成 | App、CLI、IDE 扩展、Antigravity IDE | 全套餐 | 普通会话按同一验收条件推进 |
+| `/boost` | 一个竞态、疑难算法或高耦合故障，需多轮独立挑战和验证 | App、CLI、IDE 扩展、Antigravity IDE | 付费 | 提出可反驳的根因假设，用同一复现实验验证 |
+| `/swarm` | 各模块可分别推进，Worker 需要交换接口约定或互审 Diff | App、CLI（预览） | 全套餐；组织账户受管理员设置约束 | 单写手分模块实现，必要时另派只读核查 |
+| `/run-workflow` | 多个同质对象各做同一项检查，或脚本按固定先后顺序处理，各项返回结构化结果 | App、CLI | 全套餐 | 主会话按相同格式分批检查，确定性规则用本地命令 |
+| `/teamwork` | 跨天、多里程碑的仓库迁移或系统重写，需要逐阶段独立审计 | App、CLI、IDE 扩展、Antigravity IDE | 付费 | 在实施计划中列出里程碑，逐项验证 |
+
+具体入口以当前客户端开放的命令/工具为准。免费安全模式默认节省 Swarm / Workflow 的多 Worker 配额。在支持的 App 中，用户可明确选择本次使用；IDE 直接采用表中最后一列的对应方式。Orchestrator 是模型选择器提供的单会话选项，面向符合条件的 Pro、Ultra 和 Gemini Enterprise 账户。[模型与账户条件](https://antigravity.google/docs/models#orchestrator) · [Swarm](https://antigravity.google/docs/swarm) · [Dynamic Workflows](https://antigravity.google/docs/dynamic-workflows)
+
+**三条分流判断**
+
+1. 单点疑难、需要独立检验多个根因假设，选 Boost；多个互不重叠的模块可并行实现，考虑 Swarm。
+2. Worker 需要互相对话或审查改动，选 Swarm。每项检查独立、结果交给脚本归集，选 Workflow。
+3. 一次交付可以验收，按模块协作即可；需要跨天跟踪依赖、分里程碑审计并交接，考虑 Teamwork。[官方场景对照](https://antigravity.google/docs/teamwork)
+
+一位使用 Swarm 跑并行实验的开发者让 Worker 在留言板上认领 GPU、CPU 和内存。即使写入目录分开，共用的 GPU 或测试端口也可能让任务互相干扰。这类任务在启动前就应约定资源归属和释放时机。[开发者实践记录](https://www.reddit.com/r/google_antigravity/comments/1y1yf8u/swarm_is_great_use_it/)
 
 ### 3. 定时自动化组：`/schedule` vs `/automation`
 
@@ -41,7 +53,7 @@
 
 ---
 
-## 二、桌面端与 IDE 全量 19 项内置指令速查目录
+## 二、插件涉及的桌面端与 IDE 指令
 
 输出完整速查表时，按以下 5 大功能组呈现：
 
@@ -51,8 +63,8 @@
 2. **自治与多智能体**
    - `/goal`：单目标无人值守持续执行与自修错，直到验收通过
    - `/boost`：多智能体多假设深度推演与独立验证，攻坚疑难 Bug 与复杂算法（付费计划）
-   - `/swarm`：具名 Worker 与 Verifier 在共享留言板上并行分工与质检（Google AI Pro / Ultra）
-   - `/run-workflow`：编写并运行 Python 脚本，用 `parallel()` / `pipeline()` 批量并发处理同质任务（Google AI Pro / Ultra）
+   - `/swarm`：具名 Worker 与 Verifier 在共享留言板上分工、讨论和验收（App、CLI；全套餐）
+   - `/run-workflow`：Python 脚本用 `parallel()` / `pipeline()` 处理独立项或固定管线（App、CLI；全套餐）
    - `/teamwork`：多角色长周期工程团队，适合仓库级重构与迁移（付费计划）
 3. **旁支工具与可视化**
    - `/btw`：在只读分支顺便问旁支问题，不打断主线、不污染上下文
@@ -84,14 +96,52 @@
   ```text
   /goal 根据 @终端 里的最新报错修复构建问题，直到编译与测试全部通过
   ```
-- **按项目规范批量检查**：
-  ```text
-  /run-workflow 对照 @AGENTS.md 的规则，并行检查 @目标目录/ 下所有子文件夹的合规性并输出汇总表
-  ```
 - **跨会话继承上次结论**：
   ```text
   /plan 参考 @历史会话 里敲定的数据结构，完成剩余接口实现
   ```
+
+### 后台委派与四条多智能体指令模板
+
+把示例中的路径、复现步骤、命令和指标替换为该项目真实可用的值。生成付费命令或 App 并发命令前，先按技能的准入判断选择模板。用户明确要求查看用法时可展示适用条件和示例。
+
+**Subagents · 单项只读调查**
+
+```text
+请派一个可用的只读 research 子智能体，追踪 @src/cache/ 中缓存失效通知从哪里发出、哪些调用方接收。回报文件、行号和触发条件；主会话核对调用点并汇总。
+```
+
+**Boost · 单个可复现的疑难故障（付费）**
+
+```text
+/boost @src/queue/ 在两个消费者同时取消时偶发重复投递。复现命令是 go test -race ./queue -run TestConcurrentCancel -count=50。找出竞态，保留既有断言，修复后重跑同一命令并回报结果。
+```
+
+**Swarm · 多模块需要协调接口（App）**
+
+```text
+/swarm 按 @docs/retry-contract.md 给 @src/http/ 和 @src/webhooks/ 增加退避重试。每个目录由一个 Worker 负责，公共配置交同一人串行改。先在留言板确认重试条件和次数；由 @verifier 审两个目录的 Diff、保留既有断言并跑 npm test。账户可选时给 Verifier 另一模型，否则用同模型的独立角色。
+```
+
+**Workflow · 同质对象独立交回结果（App）**
+
+```text
+/run-workflow 对照 @docs/package-rules.md 逐包检查 @packages/。每个 agent 的任务书都给出包路径、适用规则和判据，用 JSON Schema 要求返回包名、pass/fail/error 及证据。逐项捕获异常并记录失败包，保留其他结果；最后输出统计和待复查清单。
+```
+
+**Teamwork · 多个里程碑分别验收（付费）**
+
+```text
+/teamwork 将 @services/ 的订单接口迁移到新框架。先在范围访谈中确定迁移包清单、兼容性契约和验收指标。逐包验证契约测试全过，随后在同一数据集上比较 P95 延迟，增幅不得超过 5%。本次允许复用框架，采用 development 完整性模式；提交目标与验收产物供我审批后再实施。
+```
+
+Teamwork 在范围访谈中按用户允许的做法选完整性模式。日常工程可用 `development`；可复现演示可用 `demo`；限定标准库、独立从零实现的评测可用 `benchmark`。[完整性模式](https://antigravity.google/docs/teamwork#integrity-modes)
+
+**免费默认或 IDE · 主会话顺序分批**
+
+```text
+对照 @docs/package-rules.md 顺序检查 @packages/ 中每个包，分别记录包名、通过或失败、依据。遇到读不到的包，记下原因并继续，最后汇总待复查项。
+```
 
 ---
 

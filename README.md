@@ -21,7 +21,7 @@ Once installed, it runs automatically in the background during every chat to han
 - **Auto-route built-in workflows by task**: matches `/grill-me`, `/plan`, `/run-workflow`, and related workflows based on scope;
 - **Stop-hook auto-retry guard**: keeps the agent investigating and fixing when tests or build checks fail instead of stopping early;
 - **Auto-dispatch multi-agent execution on plan approval**: with Pro / Ultra Boost enabled, approving a plan automatically launches `DeepCoder` / `DeepInvestigator` to execute and verify;
-- **Fresh-perspective stuck recovery (all tiers)**: when repeated fixes fail, halts blind edits and delegates root-cause diagnosis to an independent read-only subagent (`dart-reviewer` / `research`);
+- **Fresh-perspective stuck recovery (all tiers)**: when repeated fixes fail, gives one available investigator a read-only diagnosis task. The main agent checks the proposed fix.
 - **Anti-bypass read-only plan guard**: when read-only Plan Mode blocks writing the plan file, forces an inline plan in chat and blocks `exit_plan_mode` so the agent cannot bypass approval and silently edit code;
 - **Live right-hand Sidecar control panel**: lets you toggle retry limits, trigger scope, and free-tier protection anytime (shielding free accounts from paid-only command errors by default).
 
@@ -77,7 +77,9 @@ No need to memorize or manually pick built-in Antigravity slash commands for eve
 - **1–2 files, explanations, or local lookups**: responds directly with zero extra prompts or banners.
 - **Ambiguous requirements**: asks a focused multiple-choice clarification question first.
 - **3+ files or higher-risk edits**: drafts an implementation plan for your approval before touching project files (even in read-only plan mode, it writes the plan inline and waits for confirmation); when Pro / Ultra Boost is enabled, approving the plan displays `[agy-cmd → 计划获批，自动 Boost]` and dispatches `DeepCoder` / `DeepInvestigator` strictly once while preserving `Stop` auto-retry state across background-task wakeups.
-- **5+ batch items**: fans out semantic batch processing in parallel to save waiting time.
+- **A self-contained side task**, such as tracing a call chain or inspecting a UI, can go to one subagent. Simple lookups stay in the main session.
+- **Repeated work** on five or more similar items runs in batches by default. With the panel set to a paid tier and the command available in the App, the plugin can choose `/run-workflow` to apply the same check to each item and collect structured results.
+- **Separate modules that need to agree on an interface** can use `/swarm` in the App. Set the interface, give each writer distinct files and name the integration check. A single recurring failure fits `/boost`. A multi-day migration with separately verifiable milestones fits `/teamwork`. [Routing examples](skills/agy-cmd/references/desktop-commands-matrix.md)
 - **Dynamic web pages or interactive visuals**: automatically triggers the built-in browser or interactive UI renderer.
 
 ### 2. Stop-hook auto-retry guard
@@ -85,6 +87,8 @@ No need to memorize or manually pick built-in Antigravity slash commands for eve
 Prevents the agent from stopping early while tests or build checks are still failing.
 
 When you ask the AI to edit code or fix a bug and verification fails, the `Stop` hook automatically nudges it to keep investigating and fixing until checks pass or the configured retry limit is reached.
+
+For an approved implementation plan in free mode, the plugin can also request one missing project check after a confirmed source edit. This uses the existing retry budget. Documentation edits, a canceled turn or an outstanding approval do not trigger this reminder.
 
 It lets the agent stop immediately when:
 
@@ -99,8 +103,11 @@ You can override the retry count for a single prompt using natural language (e.g
 
 Prevents free accounts from triggering paid-only errors and stops blind retry loops:
 
-- **Free-tier protection**: `/boost`, `/swarm`, and `/teamwork` are paid-tier commands in Antigravity that error on free accounts. In default free mode, `agy-cmd` suppresses them; switch to Pro / Ultra in the panel to enable hints.
+- **Plan and quota**. Google offers `/boost` and `/teamwork` on paid plans. The App offers `/swarm` and `/run-workflow` on all plans. The plugin skips automatic use of the latter two in free mode to conserve weekly quota. You can explicitly request either for the current task in a supported App session. In the IDE or when availability is unknown, automatic routing stays in the main session. [Boost and plan comparison](https://antigravity.google/docs/boost/) · [Dynamic Workflows](https://antigravity.google/docs/dynamic-workflows/)
+- **Optional independent review**. In free mode you can enable a review after plan implementation in the Sidecar. The main agent edits and runs checks, then hands the changed paths, relevant diff and evidence to one `cmd-verifier` with file-reading access. The option defaults to off. If the role is unavailable, the main agent reports that the independent review was skipped.
 - **Stuck-loop recovery**: after 3 consecutive command failures or 2 identical edit-fail cycles, the plugin instructs the agent to pause blind edits and switch to independent root-cause diagnosis.
+
+The [routing research](docs/research/multi-agent-routing-best-practices.md) and [free-tier design proposal](docs/proposals/free-tier-v2.3.md) explain the choices. The hooks and installer have been tested locally. Dispatching the reviewer on a live free account in the App and IDE still needs verification.
 
 ### 4. Sidecar control panel & slash-command reference
 
@@ -126,6 +133,9 @@ python skills/agy-cmd/scripts/setup_auto_router.py --auto-retry infinite
 # Switch account tier
 python skills/agy-cmd/scripts/setup_auto_router.py --plan-tier free
 python skills/agy-cmd/scripts/setup_auto_router.py --plan-tier paid --boost on
+
+# Enable one independent review after implementing an approved plan in free mode
+python skills/agy-cmd/scripts/setup_auto_router.py --free-plan-review on
 
 # Verify plugin bundle integrity
 python skills/agy-cmd/scripts/setup_auto_router.py --sync-check

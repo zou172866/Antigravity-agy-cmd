@@ -53,6 +53,7 @@ export function createDefaultSettings() {
     planTier: "free",
     boostEnabled: false,
     boostAfterPlanApproval: true,
+    freePlanReviewEnabled: false,
     autoRetryMode: "count",
     autoRetryMax: DEFAULT_RETRY_MAX,
     autoRetryScope: "smart",
@@ -275,6 +276,7 @@ export function normalizeSettings(raw = {}) {
     boostEnabled,
     boostAfterPlanApproval: typeof src.boostAfterPlanApproval === "boolean"
       ? src.boostAfterPlanApproval : def.boostAfterPlanApproval,
+    freePlanReviewEnabled: src.freePlanReviewEnabled === true,
     autoRetryMode,
     autoRetryMax,
     autoRetryScope,
@@ -425,6 +427,15 @@ export function updateSettings(stateDir, patch = {}, options = {}) {
         throw err;
       }
       next.boostAfterPlanApproval = patch.boostAfterPlanApproval;
+    }
+
+    if ("freePlanReviewEnabled" in patch) {
+      if (typeof patch.freePlanReviewEnabled !== "boolean") {
+        const err = new Error("freePlanReviewEnabled must be a boolean");
+        err.statusCode = 400;
+        throw err;
+      }
+      next.freePlanReviewEnabled = patch.freePlanReviewEnabled;
     }
 
     if ("freeFallbackEnabled" in patch) {

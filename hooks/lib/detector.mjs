@@ -11,6 +11,7 @@ import {
 import { createDefaultState } from "./state.mjs";
 import { normalizeSettings, parseTurnRetryOverride } from "./settings.mjs";
 import { isPlanApprovalNotice, stripTranscriptStepHeaders } from "./transcript.mjs";
+import { advancePlan, pendingPlanChecks, planPreferences, planToolEvidence, requestedProjectCheck } from "./plan-verification.mjs";
 
 const EDIT_TOOL_NAMES = new Set([
   "edit_file",
@@ -80,6 +81,16 @@ const DIRECT_TASK_MUTATE_RE =
 
 const TEAMWORK_MIGRATION_RE =
   /(?:跨天(?:重构|迁移|开发)|仓库级(?:重构|迁移|重写)|全仓库(?:重写|迁移|重构)|整个项目(?:重写|迁移)|大规模框架迁移|\b(?:repo[- ]?wide\s+(?:migration|rewrite|refactor)|multi[- ]?day\s+(?:migration|rewrite|refactor)|full\s+codebase\s+(?:migration|rewrite))\b)/i;
+
+function requestsMigration(text) {
+  const migration = TEAMWORK_MIGRATION_RE.exec(text);
+  if (!migration) return false;
+  const preceding = text.slice(0, migration.index);
+  // Discussing a migration or explicitly declining it should leave a normal chat alone.
+  const explanation = /^(?:请问|什么是|(?:请|帮我)?(?:解释|介绍|比较|对比)|(?:what (?:is|are)|explain|compare|describe)\b)|(?:什么意思|是什么意思)|(?:只|仅)(?:解释|介绍|讨论)/i;
+  const declined = /(?:不要|不用|不做|别|无需|不必)(?:做|实施|进行|启动)?\s*$|\b(?:skip|avoid|without|do not|don['’]t)(?:\s+(?:start|perform|do|attempt))?(?:\s+(?:the|a))?\s*$/i;
+  return !explanation.test(text) && !declined.test(preceding);
+}
 
 const REAL_CMD_ERROR_RE =
   /(?:command not found|not recognized|No such file|SyntaxError|TypeError|fatal:|error:\s|Traceback \(most recent call last\))/i;
@@ -274,6 +285,7 @@ function classifyCommandOutcome(bareTool, isBenignCmd, errorText, rawResponseTex
   }
 
   let failed = false;
+  let terminal = false;
   if (bareTool === "run_checks") {
     const m = body.match(/^Checks:\s*(\d+)\/(\d+)\s+passed(?:,\s*(\d+)\s+failed)?/m);
     if (m) {
@@ -281,6 +293,7 @@ function classifyCommandOutcome(bareTool, isBenignCmd, errorText, rawResponseTex
       const totalCnt = Number(m[2]);
       const failedCnt = m[3] ? Number(m[3]) : Math.max(0, totalCnt - passedCnt);
       failed = failedCnt > 0 || totalCnt === 0;
+      terminal = m.index === 0 && totalCnt > 0 && (failedCnt > 0 || (passedCnt === totalCnt && !explicitError));
     } else {
       failed = explicitError || /## \[(?:FAIL|ERROR|TIMEOUT)/i.test(body);
     }
@@ -289,6 +302,7 @@ function classifyCommandOutcome(bareTool, isBenignCmd, errorText, rawResponseTex
     const headExitMatch = body.match(/^Command exited with code\s+(\d+)\.?/i);
     if (headExitMatch) {
       const code = Number(headExitMatch[1]);
+      terminal = !explicitError || code !== 0;
       if (code === 0) {
         failed = explicitError && !isBenignSearchExit1(isBenignCmd, errorText, body);
       } else if (code === 1) {
@@ -309,6 +323,7 @@ function classifyCommandOutcome(bareTool, isBenignCmd, errorText, rawResponseTex
 
   return {
     backgroundRunning: false,
+    terminal,
     failed,
     errSig: failed ? extractErrorSignature(errorText, body) : ""
   };
@@ -348,7 +363,15 @@ function classifyEditOutcome(bareTool, hasArtifactMeta, looksLikePlanPath, error
     }
   }
 
-  return { editFailed, abortedNoWrite, planModeWriteBlocked, verifyResult };
+  // A blank, partial or still-running result is insufficient for the approved
+  // plan ledger. Older failure counters intentionally retain their old contract.
+  let applied = false;
+  if (!editFailed) {
+    if (bareTool === "apply_edits") applied = /^Applied edits to [1-9]\d* file\(s\):/i.test(body);
+    else if (WRITE_ONLY_TOOLS.has(bareTool)) applied = /^(?:Created file\b|File (?:successfully )?created\b|Successfully created\b)/i.test(body);
+    else applied = /^(?:Made [1-9]\d* replacements? in\b|Successfully (?:edited|modified|replaced|applied|updated)\b|(?:File|The file)\b[^\r\n]{0,500}\b(?:edited|modified|updated)|Applied (?:the )?(?:edit|change))/i.test(body);
+  }
+  return { editFailed, abortedNoWrite, planModeWriteBlocked, verifyResult, applied };
 }
 
 /**
@@ -388,6 +411,10 @@ export function classifyToolEvents(payload, nowMs = Date.now(), options = {}) {
   const needsPreInvocationResolve = Boolean(
     hasTranscriptPath && stepIdx !== null && !payloadResponseText && !useTranscriptStep
   );
+  const planEvidence = options.plan && planToolEvidence(
+    options.plan, bareTool, effectiveArgs, payload, extractCommandString(bareTool, effectiveArgs)
+  );
+  const planFields = planEvidence ? { planEvidence } : {};
 
   // 1. Edit / write tools (including apply_edits with optional inline verify)
   if (EDIT_TOOL_NAMES.has(bareTool)) {
@@ -427,6 +454,8 @@ export function classifyToolEvents(payload, nowMs = Date.now(), options = {}) {
         ts: nowMs,
         stepIdx,
         kind: "edit",
+        ...planFields,
+        ...(planEvidence && editOutcome.applied ? { applied: true } : {}),
         tool: bareTool,
         failed: editOutcome.editFailed,
         abortedNoWrite: editOutcome.editFailed,
@@ -446,6 +475,8 @@ export function classifyToolEvents(payload, nowMs = Date.now(), options = {}) {
         stepIdx,
         kind: "cmd",
         tool: "apply_edits:verify",
+        ...planFields,
+        ...(planEvidence ? { terminal: true } : {}),
         failed: editOutcome.verifyResult.failed,
         isVerify: true,
         cmd: sanitizeSnippet(verifyCmd, 64),
@@ -463,7 +494,7 @@ export function classifyToolEvents(payload, nowMs = Date.now(), options = {}) {
     const isBenignCmd = bareTool === "run_command" && isBenignSearchCommand(cmdStr);
     const isReadOnlyCmd = bareTool === "run_command" && isReadOnlyInspectCommand(cmdStr);
 
-    if (stepIsRunning && !payloadExplicitError) {
+    if ((stepIsRunning || (planEvidence && BG_RUNNING_RE.test(stripTranscriptStepHeaders(responseText)))) && !payloadExplicitError) {
       // Background task not finished yet; record as pending so PreInvocation resolves from completion SYSTEM_MESSAGE
       return [
         {
@@ -477,6 +508,7 @@ export function classifyToolEvents(payload, nowMs = Date.now(), options = {}) {
           isReadOnlyCmd,
           pending: true,
           backgroundRunning: true,
+          ...planFields,
           cmd: sanitizeSnippet(cmdStr, 64),
           errSig: ""
         }
@@ -495,6 +527,8 @@ export function classifyToolEvents(payload, nowMs = Date.now(), options = {}) {
         kind: "cmd",
         tool: bareTool,
         failed: cmdOutcome.failed,
+        ...planFields,
+        ...(planEvidence && cmdOutcome.terminal ? { terminal: true } : {}),
         isVerify,
         ...(isBenignCmd ? { isBenignSearchCmd: true } : {}),
         ...(isReadOnlyCmd ? { isReadOnlyCmd: true } : {}),
@@ -527,7 +561,7 @@ export function reconcileEventsWithTranscript(events, transcriptTail = null, pre
 
   for (const ev of safeEvents) {
     if (!ev || typeof ev !== "object") continue;
-    const hasStepIdx = Number.isFinite(Number(ev.stepIdx));
+    const hasStepIdx = parseNonNegInt(ev.stepIdx) !== null;
     const stepIdx = hasStepIdx ? Math.floor(Number(ev.stepIdx)) : null;
     const key = stepIdx !== null ? String(stepIdx) : "";
     if (key) activeStepKeys.add(key);
@@ -547,10 +581,11 @@ export function reconcileEventsWithTranscript(events, transcriptTail = null, pre
           bgTask.text,
           false
         );
-        nextCache[key] = { kind: "cmd", failed: outcome.failed, errSig: outcome.errSig };
+        nextCache[key] = { kind: "cmd", failed: outcome.failed, errSig: outcome.errSig, ...(ev.planEvidence ? { terminal: Boolean(outcome.terminal) } : {}) };
         resolvedEvents.push({
           ...ev,
           failed: outcome.failed,
+          ...(ev.planEvidence ? { terminal: Boolean(outcome.terminal) } : {}),
           errSig: outcome.errSig,
           pending: false,
           backgroundRunning: false
@@ -574,10 +609,14 @@ export function reconcileEventsWithTranscript(events, transcriptTail = null, pre
           txStep.content || "",
           txExplicitErr
         );
-        nextCache[key] = { kind: "cmd", failed: outcome.failed, errSig: outcome.errSig };
+        const receipt = outcome.terminal ? outcome : !txExplicitErr && (ev.terminal ? ev : cached?.terminal ? cached : null);
+        const terminal = Boolean(receipt);
+        const failed = (ev.planEvidence && terminal) ? receipt.failed : outcome.failed;
+        nextCache[key] = { kind: "cmd", failed, errSig: outcome.errSig, ...(ev.planEvidence ? { terminal } : {}) };
         resolvedEvents.push({
           ...ev,
-          failed: outcome.failed,
+          failed,
+          ...(ev.planEvidence ? { terminal } : {}),
           errSig: outcome.errSig,
           pending: false,
           backgroundRunning: false
@@ -590,6 +629,7 @@ export function reconcileEventsWithTranscript(events, transcriptTail = null, pre
         resolvedEvents.push({
           ...ev,
           failed: Boolean(cached.failed),
+          ...(ev.planEvidence ? { terminal: Boolean(cached.terminal) } : {}),
           errSig: cached.errSig || "",
           pending: false,
           backgroundRunning: false
@@ -608,6 +648,7 @@ export function reconcileEventsWithTranscript(events, transcriptTail = null, pre
 
     if (ev.kind === "edit") {
       if (txStep) {
+        if (txStep.status === "RUNNING" && ev.planEvidence) continue;
         const txErr = nonEmptyString(txStep.error);
         const txExplicitErr = txStep.status === "ERROR" || Boolean(txErr);
         const editOut = classifyEditOutcome(
@@ -620,6 +661,7 @@ export function reconcileEventsWithTranscript(events, transcriptTail = null, pre
         );
         nextCache[key] = {
           kind: "edit",
+          ...(ev.planEvidence ? { applied: editOut.applied || Boolean(ev.applied) } : {}),
           failed: editOut.editFailed,
           planModeWriteBlocked: editOut.planModeWriteBlocked,
           verifyResult: editOut.verifyResult
@@ -627,6 +669,7 @@ export function reconcileEventsWithTranscript(events, transcriptTail = null, pre
         resolvedEvents.push({
           ...ev,
           failed: editOut.editFailed,
+          ...(ev.planEvidence ? { applied: editOut.applied || Boolean(ev.applied) } : {}),
           abortedNoWrite: editOut.editFailed,
           planModeWriteBlocked: ev.planModeWriteBlocked || editOut.planModeWriteBlocked,
           pending: false
@@ -637,6 +680,7 @@ export function reconcileEventsWithTranscript(events, transcriptTail = null, pre
             stepIdx,
             kind: "cmd",
             tool: "apply_edits:verify",
+            ...(ev.planEvidence ? { planEvidence: ev.planEvidence, terminal: true } : {}),
             failed: editOut.verifyResult.failed,
             isVerify: true,
             cmd: ev.verifyCmd || "verify",
@@ -652,6 +696,7 @@ export function reconcileEventsWithTranscript(events, transcriptTail = null, pre
           ...ev,
           failed: Boolean(cached.failed),
           abortedNoWrite: Boolean(cached.failed),
+          ...(ev.planEvidence ? { applied: Boolean(cached.applied) } : {}),
           planModeWriteBlocked: Boolean(ev.planModeWriteBlocked || cached.planModeWriteBlocked),
           pending: false
         });
@@ -661,6 +706,7 @@ export function reconcileEventsWithTranscript(events, transcriptTail = null, pre
             stepIdx,
             kind: "cmd",
             tool: "apply_edits:verify",
+            ...(ev.planEvidence ? { planEvidence: ev.planEvidence, terminal: true } : {}),
             failed: Boolean(cached.verifyResult.failed),
             isVerify: true,
             cmd: ev.verifyCmd || "verify",
@@ -1023,6 +1069,7 @@ export function evaluatePreInvocation(payload, events = [], prevStateInput = nul
     stateChanged = true;
 
     if (activeSlash.has("compact")) {
+      nextState.freePlan = null;
       nextState.debugTurnStreak = 0;
       nextState.boostAlerted = false;
       nextState.lastBoostPassTs = 0;
@@ -1072,6 +1119,22 @@ export function evaluatePreInvocation(payload, events = [], prevStateInput = nul
     }
   }
 
+  // A fresh user task ends the preceding plan. A replay of the same approval
+  // or a background wakeup retains its one-shot budgets.
+  const approvedNotice = isPlanApprovalNotice(inputEnvelope) && (!rawLastUserInput || confirmsPlan(rawLastUserInput));
+  if (nextState.freePlan && (effSettings.planTier !== "free" || (isNewUserTurn &&
+      !approvedNotice && (!sameTxTurnKey || !confirmsPlan(rawLastUserInput))))) {
+    nextState.freePlan = null;
+    stateChanged = true;
+  }
+  if (nextState.freePlan) {
+    const advanced = advancePlan(nextState.freePlan, effectiveEvents);
+    if (advanced !== nextState.freePlan) {
+      nextState.freePlan = advanced;
+      stateChanged = true;
+    }
+  }
+
   // 3. Priority 1: Read-only Plan Mode blocked artifact write_file
   // Sources: (a) real Antigravity PreToolUse denial in transcript.jsonl, (b) PostToolUse event fallback.
   const txPlanBlock = transcriptTail?.latestPlanModeDenial || null;
@@ -1114,6 +1177,8 @@ export function evaluatePreInvocation(payload, events = [], prevStateInput = nul
     : latestTxUserKey || `turn:${nextState.userTurnCount}`;
   const alreadyTriggeredPlanBoost =
     planBoostKey === (nextState.lastPlanBoostKey || "") ||
+    (effSettings.planTier === "free" && latestPlanPromptKey !== "" &&
+      latestPlanPromptKey === nextState.lastPlanBoostPromptKey) ||
     (isDirectUnflushedNotice &&
       noticeHash !== "" &&
       noticeHash === (nextState.lastPlanBoostNoticeHash || "") &&
@@ -1122,8 +1187,7 @@ export function evaluatePreInvocation(payload, events = [], prevStateInput = nul
     Boolean(transcriptTail?.tailRolledOverWithoutUserInput) ||
     (!isDirectUnflushedNotice && Boolean(transcriptTail?.hasPlannerResponseSinceUserInput));
   if (
-    paidBoostActive &&
-    effSettings.boostAfterPlanApproval &&
+    ((paidBoostActive && effSettings.boostAfterPlanApproval) || effSettings.planTier === "free") &&
     isNewUserTurn &&
     activeSlash.size === 0 &&
     !alreadyTriggeredPlanBoost &&
@@ -1134,10 +1198,20 @@ export function evaluatePreInvocation(payload, events = [], prevStateInput = nul
     const confirmedInChat = confirmsPlan(rawLastUserInput);
     if ((clickedApproval && (!rawLastUserInput || confirmedInChat)) ||
         (sameInput && transcriptTail?.latestInputFollowsPlan && confirmedInChat)) {
+      if (effSettings.planTier === "free" && (txPlanBlock || transcriptTail?.awaitingUserApprovalOrQuestion && !clickedApproval)) {
+        return { nextState, injectStep: null, shouldResetEvents, reasonCode: "awaiting_approval", stateChanged, metrics };
+      }
       nextState.lastPlanBoostKey = planBoostKey;
       nextState.lastPlanBoostNoticeHash = noticeHash;
       nextState.lastPlanBoostPromptKey = latestPlanPromptKey;
       stateChanged = true;
+      if (effSettings.planTier === "free") {
+        const source = unwrapUserRequestText(nonEmptyString(transcriptTail?.planRequest) || prevState.lastUserInput);
+        const prefs = planPreferences(source);
+        const requested = requestedProjectCheck(source + "\n" + (transcriptTail?.planCheckText || ""), payload.workspacePaths ?? payload.workspace_paths);
+        nextState.freePlan = { key: planBoostKey, ...prefs, requested, wroteSource: false, reminded: false, reviewRequested: false, scopes: {} };
+        return { nextState, injectStep: null, shouldResetEvents, reasonCode: "approved_free_plan", stateChanged, metrics };
+      }
       return {
         nextState,
         injectStep: buildInjectStep({
@@ -1155,6 +1229,17 @@ export function evaluatePreInvocation(payload, events = [], prevStateInput = nul
     }
   }
 
+  const plan = nextState.freePlan;
+  if (plan?.wroteSource && effSettings.freePlanReviewEnabled && !uiOnly && !plan.reviewRequested &&
+      !plan.skipReview && !activeSlash.size && !activePlanBlock && !transcriptTail?.awaitingUserApprovalOrQuestion) {
+    nextState.freePlan = { ...plan, reviewRequested: true };
+    return {
+      nextState, shouldResetEvents, stateChanged: true, metrics, reasonCode: "approved_free_plan_review",
+      injectStep: buildInjectStep({ systemMessage:
+        "[agy-cmd] This approved implementation has one optional independent review. Finish all planned edits yourself and run relevant project checks first (honor any user skip). Before final delivery, call invoke_subagent once with TypeName='cmd-verifier' and Workspace='inherit'. Send the acceptance criteria, this task's relative paths and diff excerpts only, applicable root/nested AGENTS.md or GEMINI.md paths, and actual check commands and terminal results or the concrete reason they could not run. The reviewer reads and reports specification gaps first, then risks and missing tests with file locations and counterexamples. Address blockers and verify the final changes yourself. If unavailable, over quota or unsuccessful, report that the independent review was not completed and finish on the main thread. Do not retry the role or start a second reviewer. Respect later user requests to stop or skip review." })
+    };
+  }
+
   // 4. Priority 2: Stuck debugging / repeated failures
   //    - Paid + Boost enabled: suggest `/boost` + independent subagent check
   //    - Free tier (DEFAULT) or Boost disabled: NEVER suggest `/boost` (prevents permission errors!);
@@ -1170,8 +1255,7 @@ export function evaluatePreInvocation(payload, events = [], prevStateInput = nul
   if (
     (oscHit || failStreakHit || multiTurnDebugHit) &&
     (paidBoostActive || effSettings.freeFallbackEnabled) &&
-    !activeSlash.has("boost") &&
-    !activeSlash.has("teamwork")
+    activeSlash.size === 0
   ) {
     const cooldownElapsed =
       !nextState.boostAlerted ||
@@ -1216,7 +1300,7 @@ export function evaluatePreInvocation(payload, events = [], prevStateInput = nul
           injectStep: buildInjectStep({
             uiOnly,
             userMarkdown: `> **[agy-cmd → 建议 /boost]** 检测到${reasonsZh.join("、")}。可复制：\`/boost ${topic}\``,
-            systemMessage: `[agy-cmd] Objective stuck threshold reached (${reasonsEn.join("; ")}). Put "[agy-cmd → 建议 /boost]" and a copyable "/boost <concise issue>" on line 1 of your reply, and consider delegating a read-only "research" subagent with fresh context before patching again.`
+            systemMessage: `[agy-cmd] Objective stuck threshold reached (${reasonsEn.join("; ")}). Put "[agy-cmd → 建议 /boost]" and a copyable "/boost <concise issue>" on line 1. Scope it to the recurring problem. Include the observed reproduction or failing check, the affected code, and what result would confirm the fix.`
           }),
           shouldResetEvents,
           reasonCode: "suggest_boost",
@@ -1229,8 +1313,8 @@ export function evaluatePreInvocation(payload, events = [], prevStateInput = nul
         nextState,
         injectStep: buildInjectStep({
           uiOnly,
-          userMarkdown: `> **[agy-cmd → 自动换视角排查]** 检测到${reasonsZh.join("、")}（当前为免费安全模式，已屏蔽 \`/boost\` 防报错，按可用角色派发只读排查）。`,
-          systemMessage: `[agy-cmd] Objective stuck threshold reached (${reasonsEn.join("; ")}) in Free-Tier Safe Mode. IMPORTANT: Do NOT suggest /boost, /swarm, or /teamwork (prevents free-tier entitlement errors). Start line 1 of your reply with "[agy-cmd → 自动换视角排查]", stop repetitive blind patching, delegate to "dart-reviewer" when listed, otherwise use the read-only "research" subagent (invoke_subagent) to inspect the root cause with fresh context (or list 2-3 falsifiable hypotheses first), and verify systematically.`
+          userMarkdown: `> **[agy-cmd → 自动换视角排查]** 检测到${reasonsZh.join("、")}。先独立排查根因，再修改代码。`,
+          systemMessage: `[agy-cmd] Objective stuck threshold reached (${reasonsEn.join("; ")}). Start line 1 with "[agy-cmd → 自动换视角排查]". Give one available investigator ("dart-reviewer" or "research") a read-only task with the failing check and relevant files. Ask for a falsifiable cause and supporting evidence. If neither is available, investigate in the main session. The main agent verifies any fix. Do not recommend heavy commands for this fallback.`
         }),
         shouldResetEvents,
         reasonCode: "free_stuck_fallback",
@@ -1295,7 +1379,7 @@ export function evaluatePreInvocation(payload, events = [], prevStateInput = nul
     isNewUserTurn &&
     activeSlash.size === 0 &&
     nextState.lastTeamworkAlertTurn !== nextState.userTurnCount &&
-    TEAMWORK_MIGRATION_RE.test(intentProse)
+    requestsMigration(intentProse)
   ) {
     nextState.lastTeamworkAlertTurn = nextState.userTurnCount;
     stateChanged = true;
@@ -1307,7 +1391,7 @@ export function evaluatePreInvocation(payload, events = [], prevStateInput = nul
           uiOnly,
           userMarkdown: `> **[agy-cmd → 建议 /teamwork]** 检测到仓库级长周期迁移/重写诉求。可复制：\`/teamwork ${summary}\``,
           systemMessage:
-            '[agy-cmd] User requested a repo-wide multi-phase migration/rewrite. Put "[agy-cmd → 建议 /teamwork]" and a copyable "/teamwork <concise target>" on line 1 of your reply while outlining milestones.'
+            '[agy-cmd] User requested a repo-wide multi-phase migration/rewrite. Put "[agy-cmd → 建议 /teamwork]" and a copyable "/teamwork <concise target>" on line 1. Outline independently verifiable milestones. Start with the scoping interview to establish the target, constraints and acceptance checks before workers start.'
         }),
         shouldResetEvents,
         reasonCode: "suggest_teamwork",
@@ -1377,7 +1461,9 @@ export function evaluateStop(payload, events = [], prevStateInput = null, option
   // Safety Brake 1: Always honor user cancellation, errors, and host invocation/token ceilings
   const rawTerm = nonEmptyString(payload.terminationReason ?? payload.termination_reason) || "NO_TOOL_CALL";
   const termReason = rawTerm.toUpperCase();
-  if (termReason !== "NO_TOOL_CALL" || STOP_ALLOW_REASONS.has(termReason)) {
+  const freeModelStop = termReason === "MODEL_STOP" && effSettings.planTier === "free" &&
+    Boolean(prevState.freePlan) && (payload.fullyIdle ?? payload.fully_idle) === true;
+  if ((!freeModelStop && termReason !== "NO_TOOL_CALL") || STOP_ALLOW_REASONS.has(termReason)) {
     return {
       decision: "allow",
       reason: "",
@@ -1438,9 +1524,6 @@ export function evaluateStop(payload, events = [], prevStateInput = null, option
   );
   const turnFloorTs = nextState.lastTurnStartTs > 0 ? nextState.lastTurnStartTs - 1000 : 0;
   const metrics = analyzeEventMetrics(effectiveEvents, turnFloorTs);
-  const hasUnresolvedTurnFailure =
-    metrics.consecutiveCmdFailures >= 1 && metrics.latestFailureTs >= turnFloorTs;
-
   // Automatic pause recognition: never interrupt /plan approval or /grill-me ask_question waits
   if (transcriptTail?.awaitingUserApprovalOrQuestion) {
     return {
@@ -1458,10 +1541,27 @@ export function evaluateStop(payload, events = [], prevStateInput = null, option
   // - If AI has NOT edited any code (`!hasTurnEdit`), natural inquiries ("为什么挂了？", "分析报错原因",
   //   "排查哪里有问题", "跑一下测试", env probes) automatically stop cleanly; only explicit fix/repair
   //   requests ("帮我修一下报错", "分析原因并修好") push past a lazy pre-edit test failure.
+  const plan = effSettings.planTier === "free" ? advancePlan(nextState.freePlan, effectiveEvents) : null;
+  if (plan !== nextState.freePlan) {
+    nextState.freePlan = plan;
+    stateChanged = true;
+  }
+  // A scope outside this plan, another package's green test or arbitrary
+  // successful command cannot clear a known failed project check.
+  const skipPlanChecks = plan && (plan.skipCheck || planPreferences(rawLastUserInput).skipCheck);
+  const checks = plan && !skipPlanChecks &&
+    !transcriptTail?.latestPlanModeDenial ? pendingPlanChecks(plan) : [];
+  const scopedFailure = checks.find(check => check.failed);
+  const stalePlanFailure = plan && metrics.lastFailureIsVerify && effectiveEvents.some(ev =>
+    ev.failed && ev.kind === "cmd" && ev.ts === metrics.latestFailureTs && ev.planEvidence?.key === plan.key &&
+    Number.isSafeInteger(ev.stepIdx) && plan.scopes[ev.planEvidence.checked?.scope]?.editStep > ev.stepIdx);
+  const hasUnresolvedTurnFailure = Boolean(scopedFailure) ||
+    (metrics.consecutiveCmdFailures >= 1 && metrics.latestFailureTs >= turnFloorTs &&
+     !stalePlanFailure && !(skipPlanChecks && metrics.lastFailureIsVerify));
   const explicitNoEdit = !turnGoal && !metrics.hasTurnEdit && NEGATED_EDIT_INTENT_RE.test(intentProse);
   const smartTriggered =
     !explicitNoEdit &&
-    (metrics.hasTurnEdit ||
+    (metrics.hasTurnEdit || plan?.wroteSource ||
       (metrics.lastFailureIsVerify && hasDirectFixOrChangeIntent(intentProse)));
   const retryPolicy = resolveEffectiveRetryPolicy(
     effSettings,
@@ -1481,9 +1581,12 @@ export function evaluateStop(payload, events = [], prevStateInput = null, option
     };
   }
 
-  if (!hasUnresolvedTurnFailure) {
-    if (nextState.turnAutoRetries !== 0 || nextState.lastContinueEventSig !== "") {
-      nextState.turnAutoRetries = 0;
+  const missingCheck = !hasUnresolvedTurnFailure && !plan?.reminded && checks.length > 0 &&
+    (payload.fullyIdle ?? payload.fully_idle) === true &&
+    (freeModelStop || nonEmptyString(payload.terminationReason ?? payload.termination_reason).toUpperCase() === "NO_TOOL_CALL");
+  if (!hasUnresolvedTurnFailure && !missingCheck) {
+    if ((!plan && nextState.turnAutoRetries !== 0) || nextState.lastContinueEventSig !== "") {
+      if (!plan) nextState.turnAutoRetries = 0;
       nextState.lastContinueEventSig = "";
       stateChanged = true;
     }
@@ -1534,11 +1637,22 @@ export function evaluateStop(payload, events = [], prevStateInput = null, option
   nextState.lastContinueEventSig = currentEventSig;
   stateChanged = true;
 
+  if (missingCheck) {
+    nextState.freePlan = { ...plan, reminded: true };
+    const tasks = checks.map(({ dir, command }) => JSON.stringify(dir) + " → " + command).join("；");
+    return {
+      decision: "continue", reasonCode: "approved_plan_missing_verification", nextState, stateChanged, metrics,
+      reason: "[agy-cmd 计划补验] 本次计划已修改源码，尚缺最后一次修改之后的项目验证结果。请在以下目录运行对应检查并等待终态：" +
+        tasks + "。若环境不可用或用户要求跳过，请在交付中说明缺测项和原因。"
+    };
+  }
+
   const progressTag =
     retryPolicy.mode === "infinite"
       ? `#${nextRetryNum} (无限模式)`
       : `${nextRetryNum}/${retryPolicy.max}`;
-  const cmdHint = metrics.lastFailureCmd ? `（最近失败：${metrics.lastFailureCmd}）` : "";
+  const failedCheckLabel = scopedFailure ? `${JSON.stringify(scopedFailure.dir)} → ${scopedFailure.command}` : metrics.lastFailureCmd;
+  const cmdHint = failedCheckLabel ? `（最近失败：${failedCheckLabel}）` : "";
   const reason =
     `[agy-cmd 自动续跑 ${progressTag}] 检测到验证/测试尚未全绿通过${cmdHint}。` +
     `请勿提前收工，继续定位根因、修改代码并重新运行验证命令；若遇到必须由用户确认的阻塞问题而无法自行推进，请直接说明原因并停下（无需再运行命令）。`;

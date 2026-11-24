@@ -39,8 +39,15 @@ class TestPluginManifestsAndSync(unittest.TestCase):
         self.assertIn("[agy-cmd → /plan 审批]", disk)
         self.assertIn("[agy-cmd → 自动换视角排查]", disk)
         self.assertIn("sidecar://agy-cmd/panel/", disk)
-        self.assertIn('model="inherit"', disk)
-        self.assertIn("编码优先选可用的 `dart-coder`，否则选 `self`", disk)
+        skill = (PLUGIN_ROOT / "skills/agy-cmd/SKILL.md").read_text(encoding="utf-8")
+        self.assertIn('model="inherit"', skill)
+        self.assertIn("编码优先选可用的 `dart-coder`，否则选 `self`", skill)
+        # Standalone installs only get this text. Keep the quota and host gate
+        # ahead of the first instruction that emits a heavy command badge.
+        heavy_gate = next(line for line in disk.splitlines() if "planTier=paid" in line)
+        self.assertIn("Antigravity App", heavy_gate)
+        self.assertIn("免费、未知或 IDE", heavy_gate)
+        self.assertLess(disk.index(heavy_gate), disk.index("[agy-cmd → /run-workflow]"))
         self.assertFalse(disk.startswith("---"))
 
     def test_plugin_json_hooks_json_and_sidecar_schema(self) -> None:
@@ -63,9 +70,63 @@ class TestPluginManifestsAndSync(unittest.TestCase):
             self.assertNotIn("matcher", spec[flat_ev][0])
         self.assertEqual(router.validate_hooks_json(PLUGIN_ROOT, HOOKS_JSON_PATH), [])
         self.assertEqual(router.validate_sidecar(PLUGIN_ROOT), [])
+        self.assertEqual(router.validate_verifier(PLUGIN_ROOT), [])
 
 
 class TestSetupAutoRouterCLI(unittest.TestCase):
+    def test_installed_verifier_permissions_drift_and_upgrade(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_dir = Path(tmp) / "cfg"
+            plugin_dir = cfg_dir / "plugins" / "agy-cmd"
+            installed = plugin_dir / "agents" / "cmd-verifier.md"
+            install_args = ("--install", "--config-dir", str(cfg_dir), "--state-dir", tmp, "--json")
+            self.assertEqual(run_cli(*install_args).returncode, 0)
+            original = installed.read_text(encoding="utf-8")
+            self.assertEqual(original, (PLUGIN_ROOT / "agents/cmd-verifier.md").read_text(encoding="utf-8"))
+
+            dart_role = cfg_dir / "plugins/agy-dart/agents/dart-reviewer.md"
+            dart_role.parent.mkdir(parents=True)
+            dart_role.write_text("# existing reviewer\n", encoding="utf-8")
+            for bad in (
+                original.replace('["read_file"]', '["read_file", "run_command"]'),
+                original.replace("read_file", "raed_file"),
+                original.replace("inheritMcp: false", "inheritMcp: true"),
+                original.replace("tools:", "mainAgent: true\ntools:"),
+                original.replace("tools:", "plugins: [agy-dart]\ntools:"),
+            ):
+                with self.subTest(header=bad.split("---")[1]):
+                    installed.write_text(bad, encoding="utf-8")
+                    self.assertTrue(router.validate_verifier(plugin_dir))
+            check = run_cli("--sync-check", "--config-dir", str(cfg_dir), "--json")
+            self.assertEqual(check.returncode, 2)
+            self.assertIn("cmd-verifier.md", json.loads(check.stdout)["issues"][0])
+            installed.unlink()
+            self.assertTrue(router.validate_verifier(plugin_dir))
+            self.assertEqual(run_cli(*install_args).returncode, 0)
+            self.assertEqual(installed.read_text(encoding="utf-8"), original)
+            self.assertEqual(dart_role.read_text(encoding="utf-8"), "# existing reviewer\n")
+
+    def test_free_plan_review_is_independent_of_tier_and_boost(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp)
+            path = state / "settings.json"
+            for legacy in ({"version": 1}, {"version": 2, "freePlanReviewEnabled": "true"}):
+                path.write_text(json.dumps(legacy), encoding="utf-8")
+                self.assertFalse(router.load_settings(state)["freePlanReviewEnabled"])
+
+            def set_option(*args: str) -> dict:
+                result = run_cli(*args, "--state-dir", tmp, "--json")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                return json.loads(result.stdout)["settings"]
+
+            enabled = set_option("--free-plan-review", "on")
+            self.assertTrue(enabled["freePlanReviewEnabled"])
+            self.assertEqual(enabled["planTier"], "free")
+            self.assertFalse(enabled["boostEnabled"])
+            self.assertTrue(set_option("--plan-tier", "paid")["freePlanReviewEnabled"])
+            self.assertTrue(set_option("--plan-tier", "free")["freePlanReviewEnabled"])
+            self.assertFalse(set_option("--free-plan-review", "off")["freePlanReviewEnabled"])
+
     def _create_valid_plugin_skeleton(self, p_dir: Path) -> None:
         (p_dir / "rules").mkdir(parents=True, exist_ok=True)
         (p_dir / "hooks").mkdir(parents=True, exist_ok=True)

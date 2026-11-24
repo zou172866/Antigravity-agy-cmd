@@ -38,6 +38,7 @@ test("defaults: strictly starts in Free-Tier Safe Mode (boostEnabled=false) with
   assert.equal(s.version, 2);
   assert.equal(s.planTier, "free");
   assert.equal(s.boostEnabled, false);
+  assert.equal(s.freePlanReviewEnabled, false);
   assert.equal(s.autoRetryMode, "count");
   assert.equal(s.autoRetryMax, 3);
   assert.equal(s.autoRetryScope, "smart");
@@ -51,6 +52,7 @@ test("defaults: strictly starts in Free-Tier Safe Mode (boostEnabled=false) with
     JSON.stringify({ version: 1, planTier: "free", autoRetryScope: "goal_only", configuredByUser: false }) + "\n"
   );
   assert.equal(readSettings(dirLegacy).autoRetryScope, "smart");
+  assert.equal(readSettings(dirLegacy).freePlanReviewEnabled, false);
 
   const dirExplicit = makeTmpDir();
   fs.writeFileSync(
@@ -113,7 +115,8 @@ test("Free-Tier Safe default suppresses /boost & /teamwork; switching to Paid un
   assert.equal(freeOut.injectSteps?.length, 1);
   const freeMsg = freeOut.injectSteps[0].systemMessage.systemMessage;
   assert.match(freeMsg, /自动换视角排查/);
-  assert.match(freeMsg, /Do NOT suggest \/boost/i);
+  assert.doesNotMatch(freeMsg, /\/(?:boost|teamwork|swarm|run-workflow)\b/i);
+  assert.match(freeMsg, /main session/i);
 
   // Repo-wide migration in Free tier -> emits phased plan fallback, NEVER "/teamwork <cmd>"
   const freeTw = await runPreInvocation(
@@ -485,6 +488,7 @@ test("Sidecar HTTP server: serves UI, persists settings, blocks CSRF/cross-origi
     const html = await htmlRes.text();
     assert.ok(html.includes(csrf));
     assert.ok(html.includes("安装后首次确认提醒"));
+    assert.ok(html.includes('id="chk-free-plan-review"'));
 
     // 2. Security: GET /api/state -> 405; missing CSRF -> 401; cross-site -> 403
     const getApi = await fetch(`${base}/api/state`);
@@ -519,8 +523,22 @@ test("Sidecar HTTP server: serves UI, persists settings, blocks CSRF/cross-origi
     assert.equal(stData.settings.planTier, "free");
     assert.equal(stData.settings.boostEnabled, false);
     assert.equal(stData.settings.boostAfterPlanApproval, true);
+    assert.equal(stData.settings.freePlanReviewEnabled, false);
     assert.equal(stData.settings.configuredByUser, false);
 
+    const reviewPatch = (value) => fetch(`${base}/api/settings`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Agy-Cmd-Csrf": csrf },
+      body: JSON.stringify({ freePlanReviewEnabled: value })
+    });
+    assert.equal((await reviewPatch("true")).status, 400);
+    const enabledReview = await reviewPatch(true);
+    assert.equal(enabledReview.status, 200);
+    const { settings: reviewed } = await enabledReview.json();
+    assert.equal(reviewed.freePlanReviewEnabled, true);
+    assert.equal(reviewed.planTier, "free");
+    assert.equal(reviewed.boostEnabled, false);
+    assert.equal(readSettings(dir).freePlanReviewEnabled, true);
     // 4. Invalid autoRetryMax rejected with 400
     const badPatch = await fetch(`${base}/api/settings`, {
       method: "POST",
@@ -541,6 +559,7 @@ test("Sidecar HTTP server: serves UI, persists settings, blocks CSRF/cross-origi
     assert.equal(updData.settings.planTier, "paid");
     assert.equal(updData.settings.boostEnabled, true);
     assert.equal(updData.settings.boostAfterPlanApproval, false);
+    assert.equal(updData.settings.freePlanReviewEnabled, true);
     assert.equal(updData.settings.configuredByUser, true);
 
     // Hook immediately sees autoRetryMode="off" -> suggests /goal instead of arming auto-retry

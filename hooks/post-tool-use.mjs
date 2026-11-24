@@ -16,7 +16,7 @@ import {
   resolveStateDir
 } from "./lib/common.mjs";
 import { classifyToolEvents } from "./lib/detector.mjs";
-import { appendEvents } from "./lib/state.mjs";
+import { appendEvents, readState } from "./lib/state.mjs";
 import {
   findTranscriptStep,
   isSubagentTranscript,
@@ -45,16 +45,17 @@ export async function runPostToolUse(rawInput, env = process.env, nowMs = Date.n
       ? findTranscriptStep(transcriptPath, stepIdx)
       : null;
 
+  const stateDir = resolveStateDir(env);
+  const convId = resolveConversationId(payload, env);
   const events = classifyToolEvents(payload, nowMs, {
     transcriptStep,
-    hasTranscriptPath: Boolean(transcriptPath)
+    hasTranscriptPath: Boolean(transcriptPath),
+    plan: readState(stateDir, convId).freePlan
   });
   if (events.length === 0) {
     return {};
   }
 
-  const stateDir = resolveStateDir(env);
-  const convId = resolveConversationId(payload, env);
   try {
     appendEvents(stateDir, convId, events);
   } catch {

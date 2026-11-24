@@ -24,7 +24,8 @@ import { isSubagentTranscript } from "../hooks/lib/transcript.mjs";
 import { runPostToolUse } from "../hooks/post-tool-use.mjs";
 import { runPreInvocation } from "../hooks/pre-invocation.mjs";
 import { runStop } from "../hooks/stop.mjs";
-import { updateSettings } from "../hooks/lib/settings.mjs";
+import { readSettings, updateSettings } from "../hooks/lib/settings.mjs";
+import { planPreferences } from "../hooks/lib/plan-verification.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PLUGIN_ROOT = path.resolve(__dirname, "..");
@@ -43,6 +44,157 @@ function makeEnv(stateDir, extra = {}) {
     ...extra
   };
 }
+
+async function freePlanFixture(t, { settings, task = "重构入口", approval = true, packageTest = true } = {}) {
+  const dir = makeTmpDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const env = makeEnv(path.join(dir, "data"));
+  const workspace = path.join(dir, "project");
+  fs.mkdirSync(workspace);
+  const manifest = JSON.stringify({ scripts: packageTest ? { test: "node --test" } : {} });
+  fs.writeFileSync(path.join(workspace, "package.json"), manifest);
+  if (settings) updateSettings(env.AGY_CMD_STATE_DIR, settings);
+  const transcriptPath = path.join(dir, "transcript.jsonl");
+  const base = { conversationId: "scope", cwd: workspace, workspacePaths: [workspace], transcriptPath };
+  const rows = [{ step_index: 0, type: "USER_INPUT", content: task }];
+  if (approval) rows.push(
+    { step_index: 1, type: "PLANNER_RESPONSE", content: "[agy-cmd → /plan 审批]\n请审阅。" },
+    { step_index: 2, type: "USER_INPUT", content: "按计划执行" }
+  );
+  fs.writeFileSync(transcriptPath, rows.map(row => JSON.stringify(row)).join("\n") + "\n");
+  const pre = (extra = {}) => runPreInvocation({ ...base, initialNumSteps: rows.length, invocationNum: 1, ...extra }, env);
+  assert.deepEqual(await pre({ invocationNum: 0 }), {});
+  const post = (stepIdx, name, args, toolResponse) => runPostToolUse({ ...base, stepIdx, toolCall: { name, args }, toolResponse }, env);
+  const edit = (idx, target = "app.ts") => post(idx, "edit_file",
+    { Path: JSON.stringify(path.join(workspace, target)), Target: JSON.stringify("return 1;"), Replacement: JSON.stringify("return 2;") },
+    "Made 1 replacement in " + target + " at line 2.");
+  const command = (idx, cmd, response, cwd = workspace) => post(idx, "run_command", { CommandLine: cmd, Cwd: cwd }, response);
+  const stop = (extra = {}) => runStop({ ...base, terminationReason: "NO_TOOL_CALL", fullyIdle: true, ...extra }, env);
+  const stats = () => readSettings(env.AGY_CMD_STATE_DIR).stats.totalAutoRetries;
+  const append = (row) => fs.appendFileSync(transcriptPath, JSON.stringify(row) + "\n");
+  return { pre, post, edit, command, stop, stats, append, workspace, manifest };
+}
+
+test("approved free plan prompts once after a real native edit and shares the retry budget without increasing failure statistics", async (t) => {
+  const f = await freePlanFixture(t, { settings: { autoRetryMax: 1 } });
+  await f.edit(3);
+  assert.deepEqual(await f.pre(), {});
+  for (const extra of [{ terminationReason: "USER_CANCELED" }, { fullyIdle: false }, { terminationReason: "UNKNOWN" },
+    { terminationReason: "MAX_INVOCATIONS" }, { lastUserInput: "/goal" }, { executionNum: 1 }]) {
+    assert.deepEqual(await f.stop(extra), { decision: "allow" });
+  }
+  const verdict = await f.stop({ terminationReason: "model_stop" });
+  assert.equal(verdict.decision, "continue");
+  assert.match(verdict.reason, /计划补验.*npm test/);
+  assert.equal(f.stats(), 0);
+  assert.deepEqual(await f.stop(), { decision: "allow" });
+  await f.command(4, "npm test", "Command exited with code 1.");
+  assert.deepEqual(await f.stop(), { decision: "allow" });
+  assert.equal(f.stats(), 0);
+});
+
+test("approved plans require a completed test in each edited package at or after its edit step", async (t) => {
+  const f = await freePlanFixture(t);
+  const other = path.join(f.workspace, "other");
+  fs.mkdirSync(other);
+  fs.writeFileSync(path.join(other, "package.json"), f.manifest);
+  await f.command(3, "npm test", "Command exited with code 0.");
+  await f.edit(4);
+  await f.edit(5, "other/app.ts");
+  await f.command(6, "npm test", "Command exited with code 0.", other);
+  await f.command(7, "echo test", "Command exited with code 0.");
+  await f.command(8, "npm test", "");
+  const missing = await f.stop();
+  assert.match(missing.reason, /计划补验/);
+  assert.doesNotMatch(missing.reason, /other/);
+  const clean = await freePlanFixture(t);
+  await clean.edit(3);
+  await clean.command(4, "npm.cmd test", "Command exited with code 0.");
+  assert.deepEqual(await clean.stop(), { decision: "allow" });
+});
+
+test("real apply_edits hunks with same-step inline checks, pending background completion and terminal failures", async (t) => {
+  const f = await freePlanFixture(t);
+  const edits = [{ path: "src/app.ts", hunks: [{ target: "return 1;", replacement: "return 2;" }] }];
+  await f.post(3, "apply_edits", { cwd: f.workspace, edits: JSON.stringify(edits), verify: "npm test" },
+    "Applied edits to 1 file(s):\n- src/app.ts: updated\nVerify [PASS in 30ms] `npm test`:");
+  assert.deepEqual(await f.stop(), { decision: "allow" });
+  await f.command(4, "npm test", "Tool is running as a background task with task id: scope/task-4");
+  await f.edit(5);
+  f.append({ step_index: 6, type: "SYSTEM_MESSAGE", content: "[Message] timestamp=2026-01-01 sender=scope/task-4 finished with result:\nCommand exited with code 0." });
+  assert.match((await f.stop()).reason, /计划补验/);
+  await f.command(7, "npm test", "Command exited with code 1.");
+  assert.match((await f.stop()).reason, /自动续跑/);
+  assert.equal(f.stats(), 1);
+
+  const repaired = await freePlanFixture(t);
+  await repaired.command(3, "npm test", "Command exited with code 1.");
+  await repaired.edit(4);
+  assert.match((await repaired.stop()).reason, /计划补验/);
+  assert.equal(repaired.stats(), 0);
+});
+
+test("missing-check nudges ignore ordinary tasks, ambiguous edits, unavailable checks, skip requests and disabled budgets", async (t) => {
+  for (const args of [{ approval: false }, { packageTest: false }, { task: "重构但不用跑测试" },
+    { settings: { autoRetryMode: "off" } }, { settings: { autoRetryScope: "goal_only" } }]) {
+    const f = await freePlanFixture(t, args);
+    await f.edit(3);
+    assert.deepEqual(await f.stop(), { decision: "allow" });
+    if (args.task) {
+      await f.command(4, "npm test", "Command exited with code 1.");
+      assert.deepEqual(await f.stop(), { decision: "allow" });
+    }
+  }
+  const f = await freePlanFixture(t);
+  const native = { Path: "src/app.ts", Target: "// before", Replacement: "// after" };
+  await f.post(3, "edit_file", native, "Made 1 replacement in src/app.ts");
+  await f.edit(4, "README.md");
+  await f.edit(5, "templates/sample.ts");
+  await f.post(6, "write_file", { Path: "app.ts", Content: "return 1;", Overwrite: true }, "Created file.");
+  await f.post(7, "edit_file", { Path: "app.ts", Target: "return 1;", Replacement: "return 2;" }, "");
+  const edits = [{ path: "app.ts", hunks: [{ target: "return 1;", replacement: "return 2;" }] }];
+  await f.post(8, "apply_edits", { edits, dryRun: true }, "Dry run validated 1 file(s) (0 files modified):");
+  await f.post(9, "apply_edits", { edits, bestEffort: true }, "Partial edit applied (1/2 file(s) written; 1 file(s) failed)");
+  assert.deepEqual(await f.stop(), { decision: "allow" });
+  assert.deepEqual(planPreferences("Do not skip tests. 请勿跳过独立复核"), { skipCheck: false, skipReview: false });
+  assert.deepEqual(planPreferences("不要跳过测试，但跳过复核"), { skipCheck: false, skipReview: true });
+});
+
+test("opt-in review requires an approved implementation and actual write, and never redispatches after wakeup or replay", async (t) => {
+  const f = await freePlanFixture(t, { settings: { freePlanReviewEnabled: true } });
+  assert.deepEqual(await f.pre(), {});
+  await f.edit(3);
+  const result = await f.pre();
+  assert.match(result.injectSteps?.[0]?.systemMessage.systemMessage, /invoke_subagent once.*cmd-verifier.*Workspace='inherit'/);
+  assert.deepEqual(await f.pre(), {});
+  f.append({ step_index: 4, type: "PLANNER_RESPONSE", content: "running" });
+  f.append({ step_index: 5, type: "SYSTEM_MESSAGE", content: "[Message] timestamp=2026-01-01 sender=scope/task-3 finished with result: ok" });
+  assert.deepEqual(await f.pre({ invocationNum: 0, initialNumSteps: 6, lastUserInput: "" }), {});
+  assert.match((await f.stop()).reason, /计划补验/);
+  f.append({ step_index: 6, type: "USER_INPUT", content: "解释这段代码" });
+  assert.deepEqual(await f.pre({ invocationNum: 0, initialNumSteps: 7 }), {});
+  await f.edit(7);
+  assert.deepEqual(await f.pre({ invocationNum: 1, initialNumSteps: 7 }), {});
+  assert.deepEqual(await f.stop(), { decision: "allow" });
+});
+
+test("confirmed whole-file overwrite can receive review without treating unknown prior contents as a code change", async (t) => {
+  const f = await freePlanFixture(t, { settings: { freePlanReviewEnabled: true } });
+  await f.post(3, "write_file", { Path: "app.ts", Overwrite: true, Content: "// note\nexport const version = 1;" }, "Created file.");
+  assert.match((await f.pre()).injectSteps[0].systemMessage.systemMessage, /cmd-verifier/);
+  assert.deepEqual(await f.stop(), { decision: "allow" });
+  assert.deepEqual(await f.pre(), {});
+});
+
+test("bounded plan commands cover root runtime config, preserve its package manager, and honor a user question", async (t) => {
+  const f = await freePlanFixture(t, { task: "修改根目录配置。验收命令为 `pnpm test`。", packageTest: false });
+  await f.post(3, "edit_file", { Path: "tsconfig.json", Target: '"strict": false,', Replacement: '"strict": true,' },
+    "Made 1 replacement in tsconfig.json at line 2.");
+  f.append({ step_index: 4, type: "PLANNER_RESPONSE", tool_calls: [{ name: "ask_question" }] });
+  assert.deepEqual(await f.stop(), { decision: "allow" });
+  f.append({ step_index: 5, type: "PLANNER_RESPONSE", tool_calls: [{ name: "read_file" }] });
+  assert.match((await f.stop()).reason, /计划补验.*pnpm test/);
+});
 
 test("paid Boost hands an approved plan to the executor once through the desktop hook", async (t) => {
   const dir = makeTmpDir();
@@ -516,7 +668,7 @@ test("Trigger 2a: >=2 edit<->fail oscillations trigger /boost once, and passing 
   assert.equal(out1.injectSteps?.length, 1);
   assert.deepEqual(Object.keys(out1.injectSteps[0].systemMessage), ["systemMessage"]);
   assert.match(out1.injectSteps[0].systemMessage.systemMessage, /agy-cmd → 自动换视角排查/);
-  assert.match(out1.injectSteps[0].systemMessage.systemMessage, /"dart-reviewer" when listed, otherwise use the read-only "research"/);
+  assert.match(out1.injectSteps[0].systemMessage.systemMessage, /one available investigator \("dart-reviewer" or "research"\) a read-only task/);
   assert.match(out1.injectSteps[0].systemMessage.systemMessage, /src\/auth\.ts/);
 
   // Cooldown: must NOT fire again immediately during same episode
@@ -687,22 +839,19 @@ test("Trigger 3 & 4: /goal and /teamwork fire on turn entry only and suppress wh
     {}
   );
 
-  // Trailing /boost suppresses /boost even after 3 command failures
-  for (let i = 0; i < 3; i++) {
-    await runPostToolUse(
-      { conversationId: "b-sup", toolCall: { name: "run_command", args: { CommandLine: "npm test" } }, error: "exit status 1" },
-      env,
-      7100 + i * 10
-    );
+  // A user's chosen workflow keeps control even when a mid-turn failure streak would reroute it.
+  for (const command of ["/boost", "/swarm", "/run-workflow", "/goal"]) {
+    const conversationId = `chosen-${command.slice(1)}`;
+    const lastUserInput = `排查反复报错的模块 ${command}`;
+    await runPreInvocation({ conversationId, invocationNum: 0, initialNumSteps: 8, lastUserInput }, env, 7090);
+    for (let i = 0; i < 3; i++) {
+      await runPostToolUse(
+        { conversationId, toolCall: { name: "run_command", args: { CommandLine: "npm test" } }, error: "exit status 1" },
+        env, 7100 + i * 10
+      );
+    }
+    assert.deepEqual(await runPreInvocation({ conversationId, invocationNum: 1, initialNumSteps: 8, lastUserInput }, env, 7150), {});
   }
-  assert.deepEqual(
-    await runPreInvocation(
-      { conversationId: "b-sup", invocationNum: 0, initialNumSteps: 8, lastUserInput: "方案A和B同时做了吧 /boost" },
-      env,
-      7150
-    ),
-    {}
-  );
 
   // Teamwork intent
   const twOut = await runPreInvocation(
@@ -713,6 +862,11 @@ test("Trigger 3 & 4: /goal and /teamwork fire on turn entry only and suppress wh
   assert.equal(twOut.injectSteps?.length, 1);
   assert.deepEqual(Object.keys(twOut.injectSteps[0].systemMessage), ["systemMessage"]);
   assert.match(twOut.injectSteps[0].systemMessage.systemMessage, /agy-cmd → 分阶段迁移规划/);
+
+  for (const [i, lastUserInput] of ["什么是仓库级迁移？", "不要做仓库级迁移，只修这个页面。", "What is a repo-wide migration?"].entries()) {
+    const explanation = await runPreInvocation({ conversationId: `migration-question-${i}`, invocationNum: 0, initialNumSteps: 1, lastUserInput }, env, 7210);
+    assert.deepEqual(explanation, {});
+  }
 });
 
 test("rewind (initialNumSteps decrease) and /compact clear stale failure streaks", async () => {

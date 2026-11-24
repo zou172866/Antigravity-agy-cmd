@@ -275,6 +275,8 @@ export function inspectTranscriptTail(transcriptPath) {
     latestUserInput: "",
     latestUserInputKey: "",
     latestPlanPromptKey: "",
+    planRequest: "",
+    planCheckText: "",
     latestInputFollowsPlan: false,
     hasPlannerResponseSinceUserInput: false,
     hasBgTaskCompletionSinceUserInput: false,
@@ -297,6 +299,8 @@ export function inspectTranscriptTail(transcriptPath) {
   let latestUserInput = "";
   let latestUserInputKey = "";
   let latestPlanPromptKey = "";
+  let planRequest = "";
+  let planCheckText = "";
   let lastPlannerStep = null;
   let awaitingUserApprovalOrQuestion = false;
   let waitingForPlanReply = false;
@@ -344,6 +348,13 @@ export function inspectTranscriptTail(transcriptPath) {
         waitingForPlanReply = !calledAskQuestion && (showsPlan || pCalls.some(requestsPlanFeedback));
         if (waitingForPlanReply) {
           latestPlanPromptKey = idx !== null ? `step:${idx}` : `byte:${byteOffset}`;
+          planRequest = latestUserInput;
+          const artifact = pCalls.find(requestsPlanFeedback);
+          const args = parseToolCallArgs(artifact?.args);
+          // The validation section usually closes the plan. Use only visible
+          // bounded text, without opening an arbitrary artifact URI.
+          const planText = args.Content ?? args.content ?? pContent;
+          planCheckText = typeof planText === "string" ? planText.slice(-4096) : "";
         }
       }
       const calledPlanWrite = pCalls.some((c) => isPlanWriteToolCall(c));
@@ -426,6 +437,8 @@ export function inspectTranscriptTail(transcriptPath) {
     latestUserInput,
     latestUserInputKey,
     latestPlanPromptKey,
+    planRequest,
+    planCheckText,
     latestInputFollowsPlan,
     hasPlannerResponseSinceUserInput,
     hasBgTaskCompletionSinceUserInput,
