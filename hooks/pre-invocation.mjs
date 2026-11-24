@@ -5,8 +5,8 @@
  * Dynamically injects a single concise protojson-safe `systemMessage`
  * (`{ systemMessage: { systemMessage: "..." } }`) ONLY when objective thresholds are hit:
  *   1. Read-only Plan Mode blocked artifact `write_file`
- *   2. >=2 edit<->fail oscillations, >=3 consecutive command failures,
- *      or >=2 consecutive unresolved debug turns -> suggest `/boost`
+ *   2. Hard debugging requests or repeated failures -> dispatch a Boost role when enabled.
+ *      Free fallback can delegate read-only investigation on repeated failures.
  *   3. Explicit unattended fix-until-green request -> suggest `/goal`
  *   4. Repo-wide multi-day migration/rewrite -> suggest `/teamwork`
  */

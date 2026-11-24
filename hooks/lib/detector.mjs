@@ -64,6 +64,17 @@ const SOFT_CONTINUATION_RE =
 const DEBUG_INITIAL_RE =
   /(?:报错|出错|失败|排查|调试|修一下.*(?:错|bug|问题)|异常|崩溃|死锁|竞态|卡死|跑不通|测不过|通不过|\b(?:error|exception|traceback|stack\s*trace|failing|failed|bug|crash|deadlock|race\s+condition|broken|debug|fix\s+(?:this|the)\s+(?:bug|error|issue|crash|failure))\b)/i;
 
+const HARD_DEBUG_TASK_RE =
+  /死锁|竞态|并发竞争|内存泄漏|(?:偶发|间歇性).{0,16}(?:失败|崩溃|超时)|(?:算法|性能).{0,8}瓶颈|\b(?:deadlocks?|(?:data|thread) races?|race conditions?|memory leaks?|(?:intermittent|flaky) (?:ci|tests?|crashes|failures?|timeouts?)|(?:algorithmic|performance) bottlenecks?)\b/i;
+
+// Match a request to do the work, including a symptom followed by an imperative.
+const DEBUG_ACTION_RE =
+  /(?:^|[，。,:：.!！]\s*)(?:请帮我|帮我|请|先|只|仅|please\s+)?\s*(?:修复|修好|修一下|解决|排查|定位|诊断|优化|(?:fix|resolve|debug|investigate|diagnose|optimize)\b)/i;
+const DEBUG_DISCUSSION_RE =
+  /^(?:请问|(?:请|帮我)?(?:解释|介绍|举例|比较|翻译|总结)|什么是|如何|怎么(?:修复|排查)|(?:please\s+)?(?:what is|what are|explain|describe|translate|summarize|how (?:do|can|to))\b)|(?:是什么意思|最佳实践是什么)/i;
+const DECLINES_DELEGATION_RE =
+  /(?:不用|不要|不使用|别|无需|禁止|关闭)\s*(?:自动)?(?:调用|使用|启用|开启|用|派)?\s*(?:\/?boost|多智能体|子智能体)|(?:仅|只)(?:用|在)?主(?:线程|会话)|\b(?:no|without|skip|disable|do not|don['’]t)\s+(?:(?:use|call|invoke)\s+)?(?:\/?boost|subagents?|delegation)\b/i;
+
 const UNATTENDED_GOAL_RE =
   /(?:无人值守|一直修|修到全绿|跑到全绿|直到(?:全部|所有)?(?:测试|编译|构建|检查)?(?:全部)?通过|修通(?:全部|所有)|中途别停|别停下来|死磕到底|自动修到|全绿为止|全部修好为止|\b(?:fix\s+(?:all|every(?:thing)?|until)\s+(?:tests?\s+)?(?:pass|green)|keep\s+(?:fixing|going|trying)\s+until\s+(?:all\s+)?(?:tests?|build|ci)\s+(?:pass|green|succeed)|don'?t\s+stop\s+until\s+(?:all\s+)?(?:tests?|build)\s+(?:pass|green)|unattended\s+(?:fix|loop|run))\b)/i;
 
@@ -1019,8 +1030,9 @@ export function evaluatePreInvocation(payload, events = [], prevStateInput = nul
     }
   }
 
-  const activeSlash = extractActiveSlashCommands(rawLastUserInput);
-  const intentProse = extractProseForIntent(rawLastUserInput);
+  const turnInput = rawLastUserInput || (isMidTurn ? nextState.lastUserInput : "");
+  const activeSlash = extractActiveSlashCommands(turnInput);
+  const intentProse = extractProseForIntent(turnInput);
 
   // 2. Detect new user turn entry (excluding background-task wakeups that carry no new USER_INPUT)
   const latestTxUserKey = nonEmptyString(transcriptTail?.latestUserInputKey);
@@ -1073,6 +1085,7 @@ export function evaluatePreInvocation(payload, events = [], prevStateInput = nul
       nextState.debugTurnStreak = 0;
       nextState.boostAlerted = false;
       nextState.lastBoostPassTs = 0;
+      nextState.lastPaidBoostTurn = null;
       nextState.lastBoostAlertEventTs = 0;
       nextState.turnUnattendedGoal = false;
       nextState.turnRetryOverride = null;
@@ -1187,7 +1200,10 @@ export function evaluatePreInvocation(payload, events = [], prevStateInput = nul
     Boolean(transcriptTail?.tailRolledOverWithoutUserInput) ||
     (!isDirectUnflushedNotice && Boolean(transcriptTail?.hasPlannerResponseSinceUserInput));
   if (
-    ((paidBoostActive && effSettings.boostAfterPlanApproval) || effSettings.planTier === "free") &&
+    ((paidBoostActive && effSettings.boostAfterPlanApproval &&
+      !DECLINES_DELEGATION_RE.test(intentProse) &&
+      !DECLINES_DELEGATION_RE.test(extractProseForIntent(transcriptTail?.planRequest || prevState.lastUserInput))) ||
+      effSettings.planTier === "free") &&
     isNewUserTurn &&
     activeSlash.size === 0 &&
     !alreadyTriggeredPlanBoost &&
@@ -1212,6 +1228,7 @@ export function evaluatePreInvocation(payload, events = [], prevStateInput = nul
         nextState.freePlan = { key: planBoostKey, ...prefs, requested, wroteSource: false, reminded: false, reviewRequested: false, scopes: {} };
         return { nextState, injectStep: null, shouldResetEvents, reasonCode: "approved_free_plan", stateChanged, metrics };
       }
+      nextState.lastPaidBoostTurn = nextState.userTurnCount;
       return {
         nextState,
         injectStep: buildInjectStep({
@@ -1240,10 +1257,7 @@ export function evaluatePreInvocation(payload, events = [], prevStateInput = nul
     };
   }
 
-  // 4. Priority 2: Stuck debugging / repeated failures
-  //    - Paid + Boost enabled: suggest `/boost` + independent subagent check
-  //    - Free tier (DEFAULT) or Boost disabled: NEVER suggest `/boost` (prevents permission errors!);
-  //      automatically steer to built-in read-only `research` subagent & falsifiable hypotheses.
+  // Route a single hard problem at entry, or escalate once the debugging signals accumulate.
   const hasFreshFailureSinceAlert =
     !nextState.boostAlerted || metrics.latestFailureTs > (nextState.lastBoostAlertEventTs || 0);
   const isCleanNonDebugTurnEntry = isNewUserTurn && (nextState.debugTurnStreak || 0) === 0;
@@ -1251,15 +1265,19 @@ export function evaluatePreInvocation(payload, events = [], prevStateInput = nul
   const failStreakHit =
     !isCleanNonDebugTurnEntry && metrics.consecutiveCmdFailures >= 3 && hasFreshFailureSinceAlert;
   const multiTurnDebugHit = isNewUserTurn && (nextState.debugTurnStreak || 0) >= 2;
+  const hardTaskHit = isNewUserTurn && DEBUG_ACTION_RE.test(intentProse) && HARD_DEBUG_TASK_RE.test(intentProse);
+  const stuck = oscHit || failStreakHit || multiTurnDebugHit;
+  const shouldEscalate = paidBoostActive
+    ? (hardTaskHit || stuck) && !uiOnly && !isBgTaskWakeup && !activePlanBlock &&
+      !transcriptTail?.awaitingUserApprovalOrQuestion && !DEBUG_DISCUSSION_RE.test(intentProse) &&
+      !(isNewUserTurn && (nextState.turnUnattendedGoal || requestsMigration(intentProse))) &&
+      nextState.lastPaidBoostTurn !== nextState.userTurnCount
+    : stuck && effSettings.freeFallbackEnabled;
 
-  if (
-    (oscHit || failStreakHit || multiTurnDebugHit) &&
-    (paidBoostActive || effSettings.freeFallbackEnabled) &&
-    activeSlash.size === 0
-  ) {
+  if (shouldEscalate && activeSlash.size === 0 && !DECLINES_DELEGATION_RE.test(intentProse)) {
     const cooldownElapsed =
       !nextState.boostAlerted ||
-      nextState.userTurnCount - (nextState.lastBoostAlertTurn || 0) >= 3;
+      (!paidBoostActive && nextState.userTurnCount - (nextState.lastBoostAlertTurn || 0) >= 3);
 
     if (cooldownElapsed) {
       nextState.boostAlerted = true;
@@ -1269,6 +1287,10 @@ export function evaluatePreInvocation(payload, events = [], prevStateInput = nul
 
       const reasonsZh = [];
       const reasonsEn = [];
+      if (paidBoostActive && hardTaskHit) {
+        reasonsZh.push("明确的疑难排查或修复任务");
+        reasonsEn.push("explicit request to tackle a hard debugging or optimization task");
+      }
       if (oscHit) {
         const filesHint =
           metrics.topOscillatingFiles.length > 0
@@ -1287,23 +1309,18 @@ export function evaluatePreInvocation(payload, events = [], prevStateInput = nul
       }
 
       if (paidBoostActive) {
-        let topic = "";
-        if (metrics.topOscillatingFiles.length > 0) {
-          topic = `排查 ${metrics.topOscillatingFiles.join(" / ")} 反复失败根因`;
-        } else if (rawLastUserInput) {
-          topic = sanitizeSnippet(rawLastUserInput, 36);
-        }
-        if (!topic) topic = "深度排查当前反复失败的根因";
-
+        nextState.lastPaidBoostTurn = nextState.userTurnCount;
+        const allowFix = hasDirectFixOrChangeIntent(intentProse) && !/只读|\bread[- ]only\b/i.test(intentProse);
+        const role = allowFix ? "DeepCoder" : "DeepInvestigator";
         return {
           nextState,
           injectStep: buildInjectStep({
             uiOnly,
-            userMarkdown: `> **[agy-cmd → 建议 /boost]** 检测到${reasonsZh.join("、")}。可复制：\`/boost ${topic}\``,
-            systemMessage: `[agy-cmd] Objective stuck threshold reached (${reasonsEn.join("; ")}). Put "[agy-cmd → 建议 /boost]" and a copyable "/boost <concise issue>" on line 1. Scope it to the recurring problem. Include the observed reproduction or failing check, the affected code, and what result would confirm the fix.`
+            userMarkdown: `> **[agy-cmd → 自动 Boost]** 检测到${reasonsZh.join("、")}。`,
+            systemMessage: `[agy-cmd] Start line 1 with "[agy-cmd → 自动 Boost]". Call invoke_subagent once with TypeName='${role}' and Workspace='inherit' for this single problem (${reasonsEn.join(", ")}). If edits need plan approval or the session is read-only, use DeepInvestigator for read-only investigation and obtain approval before implementation. Honor the user's scope and constraints. Give the worker relevant files, observed failures or symptoms, and a verification criterion. Hidden roles may be omitted from the available list. If the call fails, continue in the main session and report the fallback. Follow the worker to completion and independently verify its result.`
           }),
           shouldResetEvents,
-          reasonCode: "suggest_boost",
+          reasonCode: "auto_boost",
           stateChanged,
           metrics
         };

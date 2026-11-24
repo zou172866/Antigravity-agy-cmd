@@ -127,7 +127,7 @@ test("Free-Tier Safe default suppresses /boost & /teamwork; switching to Paid un
   assert.equal(freeTw.injectSteps?.length, 1);
   assert.match(freeTw.injectSteps[0].systemMessage.systemMessage, /分阶段迁移规划/);
 
-  // 2. Switch to Paid tier in settings -> auto-enables boostEnabled -> stuck failures suggest /boost
+  // Paid tier enables automatic Boost delegation on repeated failures.
   const updated = updateSettings(dir, { planTier: "paid" });
   assert.equal(updated.planTier, "paid");
   assert.equal(updated.boostEnabled, true);
@@ -146,7 +146,9 @@ test("Free-Tier Safe default suppresses /boost & /teamwork; switching to Paid un
     2050
   );
   assert.equal(paidOut.injectSteps?.length, 1);
-  assert.match(paidOut.injectSteps[0].systemMessage.systemMessage, /建议 \/boost/);
+  const paidMsg = paidOut.injectSteps[0].systemMessage.systemMessage;
+  assert.match(paidMsg, /自动 Boost/);
+  assert.match(paidMsg, /invoke_subagent once with TypeName='DeepCoder' and Workspace='inherit'/);
 
   // Switching back to Free forces boostEnabled=false
   const backToFree = updateSettings(dir, { planTier: "free" });

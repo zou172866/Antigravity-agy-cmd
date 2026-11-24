@@ -18,6 +18,7 @@ export function createDefaultState() {
     lastUserInput: "",
     debugTurnStreak: 0,
     boostAlerted: false,
+    lastPaidBoostTurn: null,
     lastBoostAlertTurn: 0,
     lastBoostAlertEventTs: 0,
     lastBoostPassTs: 0,

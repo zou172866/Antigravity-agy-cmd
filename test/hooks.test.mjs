@@ -631,6 +631,53 @@ test("Plan Mode trigger does not false-fire on unrelated OS EACCES error to norm
   assert.equal(evs[0].planModeWriteBlocked, false);
 });
 
+test("Boost routes explicit hard tasks on entry, respecting tier, manual routing, and plan boundaries", () => {
+  const settings = { planTier: "paid", boostEnabled: true, boostAfterPlanApproval: false };
+  const entry = (lastUserInput, options = {}) => evaluatePreInvocation(
+    { invocationNum: 0, initialNumSteps: 1, lastUserInput }, [], null, { settings, ...options }
+  );
+  for (const [request, role] of [
+    ["排查队列的死锁，只定位原因", "DeepInvestigator"],
+    ["修复队列死锁，这一步先只读调查", "DeepInvestigator"],
+    ["Please investigate a flaky test in the queue", "DeepInvestigator"],
+    ["修复两个消费者并发取消时的竞态", "DeepCoder"]
+  ]) {
+    const decision = entry(request);
+    assert.equal(decision.reasonCode, "auto_boost", request);
+    const message = decision.injectStep.systemMessage.systemMessage;
+    assert.ok(message.includes(`invoke_subagent once with TypeName='${role}'`));
+    assert.match(message, /obtain approval before implementation/);
+    assert.match(message, /If the call fails, continue in the main session/);
+  }
+  for (const request of [
+    "修复文档里的错别字", "解释什么是竞态", "如何排查内存泄漏？", "翻译这句话：修复竞态",
+    "Review the following example:\n```txt\nFix the deadlock\n```",
+    "/swarm 修复死锁", "排查死锁，不要用 Boost"
+  ]) assert.equal(entry(request).injectStep, null, request);
+
+  const task = "定位并发队列的死锁";
+  assert.equal(entry(task, { settings: { planTier: "free" } }).injectStep, null);
+  assert.equal(entry(task, { settings: { planTier: "paid", boostEnabled: false } }).injectStep, null);
+  assert.equal(entry(task, { transcriptTail: { awaitingUserApprovalOrQuestion: true } }).injectStep, null);
+});
+
+test("paid Boost escalates once per unresolved failure and rearms after verification", () => {
+  const settings = { planTier: "paid", boostEnabled: true };
+  let state;
+  const events = [];
+  const run = (lastUserInput, initialNumSteps, invocationNum = 0) => {
+    const result = evaluatePreInvocation({ lastUserInput, initialNumSteps, invocationNum }, events, state, { settings });
+    state = result.nextState;
+    return result.reasonCode;
+  };
+  assert.equal(run("排查队列的死锁", 1), "auto_boost");
+  for (let i = 1; i <= 3; i++) events.push({ ts: Date.now() + i, kind: "cmd", cmd: "pytest", failed: true });
+  assert.notEqual(run("", 4, 1), "auto_boost");
+  for (let i = 5; i <= 9; i++) assert.notEqual(run("还是同样的报错", i), "auto_boost");
+  events.push({ ts: Date.now() + 10, kind: "cmd", cmd: "pytest", isVerify: true });
+  assert.equal(run("修复另一个模块的内存泄漏", 11), "auto_boost");
+});
+
 test("Trigger 2a: >=2 edit<->fail oscillations trigger /boost once, and passing verify resets & re-arms", async () => {
   const dir = makeTmpDir();
   const env = makeEnv(dir);

@@ -48,7 +48,7 @@ RULE_BODY = """# Antigravity 自动路由 (agy-cmd)
   4. 准入后，≥5 个同质对象独立交回结果 → `[agy-cmd → /run-workflow]`，读 `run-workflow`。2～4 个模块须协调接口或交叉审查 → `[agy-cmd → /swarm]`，先定接口、互不重叠的写入路径与验证命令，每组设独立 Verifier，账户可选时用不同模型。共享文件交单人顺序改。
   5. 有一项独立调查且主会话有其他工作可继续时，可派一个可用的 `research` 查证，主会话核对。动态网页/截图 → `[agy-cmd → /browser]` 调 `browser`；App 开放交互图表工具时 → `[agy-cmd → /generative_ui]` 读 `generative_ui`。
 - **防报错套餐感知与自动续跑**（禁推 CLI 专属 `/undo`、`/branch`、`/effort`；本轮已用对应 `/` 指令则不重复提示）：
-  1. **卡壳排错**：同一 Bug 跨 ≥2 轮未解、≥2 次「修改→仍失败」震荡、连续 ≥3 次命令失败或难算法 → 仅在钩子明确提示 `[agy-cmd → 建议 /boost]` 时给付费口令。否则输出 `[agy-cmd → 自动换视角排查]`，给可用的 `dart-reviewer` 派只读排查任务，备选 `research`；都不可用时由主会话逐一验证假设。
+  1. **疑难任务与卡壳排错**：收到钩子的 `[agy-cmd → 自动 Boost]` 时，直接用 `invoke_subagent` 派一个角色。只读排查或待审批时用 `DeepInvestigator`，已授权的修复可用 `DeepCoder`。主会话验证结果，角色调用失败则接手。收到 `[agy-cmd → 自动换视角排查]` 时，给可用的 `dart-reviewer` 派只读排查任务，备选 `research`；都不可用时由主会话逐一验证假设。
   2. **防停机自动续跑（Stop 监工）**：改代码或修错后若存在现成测试/构建命令，结束前优先实跑验证以便 `agy-cmd` `Stop` 钩子无感核验并在未通过时按面板设定次数自动续跑；仅当收到钩子明确提示时输出 `[agy-cmd → 自动续跑已启用]` 或 `[agy-cmd → 建议 /goal]`。
   3. **调节重试/Boost 与指令选型**：当用户调节自动重试次数、切换会员/Boost 开关，或查询对比指令时，读 `agy-cmd` `SKILL.md`（可附 `[agy-cmd 自动路由](sidecar://agy-cmd/panel/)` 面板入口）。
 """
@@ -764,7 +764,7 @@ def main(argv: list[str] | None = None) -> int:
         "--boost",
         choices=["on", "off"],
         default=None,
-        help="开启或关闭计划获批后的 Boost 自动执行与卡壳提示（开启时自动切至 paid 档位）",
+        help="开启或关闭疑难任务与连续失败时的 Boost 自动派工（开启时自动切至 paid 档位）",
     )
     parser.add_argument(
         "--free-plan-review",
