@@ -92,26 +92,58 @@ export function readTranscriptHead(transcriptPath, maxBytes = HEAD_READ_BYTES) {
   return readTranscriptHeadRaw(transcriptPath, maxBytes).steps;
 }
 
-export function readTranscriptTail(transcriptPath, maxBytes = TAIL_READ_BYTES) {
-  if (!transcriptPath) return [];
+function parseNonNegStepIdx(rawIdx) {
+  if (rawIdx === null || rawIdx === undefined || rawIdx === "" || typeof rawIdx === "boolean") {
+    return null;
+  }
+  if (typeof rawIdx === "string" && rawIdx.trim() === "") {
+    return null;
+  }
+  const n = Number(rawIdx);
+  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : null;
+}
+
+function readTranscriptTailRaw(transcriptPath, maxBytes = TAIL_READ_BYTES) {
+  const empty = { entries: [], truncated: false, fileSize: 0 };
+  if (!transcriptPath) return empty;
   let fd = null;
   try {
     const st = fs.statSync(transcriptPath);
-    if (!st.isFile() || st.size === 0) return [];
+    if (!st.isFile() || st.size === 0) return empty;
     const offset = Math.max(0, st.size - maxBytes);
+    const truncated = offset > 0;
     const readLen = st.size - offset;
     const buf = Buffer.allocUnsafe(readLen);
     fd = fs.openSync(transcriptPath, "r");
     const bytesRead = fs.readSync(fd, buf, 0, readLen, offset);
-    let raw = buf.subarray(0, bytesRead).toString("utf8");
-    if (offset > 0) {
-      const firstNl = raw.indexOf("\n");
-      if (firstNl >= 0) raw = raw.slice(firstNl + 1);
-      else return [];
+    let pos = 0;
+    if (truncated) {
+      const firstNl = buf.indexOf(0x0a, 0);
+      if (firstNl < 0 || firstNl >= bytesRead) {
+        return { entries: [], truncated: true, fileSize: st.size };
+      }
+      pos = firstNl + 1;
     }
-    return parseJsonLines(raw);
+    const entries = [];
+    while (pos < bytesRead) {
+      const nextNl = buf.indexOf(0x0a, pos);
+      const end = nextNl >= 0 && nextNl < bytesRead ? nextNl : bytesRead;
+      const line = buf.subarray(pos, end).toString("utf8").trim();
+      const byteOffset = offset + pos;
+      pos = nextNl >= 0 && nextNl < bytesRead ? nextNl + 1 : bytesRead;
+      if (!line) continue;
+      try {
+        const obj = JSON.parse(line);
+        if (obj && typeof obj === "object" && !Array.isArray(obj)) {
+          entries.push({ step: obj, byteOffset });
+        }
+      } catch {
+        // Ignore partial or malformed lines safely
+      }
+    }
+    return { entries, truncated, fileSize: st.size };
   } catch {
-    return [];
+    return empty;
   } finally {
     if (fd !== null) {
       try {
@@ -119,6 +151,10 @@ export function readTranscriptTail(transcriptPath, maxBytes = TAIL_READ_BYTES) {
       } catch {}
     }
   }
+}
+
+export function readTranscriptTail(transcriptPath, maxBytes = TAIL_READ_BYTES) {
+  return readTranscriptTailRaw(transcriptPath, maxBytes).entries.map((entry) => entry.step);
 }
 
 /**
@@ -237,29 +273,52 @@ export function inspectTranscriptTail(transcriptPath) {
     taskResultsByStepIdx: new Map(),
     latestPlanModeDenial: null,
     latestUserInput: "",
+    latestUserInputKey: "",
+    latestPlanPromptKey: "",
     latestInputFollowsPlan: false,
+    hasPlannerResponseSinceUserInput: false,
+    hasBgTaskCompletionSinceUserInput: false,
+    tailRolledOverWithoutUserInput: false,
     awaitingUserApprovalOrQuestion: false
   };
   if (!transcriptPath) return empty;
 
-  const steps = readTranscriptTail(transcriptPath, TAIL_READ_BYTES);
-  if (steps.length === 0) return empty;
+  const { entries, truncated, fileSize } = readTranscriptTailRaw(transcriptPath, TAIL_READ_BYTES);
+  if (entries.length === 0) {
+    return {
+      ...empty,
+      tailRolledOverWithoutUserInput: Boolean(truncated && fileSize > 0)
+    };
+  }
 
   const stepsByIndex = new Map();
   const taskResultsByStepIdx = new Map();
   let latestPlanModeDenial = null;
   let latestUserInput = "";
+  let latestUserInputKey = "";
+  let latestPlanPromptKey = "";
   let lastPlannerStep = null;
   let awaitingUserApprovalOrQuestion = false;
   let waitingForPlanReply = false;
   let latestInputFollowsPlan = false;
+  let hasPlannerResponseSinceUserInput = false;
+  let hasBgTaskCompletionSinceUserInput = false;
 
-  for (const step of steps) {
-    const idx = Number.isFinite(Number(step.step_index)) ? Math.floor(Number(step.step_index)) : null;
+  for (const { step, byteOffset } of entries) {
+    const idx = parseNonNegStepIdx(step.step_index);
 
     if (step.type === "USER_INPUT") {
       latestInputFollowsPlan = waitingForPlanReply;
       waitingForPlanReply = false;
+      const createdAt = nonEmptyString(step.created_at);
+      latestUserInputKey =
+        idx !== null
+          ? `step:${idx}`
+          : createdAt
+            ? `ts:${createdAt}@${byteOffset}`
+            : `byte:${byteOffset}`;
+      hasPlannerResponseSinceUserInput = false;
+      hasBgTaskCompletionSinceUserInput = false;
       if (typeof step.content === "string" && step.content.trim()) {
         latestUserInput = step.content;
       }
@@ -272,6 +331,7 @@ export function inspectTranscriptTail(transcriptPath) {
 
     if (step.type === "PLANNER_RESPONSE") {
       lastPlannerStep = step;
+      hasPlannerResponseSinceUserInput = true;
       const pContent = typeof step.content === "string" ? step.content : "";
       const pCalls = Array.isArray(step.tool_calls)
         ? step.tool_calls
@@ -282,6 +342,9 @@ export function inspectTranscriptTail(transcriptPath) {
       const showsPlan = /^\s*(?:\*\*)?\[agy-cmd\s*→\s*\/plan\s*审批\]/.test(pContent);
       if (calledAskQuestion || pCalls.length > 0 || showsPlan) {
         waitingForPlanReply = !calledAskQuestion && (showsPlan || pCalls.some(requestsPlanFeedback));
+        if (waitingForPlanReply) {
+          latestPlanPromptKey = idx !== null ? `step:${idx}` : `byte:${byteOffset}`;
+        }
       }
       const calledPlanWrite = pCalls.some((c) => isPlanWriteToolCall(c));
       const hasApprovalOrGrillBadge =
@@ -299,6 +362,7 @@ export function inspectTranscriptTail(transcriptPath) {
       const content = typeof step.content === "string" ? step.content : "";
       const taskMatch = content.match(BG_TASK_SENDER_RE);
       if (taskMatch && /finished with result:/i.test(content)) {
+        hasBgTaskCompletionSinceUserInput = true;
         const taskStepIdx = Number(taskMatch[1]);
         const resultIdx = content.search(/finished with result:\s*\r?\n?/i);
         const body =
@@ -360,7 +424,12 @@ export function inspectTranscriptTail(transcriptPath) {
     taskResultsByStepIdx,
     latestPlanModeDenial,
     latestUserInput,
+    latestUserInputKey,
+    latestPlanPromptKey,
     latestInputFollowsPlan,
+    hasPlannerResponseSinceUserInput,
+    hasBgTaskCompletionSinceUserInput,
+    tailRolledOverWithoutUserInput: Boolean(truncated && !latestUserInputKey && fileSize > 0),
     awaitingUserApprovalOrQuestion
   };
 }
@@ -369,12 +438,12 @@ export function inspectTranscriptTail(transcriptPath) {
  * Lightweight single-step lookup used by PostToolUse when payload omits `toolResponse`.
  */
 export function findTranscriptStep(transcriptPath, stepIdx) {
-  if (!transcriptPath || !Number.isFinite(Number(stepIdx))) return null;
-  const target = Math.floor(Number(stepIdx));
+  const target = parseNonNegStepIdx(stepIdx);
+  if (!transcriptPath || target === null) return null;
   const steps = readTranscriptTail(transcriptPath, 32 * 1024);
   for (let i = steps.length - 1; i >= 0; i--) {
     const s = steps[i];
-    if (s.type === "GENERIC" && Number(s.step_index) === target) {
+    if (s.type === "GENERIC" && parseNonNegStepIdx(s.step_index) === target) {
       return s;
     }
   }

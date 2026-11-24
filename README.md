@@ -4,7 +4,7 @@
 
 # agy-cmd
 
-**Google Antigravity plugin: smart auto-router · Stop-hook auto-retry guard · free-tier protection · live Sidecar panel**
+**Google Antigravity plugin: auto-route commands · Stop-hook auto-retry · multi-agent Boost on plan approval · fresh-perspective stuck recovery · anti-bypass plan guard**
 
 [简体中文](README.zh-CN.md) · English · [How to Install](#how-to-install) · [Features](#features) · [CLI Management](#cli-management)
 
@@ -16,7 +16,14 @@
 
 `agy-cmd` is a workflow plugin for **Google Antigravity Desktop / IDE**.
 
-Once installed, it runs automatically in the background during every chat to handle four things: routing tasks to the right Antigravity workflow by scope, automatically retrying fixes when tests or checks fail via a Stop hook, protecting free-tier accounts from paid-only slash commands, and providing a live right-hand Sidecar control panel.
+Once installed, it runs automatically in the background during every chat to handle these things:
+
+- **Auto-route built-in workflows by task**: matches `/grill-me`, `/plan`, `/run-workflow`, and related workflows based on scope;
+- **Stop-hook auto-retry guard**: keeps the agent investigating and fixing when tests or build checks fail instead of stopping early;
+- **Auto-dispatch multi-agent execution on plan approval**: with Pro / Ultra Boost enabled, approving a plan automatically launches `DeepCoder` / `DeepInvestigator` to execute and verify;
+- **Fresh-perspective stuck recovery (all tiers)**: when repeated fixes fail, halts blind edits and delegates root-cause diagnosis to an independent read-only subagent (`dart-reviewer` / `research`);
+- **Anti-bypass read-only plan guard**: when read-only Plan Mode blocks writing the plan file, forces an inline plan in chat and blocks `exit_plan_mode` so the agent cannot bypass approval and silently edit code;
+- **Live right-hand Sidecar control panel**: lets you toggle retry limits, trigger scope, and free-tier protection anytime (shielding free accounts from paid-only command errors by default).
 
 ## How to Install
 
@@ -59,7 +66,7 @@ To prevent free accounts from hitting errors on paid-only commands, `agy-cmd` sh
 After installing, open the right-hand **agy-cmd Auto-Router** Sidecar panel (or click `sidecar://agy-cmd/panel/` in chat) and confirm:
 
 1. **Auto-retry limit**: choose **Off (0)**, **Fixed count (1–50)**, or **Unlimited**.
-2. **Account tier**: if you subscribe to **Google AI Pro / Ultra**, switch to **Pro / Ultra** to enable Boost. The panel’s **Use Boost after plan approval** switch is on by default. Approve the implementation plan or reply “implement the plan” to run it with Boost and verify the result. Turn off this switch to keep only the Boost reminders for stuck tasks.
+2. **Account tier**: if you subscribe to **Google AI Pro / Ultra**, switch to **Pro / Ultra** to enable Boost. The panel’s **Use Boost after plan approval** switch is on by default. When you click **Approve** or reply “implement the plan”, `agy-cmd` outputs `[agy-cmd → 计划获批，自动 Boost]` and directly dispatches Antigravity’s hidden `DeepCoder` / `DeepInvestigator` Boost subagents once without requiring manual `/boost` input (falling back to standard tools only if invocation fails), with deduplication across background-task wakeups. Turn off this switch to keep only `/boost` reminders for stuck tasks.
 
 ## Features
 
@@ -69,7 +76,7 @@ No need to memorize or manually pick built-in Antigravity slash commands for eve
 
 - **1–2 files, explanations, or local lookups**: responds directly with zero extra prompts or banners.
 - **Ambiguous requirements**: asks a focused multiple-choice clarification question first.
-- **3+ files or higher-risk edits**: drafts an implementation plan for your approval before touching project files (even in read-only plan mode, it writes the plan inline and waits for confirmation).
+- **3+ files or higher-risk edits**: drafts an implementation plan for your approval before touching project files (even in read-only plan mode, it writes the plan inline and waits for confirmation); when Pro / Ultra Boost is enabled, approving the plan displays `[agy-cmd → 计划获批，自动 Boost]` and dispatches `DeepCoder` / `DeepInvestigator` strictly once while preserving `Stop` auto-retry state across background-task wakeups.
 - **5+ batch items**: fans out semantic batch processing in parallel to save waiting time.
 - **Dynamic web pages or interactive visuals**: automatically triggers the built-in browser or interactive UI renderer.
 

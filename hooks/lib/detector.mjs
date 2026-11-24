@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import {
   extractActiveSlashCommands,
   isSubagentPayload,
@@ -696,8 +697,13 @@ function extractProseForIntent(rawText) {
 
 function parseNonNegInt(val) {
   if (val === undefined || val === null || val === "" || typeof val === "boolean") return null;
+  if (typeof val === "string" && val.trim() === "") return null;
   const n = Number(val);
   return Number.isFinite(n) && n >= 0 ? Math.floor(n) : null;
+}
+
+function hashText(val) {
+  return crypto.createHash("sha1").update(String(val || "")).digest("hex").slice(0, 16);
 }
 
 /**
@@ -914,7 +920,8 @@ export function evaluatePreInvocation(payload, events = [], prevStateInput = nul
   const initialNumSteps = parseNonNegInt(payload.initialNumSteps ?? payload.initial_num_steps);
   const invocationNum = parseNonNegInt(payload.invocationNum ?? payload.invocation_num);
   const latestTranscriptInput = nonEmptyString(transcriptTail?.latestUserInput);
-  const inputEnvelope = nonEmptyString(payload.lastUserInput ?? payload.last_user_input) || latestTranscriptInput;
+  const rawPayloadInput = nonEmptyString(payload.lastUserInput ?? payload.last_user_input);
+  const inputEnvelope = rawPayloadInput || latestTranscriptInput;
   const rawLastUserInput = unwrapUserRequestText(inputEnvelope);
   const isMidTurn = invocationNum !== null && invocationNum >= 1;
 
@@ -969,9 +976,28 @@ export function evaluatePreInvocation(payload, events = [], prevStateInput = nul
   const activeSlash = extractActiveSlashCommands(rawLastUserInput);
   const intentProse = extractProseForIntent(rawLastUserInput);
 
-  // 2. Detect new user turn entry
+  // 2. Detect new user turn entry (excluding background-task wakeups that carry no new USER_INPUT)
+  const latestTxUserKey = nonEmptyString(transcriptTail?.latestUserInputKey);
+  const sameTxTurnKey =
+    Boolean(latestTxUserKey) && latestTxUserKey === (nextState.lastTurnUserInputKey || "");
+  const isWakeupWithNoNewInput =
+    !rawPayloadInput ||
+    (sameTxTurnKey &&
+      Boolean(transcriptTail?.hasBgTaskCompletionSinceUserInput) &&
+      rawLastUserInput === nextState.lastUserInput);
+  const isBgTaskWakeup =
+    !isMidTurn &&
+    invocationNum === 0 &&
+    isWakeupWithNoNewInput &&
+    (nextState.userTurnCount || 0) > 0 &&
+    (sameTxTurnKey || Boolean(transcriptTail?.tailRolledOverWithoutUserInput)) &&
+    (Boolean(transcriptTail?.hasBgTaskCompletionSinceUserInput) ||
+      Boolean(transcriptTail?.hasPlannerResponseSinceUserInput) ||
+      Boolean(transcriptTail?.tailRolledOverWithoutUserInput));
+
   const isNewUserTurn =
     !isMidTurn &&
+    !isBgTaskWakeup &&
     ((invocationNum === 0 &&
       (initialNumSteps !== nextState.lastTurnInitialSteps ||
         rawLastUserInput !== nextState.lastUserInput ||
@@ -981,6 +1007,10 @@ export function evaluatePreInvocation(payload, events = [], prevStateInput = nul
   if (isNewUserTurn) {
     nextState.userTurnCount = (nextState.userTurnCount || 0) + 1;
     nextState.lastUserInput = rawLastUserInput;
+    nextState.lastTurnUserInputKey = latestTxUserKey;
+    if (!isPlanApprovalNotice(inputEnvelope)) {
+      nextState.lastPlanBoostNoticeHash = "";
+    }
     nextState.lastTurnInitialSteps = initialNumSteps;
     nextState.lastTurnStartTs = nowMs;
     nextState.turnAutoRetries = 0;
@@ -1001,6 +1031,10 @@ export function evaluatePreInvocation(payload, events = [], prevStateInput = nul
       nextState.turnRetryOverride = null;
       nextState.turnAutoRetries = 0;
       nextState.lastContinueEventSig = "";
+      nextState.lastPlanBoostKey = "";
+      nextState.lastPlanBoostNoticeHash = "";
+      nextState.lastPlanBoostPromptKey = "";
+      nextState.lastTurnUserInputKey = "";
       nextState.resolvedSteps = {};
       shouldResetEvents = true;
       return {
@@ -1068,17 +1102,50 @@ export function evaluatePreInvocation(payload, events = [], prevStateInput = nul
   }
 
   const paidBoostActive = effSettings.planTier === "paid" && effSettings.boostEnabled === true;
-  if (paidBoostActive && effSettings.boostAfterPlanApproval && isNewUserTurn && activeSlash.size === 0) {
+  const isDirectUnflushedNotice =
+    Boolean(rawPayloadInput) &&
+    isPlanApprovalNotice(rawPayloadInput) &&
+    !transcriptTail?.tailRolledOverWithoutUserInput &&
+    rawPayloadInput !== latestTranscriptInput;
+  const noticeHash = isPlanApprovalNotice(inputEnvelope) ? hashText(inputEnvelope) : "";
+  const latestPlanPromptKey = nonEmptyString(transcriptTail?.latestPlanPromptKey);
+  const planBoostKey = isDirectUnflushedNotice
+    ? `notice:${noticeHash}:${initialNumSteps ?? nextState.userTurnCount}`
+    : latestTxUserKey || `turn:${nextState.userTurnCount}`;
+  const alreadyTriggeredPlanBoost =
+    planBoostKey === (nextState.lastPlanBoostKey || "") ||
+    (isDirectUnflushedNotice &&
+      noticeHash !== "" &&
+      noticeHash === (nextState.lastPlanBoostNoticeHash || "") &&
+      latestPlanPromptKey === (nextState.lastPlanBoostPromptKey || ""));
+  const blockedByTailState =
+    Boolean(transcriptTail?.tailRolledOverWithoutUserInput) ||
+    (!isDirectUnflushedNotice && Boolean(transcriptTail?.hasPlannerResponseSinceUserInput));
+  if (
+    paidBoostActive &&
+    effSettings.boostAfterPlanApproval &&
+    isNewUserTurn &&
+    activeSlash.size === 0 &&
+    !alreadyTriggeredPlanBoost &&
+    !blockedByTailState
+  ) {
     const sameInput = inputEnvelope === latestTranscriptInput || inputEnvelope === unwrapUserRequestText(latestTranscriptInput);
     const clickedApproval = isPlanApprovalNotice(inputEnvelope) || (sameInput && isPlanApprovalNotice(latestTranscriptInput));
     const confirmedInChat = confirmsPlan(rawLastUserInput);
     if ((clickedApproval && (!rawLastUserInput || confirmedInChat)) ||
         (sameInput && transcriptTail?.latestInputFollowsPlan && confirmedInChat)) {
+      nextState.lastPlanBoostKey = planBoostKey;
+      nextState.lastPlanBoostNoticeHash = noticeHash;
+      nextState.lastPlanBoostPromptKey = latestPlanPromptKey;
+      stateChanged = true;
       return {
         nextState,
         injectStep: buildInjectStep({
           uiOnly,
-          systemMessage: "[agy-cmd → 计划获批，自动 Boost] For this approval turn, execute the approved implementation plan now. If still in read-only Plan Mode, use the host's approved transition to execution first. Call invoke_subagent with TypeName='DeepCoder' and Workspace='inherit'. Pass the approved plan or its path, scope, user constraints and verification criteria. For a read-only investigation plan use DeepInvestigator instead. Follow the worker to completion and independently verify the result. If the host does not provide the role, carry out the approved plan with the available tools. Do not ask the user to type /boost."
+          userMarkdown:
+            "> **[agy-cmd → 计划获批，自动 Boost]** 检测到实施计划已获批准，正在尝试直接调度 `DeepCoder` / `DeepInvestigator` 隐藏子智能体执行并验证。",
+          systemMessage:
+            '[agy-cmd → 计划获批，自动 Boost] For this approval turn, execute the approved implementation plan now. Start line 1 of your reply with "[agy-cmd → 计划获批，自动 Boost]". If still in read-only Plan Mode, use the host\'s approved transition to execution first. IMPORTANT: DeepCoder and DeepInvestigator are hidden from the <subagents> ("Available subagents") list—do NOT skip them just because they are omitted from that list. Call invoke_subagent directly with TypeName=\'DeepCoder\' (or TypeName=\'DeepInvestigator\' for a read-only investigation plan) and Workspace=\'inherit\', passing the approved plan or its path, scope, user constraints and verification criteria. Follow the worker to completion and independently verify the result. ONLY if invoke_subagent actually returns an error (e.g. role unavailable without /boost), fall back to carrying out the approved plan with the available tools/subagents and note the fallback reason. Do not ask the user to type /boost.'
         }),
         shouldResetEvents,
         reasonCode: "approved_plan_boost",

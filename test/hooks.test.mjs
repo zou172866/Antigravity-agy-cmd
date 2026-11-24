@@ -23,6 +23,7 @@ import { maybeGcStaleSessions, readEvents } from "../hooks/lib/state.mjs";
 import { isSubagentTranscript } from "../hooks/lib/transcript.mjs";
 import { runPostToolUse } from "../hooks/post-tool-use.mjs";
 import { runPreInvocation } from "../hooks/pre-invocation.mjs";
+import { runStop } from "../hooks/stop.mjs";
 import { updateSettings } from "../hooks/lib/settings.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -78,9 +79,26 @@ test("paid Boost hands an approved plan to the executor once through the desktop
     ["artifact", [artifact, request("继续")]]
   ]) {
     const result = await run(name, steps);
-    assert.match(result.injectSteps[0].systemMessage.systemMessage, /invoke_subagent.*DeepCoder.*Workspace='inherit'/);
+    const injected = result.injectSteps[0].systemMessage.systemMessage;
+    assert.match(injected, /> \*\*\[agy-cmd → 计划获批，自动 Boost\]\*\*/);
+    assert.match(injected, /Start line 1 of your reply with "\[agy-cmd → 计划获批，自动 Boost\]"/);
+    assert.match(injected, /hidden from the <subagents>/);
+    assert.match(injected, /invoke_subagent.*DeepCoder.*Workspace='inherit'/s);
+    assert.match(injected, /ONLY if invoke_subagent actually returns an error/);
     assert.deepEqual(await run(name, steps), {});
     assert.deepEqual(await run(name, steps, { invocationNum: 1 }), {});
+    // Background task wakeup increases initialNumSteps with invocationNum=0 and empty lastUserInput: must not re-fire
+    const wakeupSteps = [
+      ...steps,
+      { type: "PLANNER_RESPONSE", content: "[agy-cmd → 计划获批，自动 Boost]\n正在启动..." },
+      { type: "SYSTEM_MESSAGE", content: "[Message] sender=c/task-240 finished with result: ok" }
+    ];
+    assert.deepEqual(await run(name, wakeupSteps, { lastUserInput: "" }), {}, `${name} wakeup dedup`);
+    // A second distinct plan approval in the same session must still fire once
+    const secondPlan = [...wakeupSteps, plan, request(approval)];
+    const secondResult = await run(name, secondPlan, { lastUserInput: approval });
+    assert.equal(secondResult.injectSteps?.length, 1, `${name} second plan approval`);
+    assert.deepEqual(await run(name, [...secondPlan, { type: "PLANNER_RESPONSE", content: "ok" }], { lastUserInput: "" }), {});
   }
   for (const [name, steps] of [
     ["waiting", [plan]],
@@ -95,6 +113,210 @@ test("paid Boost hands an approved plan to the executor once through the desktop
   ]) {
     assert.deepEqual(await run(name, steps), {}, name);
   }
+});
+
+test("paid Boost edge cases: null step_index, >256KB tail rollover, unflushed approval, and Stop wakeup preservation", async (t) => {
+  const dir = makeTmpDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const env = makeEnv(dir);
+  updateSettings(dir, { planTier: "paid", boostEnabled: true, boostAfterPlanApproval: true });
+
+  const approval =
+    "Comments on artifact URI: file:///c%3A/brain/implementation_plan_v2.md\n\nThe user has approved this document.\n\n<USER_REQUEST>\n\n</USER_REQUEST>";
+  const plan = { type: "PLANNER_RESPONSE", content: "[agy-cmd → /plan 审批]\n请审阅方案。" };
+
+  // 1. Null / empty step_index with distinct approvals must NOT collide on step:0
+  const nullTx = path.join(dir, "null-idx.jsonl");
+  const nullLines = [
+    { step_index: null, type: "USER_INPUT", content: "重构模块" },
+    { step_index: null, ...plan },
+    { step_index: null, type: "USER_INPUT", content: approval }
+  ];
+  fs.writeFileSync(nullTx, nullLines.map((x) => JSON.stringify(x)).join("\n") + "\n");
+  const rNull1 = await runPreInvocation(
+    { conversationId: "null-idx", transcriptPath: nullTx, invocationNum: 0, initialNumSteps: 3, lastUserInput: approval },
+    env,
+    1000
+  );
+  assert.equal(rNull1.injectSteps?.length, 1);
+  fs.appendFileSync(
+    nullTx,
+    [plan, { step_index: null, type: "USER_INPUT", content: approval }].map((x) => JSON.stringify(x)).join("\n") + "\n"
+  );
+  const rNull2 = await runPreInvocation(
+    { conversationId: "null-idx", transcriptPath: nullTx, invocationNum: 0, initialNumSteps: 5, lastUserInput: approval },
+    env,
+    2000
+  );
+  assert.equal(rNull2.injectSteps?.length, 1);
+
+  // 2a. >256KB tail rollover without step_index/created_at: byte offset keeps second approval distinct
+  const rollTx = path.join(dir, "rollover-ord.jsonl");
+  const pad160k = "A".repeat(160 * 1024);
+  const pad140k = "B".repeat(140 * 1024);
+  fs.writeFileSync(
+    rollTx,
+    [
+      { type: "USER_INPUT", content: `首次请求 ${pad160k}` },
+      { type: "USER_INPUT", content: approval }
+    ]
+      .map((x) => JSON.stringify(x))
+      .join("\n") + "\n"
+  );
+  const rRoll1 = await runPreInvocation(
+    { conversationId: "roll-ord", transcriptPath: rollTx, invocationNum: 0, initialNumSteps: 2, lastUserInput: approval },
+    env,
+    3000
+  );
+  assert.equal(rRoll1.injectSteps?.length, 1);
+  fs.appendFileSync(
+    rollTx,
+    [
+      { type: "GENERIC", status: "DONE", content: pad140k },
+      plan,
+      { type: "USER_INPUT", content: approval }
+    ]
+      .map((x) => JSON.stringify(x))
+      .join("\n") + "\n"
+  );
+  const rRoll2 = await runPreInvocation(
+    { conversationId: "roll-ord", transcriptPath: rollTx, invocationNum: 0, initialNumSteps: 5, lastUserInput: approval },
+    env,
+    4000
+  );
+  assert.equal(rRoll2.injectSteps?.length, 1);
+
+  // 2b. >256KB output pushing USER_INPUT & PLANNER_RESPONSE out of tail while payload.lastUserInput keeps approval: wakeup must NOT re-fire
+  const bigOutTx = path.join(dir, "rollover-wakeup.jsonl");
+  fs.writeFileSync(
+    bigOutTx,
+    [
+      { step_index: 0, type: "USER_INPUT", content: "帮我重构" },
+      { step_index: 1, ...plan },
+      { step_index: 2, type: "USER_INPUT", content: approval }
+    ]
+      .map((x) => JSON.stringify(x))
+      .join("\n") + "\n"
+  );
+  const rBig1 = await runPreInvocation(
+    { conversationId: "roll-wake", transcriptPath: bigOutTx, invocationNum: 0, initialNumSteps: 3, lastUserInput: approval },
+    env,
+    5000
+  );
+  assert.equal(rBig1.injectSteps?.length, 1);
+  fs.appendFileSync(
+    bigOutTx,
+    [
+      { step_index: 3, type: "PLANNER_RESPONSE", content: "[agy-cmd → 计划获批，自动 Boost]" },
+      { step_index: 4, type: "GENERIC", status: "DONE", content: "C".repeat(270 * 1024) }
+    ]
+      .map((x) => JSON.stringify(x))
+      .join("\n") + "\n"
+  );
+  const rBigWake = await runPreInvocation(
+    { conversationId: "roll-wake", transcriptPath: bigOutTx, invocationNum: 0, initialNumSteps: 5, lastUserInput: approval },
+    env,
+    6000
+  );
+  assert.deepEqual(rBigWake, {});
+
+  // 3. Delayed transcript flush on clickedApproval: fires once before USER_INPUT flush, stays suppressed on later wakeup
+  const flushTx = path.join(dir, "delayed-flush.jsonl");
+  fs.writeFileSync(
+    flushTx,
+    [
+      { step_index: 0, type: "USER_INPUT", content: "帮我重构" },
+      { step_index: 1, ...plan }
+    ]
+      .map((x) => JSON.stringify(x))
+      .join("\n") + "\n"
+  );
+  const rFlush1 = await runPreInvocation(
+    { conversationId: "flush-1", transcriptPath: flushTx, invocationNum: 0, initialNumSteps: 2, lastUserInput: approval },
+    env,
+    7000
+  );
+  assert.equal(rFlush1.injectSteps?.length, 1);
+  fs.appendFileSync(
+    flushTx,
+    [
+      { step_index: 2, type: "USER_INPUT", content: approval },
+      { step_index: 3, type: "PLANNER_RESPONSE", content: "[agy-cmd → 计划获批，自动 Boost]" },
+      { step_index: 4, type: "SYSTEM_MESSAGE", content: "[Message] sender=flush-1/task-4 finished with result: ok" }
+    ]
+      .map((x) => JSON.stringify(x))
+      .join("\n") + "\n"
+  );
+  assert.deepEqual(
+    await runPreInvocation(
+      { conversationId: "flush-1", transcriptPath: flushTx, invocationNum: 1, initialNumSteps: 2, lastUserInput: approval },
+      env,
+      7100
+    ),
+    {}
+  );
+  assert.deepEqual(
+    await runPreInvocation(
+      { conversationId: "flush-1", transcriptPath: flushTx, invocationNum: 0, initialNumSteps: 5, lastUserInput: "" },
+      env,
+      7200
+    ),
+    {}
+  );
+
+  // 4. Wakeup after pre-wakeup edit + test failure must NOT wipe Stop's turnFloorTs
+  const stopTx = path.join(dir, "stop-wakeup.jsonl");
+  fs.writeFileSync(
+    stopTx,
+    [
+      { step_index: 0, type: "USER_INPUT", content: "帮我重构" },
+      { step_index: 1, ...plan },
+      { step_index: 2, type: "USER_INPUT", content: approval }
+    ]
+      .map((x) => JSON.stringify(x))
+      .join("\n") + "\n"
+  );
+  const rStopEntry = await runPreInvocation(
+    { conversationId: "stop-wake", transcriptPath: stopTx, invocationNum: 0, initialNumSteps: 3, lastUserInput: approval },
+    env,
+    10000
+  );
+  assert.equal(rStopEntry.injectSteps?.length, 1);
+  await runPostToolUse(
+    { conversationId: "stop-wake", transcriptPath: stopTx, stepIdx: 4, toolCall: { name: "edit_file", args: { Path: "src/a.js" } } },
+    env,
+    10500
+  );
+  await runPostToolUse(
+    { conversationId: "stop-wake", transcriptPath: stopTx, stepIdx: 5, toolCall: { name: "run_command", args: { CommandLine: "npm test" } }, error: "exit status 1" },
+    env,
+    10600
+  );
+  fs.appendFileSync(
+    stopTx,
+    [
+      { step_index: 3, type: "PLANNER_RESPONSE", content: "[agy-cmd → 计划获批，自动 Boost]" },
+      { step_index: 4, type: "GENERIC", status: "DONE", content: "ok" },
+      { step_index: 5, type: "GENERIC", status: "ERROR", error: "exit status 1", content: "Command exited with code 1." },
+      { step_index: 6, type: "SYSTEM_MESSAGE", content: "[Message] sender=stop-wake/task-5 finished with result:\nCommand exited with code 1." }
+    ]
+      .map((x) => JSON.stringify(x))
+      .join("\n") + "\n"
+  );
+  assert.deepEqual(
+    await runPreInvocation(
+      { conversationId: "stop-wake", transcriptPath: stopTx, invocationNum: 0, initialNumSteps: 7, lastUserInput: "" },
+      env,
+      30000
+    ),
+    {}
+  );
+  const stopDecision = await runStop(
+    { conversationId: "stop-wake", transcriptPath: stopTx, terminationReason: "NO_TOOL_CALL", executionNum: 0, fullyIdle: true },
+    env,
+    31000
+  );
+  assert.equal(stopDecision.decision, "continue");
 });
 
 test("common: extractActiveSlashCommands detects prefix/suffix/quoted commands and ignores URLs/paths", () => {
