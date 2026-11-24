@@ -4,7 +4,7 @@
 
 # agy-cmd
 
-**Google Antigravity plugin: auto-route commands · Stop-hook auto-retry · multi-agent Boost on plan approval · fresh-perspective stuck recovery · anti-bypass plan guard**
+**Google Antigravity plugin: auto-route commands · Stop-hook auto-retry · auto multi-agent dispatch · fresh-perspective stuck recovery · anti-bypass plan guard**
 
 [简体中文](README.zh-CN.md) · English · [How to Install](#how-to-install) · [Features](#features) · [CLI Management](#cli-management)
 
@@ -20,7 +20,7 @@ Once installed, it runs automatically in the background during every chat to han
 
 - **Auto-route built-in workflows by task**: matches `/grill-me`, `/plan`, `/run-workflow`, and related workflows based on scope;
 - **Stop-hook auto-retry guard**: keeps the agent investigating and fixing when tests or build checks fail instead of stopping early;
-- **Auto-dispatch multi-agent execution on plan approval**: with Pro / Ultra Boost enabled, approving a plan automatically launches `DeepCoder` / `DeepInvestigator` to execute and verify;
+- **Auto-dispatch multi-agent execution on plan approval**: with Pro / Ultra Boost enabled, approving a plan automatically launches `DeepCoder` / `DeepInvestigator` to execute and verify; automatically selects the right multi-agent mode for the task while keeping simple tasks in the main conversation.
 - **Fresh-perspective stuck recovery (all tiers)**: when repeated fixes fail, gives one available investigator a read-only diagnosis task. The main agent checks the proposed fix.
 - **Anti-bypass read-only plan guard**: when read-only Plan Mode blocks writing the plan file, forces an inline plan in chat and blocks `exit_plan_mode` so the agent cannot bypass approval and silently edit code;
 - **Live right-hand Sidecar control panel**: lets you toggle retry limits, trigger scope, and free-tier protection anytime (shielding free accounts from paid-only command errors by default).
