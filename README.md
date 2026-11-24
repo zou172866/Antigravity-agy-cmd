@@ -20,6 +20,8 @@ Once installed, it runs automatically in the background during every chat to han
 
 ## How to Install
 
+For the packaged stable version, download the ZIP from [GitHub Releases](https://github.com/zou172866/Antigravity-agy-cmd/releases/latest), extract it, and run `.\install.ps1` on Windows or `sh ./install.sh` on macOS or Linux.
+
 Requires **Google Antigravity Desktop**, **Node.js (>= 20)**, and **Python 3**.
 
 Run the one-line installer for your OS, then restart or reload your Antigravity window.

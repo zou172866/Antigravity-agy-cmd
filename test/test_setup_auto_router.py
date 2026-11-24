@@ -46,7 +46,10 @@ class TestPluginManifestsAndSync(unittest.TestCase):
     def test_plugin_json_hooks_json_and_sidecar_schema(self) -> None:
         plugin_meta = json.loads(PLUGIN_JSON_PATH.read_text(encoding="utf-8"))
         self.assertEqual(plugin_meta["name"], "agy-cmd")
-        self.assertEqual(plugin_meta["version"], "2.1.1")
+        package = json.loads((PLUGIN_ROOT / "package.json").read_text(encoding="utf-8"))
+        self.assertEqual(plugin_meta["version"], package["version"])
+        panel = (PLUGIN_ROOT / "sidecars/panel/index.html").read_text(encoding="utf-8")
+        self.assertIn(f'<span class="ver-pill">v{package["version"]}</span>', panel)
         self.assertTrue((PLUGIN_ROOT / plugin_meta["logo"]).is_file())
 
         hooks = json.loads(HOOKS_JSON_PATH.read_text(encoding="utf-8"))

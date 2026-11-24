@@ -20,6 +20,8 @@
 
 ## 怎么安装 agy-cmd？
 
+要安装打包好的稳定版，请从 [GitHub Releases](https://github.com/zou172866/Antigravity-agy-cmd/releases/latest) 下载 ZIP 并解压。在解压目录中，Windows 运行 `.\install.ps1`，macOS 或 Linux 运行 `sh ./install.sh`。
+
 需要电脑已安装 Google Antigravity 桌面版、Node.js（20 及以上版本）和 Python 3。
 
 打开终端，复制对应系统的一行命令运行，完成后重启或刷新 Antigravity 窗口即可使用。
