@@ -1068,7 +1068,7 @@ export function evaluatePreInvocation(payload, events = [], prevStateInput = nul
   }
 
   const paidBoostActive = effSettings.planTier === "paid" && effSettings.boostEnabled === true;
-  if (paidBoostActive && isNewUserTurn && activeSlash.size === 0) {
+  if (paidBoostActive && effSettings.boostAfterPlanApproval && isNewUserTurn && activeSlash.size === 0) {
     const sameInput = inputEnvelope === latestTranscriptInput || inputEnvelope === unwrapUserRequestText(latestTranscriptInput);
     const clickedApproval = isPlanApprovalNotice(inputEnvelope) || (sameInput && isPlanApprovalNotice(latestTranscriptInput));
     const confirmedInChat = confirmsPlan(rawLastUserInput);

@@ -64,6 +64,14 @@ test("paid Boost hands an approved plan to the executor once through the desktop
   updateSettings(dir, { planTier: "paid", boostEnabled: false });
   assert.deepEqual(await run("disabled", [request(approval)]), {});
   updateSettings(dir, { boostEnabled: true });
+  updateSettings(dir, { boostAfterPlanApproval: false });
+  assert.deepEqual(await run("plan-boost-off", [request(approval)]), {});
+  assert.deepEqual(await run("plan-boost-chat-off", [plan, request("按计划执行")]), {});
+  updateSettings(dir, { planTier: "free" });
+  const paidAgain = updateSettings(dir, { planTier: "paid" });
+  assert.equal(paidAgain.boostEnabled, true);
+  assert.equal(paidAgain.boostAfterPlanApproval, false);
+  updateSettings(dir, { boostAfterPlanApproval: true });
   for (const [name, steps] of [
     ["button", [request(approval)]],
     ["inline", [plan, request("按计划执行")]],

@@ -402,6 +402,29 @@
       cursor: pointer;
     }
 
+    input[role="switch"] {
+      appearance: none;
+      flex: none;
+      align-self: center;
+      width: 32px;
+      height: 18px;
+      margin: 0;
+      border: 1px solid var(--border-strong);
+      border-radius: 12px;
+      background: var(--bg-card);
+    }
+    input[role="switch"]::before {
+      content: "";
+      display: block;
+      width: 12px;
+      height: 12px;
+      margin: 2px;
+      border-radius: 50%;
+      background: var(--text-secondary);
+    }
+    input[role="switch"]:checked { background: var(--accent); }
+    input[role="switch"]:checked::before { transform: translateX(14px); background: white; }
+
     .free-lock-note {
       font-size: 12px;
       padding: 8px 10px;
@@ -609,9 +632,17 @@
         <label class="toggle-row" id="row-boost">
           <div class="row-text">
             <b>开启 <code>/boost</code> 自动接入</b>
-            <small id="boost-sub">批准实施计划后自动用 Boost 执行；连续失败时提供攻坚口令</small>
+            <small id="boost-sub">允许插件使用会员 Boost，并在连续失败时提供攻坚口令</small>
           </div>
           <input id="chk-boost" type="checkbox">
+        </label>
+
+        <label class="toggle-row">
+          <div class="row-text">
+            <b id="plan-boost-label">计划获批后自动使用 Boost</b>
+            <small id="plan-boost-help">默认开启。会员 Boost 接入开启时，点「批准」或回复「按计划执行」即可触发。</small>
+          </div>
+          <input id="chk-plan-boost" type="checkbox" role="switch" aria-labelledby="plan-boost-label" aria-describedby="plan-boost-help" checked>
         </label>
 
         <label class="toggle-row">
@@ -733,6 +764,7 @@
       const scopeAll = $("scope-all");
       const freeNote = $("free-note");
       const chkBoost = $("chk-boost");
+      const chkPlanBoost = $("chk-plan-boost");
       const boostSub = $("boost-sub");
       const chkFreeFb = $("chk-free-fb");
       const chkPlanFb = $("chk-plan-fb");
@@ -958,7 +990,8 @@
         chkBoost.disabled = isFree;
         boostSub.textContent = isFree
           ? "需先切换上方为「Pro / Ultra 会员」才可开启，防止免费号触发报错"
-          : "批准实施计划后自动用 Boost 执行；连续失败时提供攻坚口令";
+          : "允许插件使用会员 Boost，并在连续失败时提供攻坚口令";
+        chkPlanBoost.checked = s.boostAfterPlanApproval !== false;
 
         chkFreeFb.checked = Boolean(s.freeFallbackEnabled);
         chkPlanFb.checked = Boolean(s.planFallbackEnabled);
@@ -1026,6 +1059,10 @@
 
       chkBoost.addEventListener("change", () => {
         savePatch({ boostEnabled: chkBoost.checked });
+      });
+
+      chkPlanBoost.addEventListener("change", () => {
+        savePatch({ boostAfterPlanApproval: chkPlanBoost.checked });
       });
 
       chkFreeFb.addEventListener("change", () => {

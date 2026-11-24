@@ -297,6 +297,7 @@ def default_settings() -> dict:
         "version": 2,
         "planTier": "free",
         "boostEnabled": False,
+        "boostAfterPlanApproval": True,
         "autoRetryMode": "count",
         "autoRetryMax": DEFAULT_RETRY_MAX,
         "autoRetryScope": "smart",

@@ -52,6 +52,7 @@ export function createDefaultSettings() {
     // Default strictly to Free-Tier Safe Mode so non-subscribers never hit /boost errors.
     planTier: "free",
     boostEnabled: false,
+    boostAfterPlanApproval: true,
     autoRetryMode: "count",
     autoRetryMax: DEFAULT_RETRY_MAX,
     autoRetryScope: "smart",
@@ -272,6 +273,8 @@ export function normalizeSettings(raw = {}) {
     version: SETTINGS_VERSION,
     planTier,
     boostEnabled,
+    boostAfterPlanApproval: typeof src.boostAfterPlanApproval === "boolean"
+      ? src.boostAfterPlanApproval : def.boostAfterPlanApproval,
     autoRetryMode,
     autoRetryMax,
     autoRetryScope,
@@ -413,6 +416,15 @@ export function updateSettings(stateDir, patch = {}, options = {}) {
         throw err;
       }
       next.autoRetryScope = patch.autoRetryScope;
+    }
+
+    if ("boostAfterPlanApproval" in patch) {
+      if (typeof patch.boostAfterPlanApproval !== "boolean") {
+        const err = new Error("boostAfterPlanApproval must be a boolean");
+        err.statusCode = 400;
+        throw err;
+      }
+      next.boostAfterPlanApproval = patch.boostAfterPlanApproval;
     }
 
     if ("freeFallbackEnabled" in patch) {

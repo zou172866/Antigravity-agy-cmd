@@ -518,6 +518,7 @@ test("Sidecar HTTP server: serves UI, persists settings, blocks CSRF/cross-origi
     const stData = await stRes.json();
     assert.equal(stData.settings.planTier, "free");
     assert.equal(stData.settings.boostEnabled, false);
+    assert.equal(stData.settings.boostAfterPlanApproval, true);
     assert.equal(stData.settings.configuredByUser, false);
 
     // 4. Invalid autoRetryMax rejected with 400
@@ -532,13 +533,14 @@ test("Sidecar HTTP server: serves UI, persists settings, blocks CSRF/cross-origi
     const updRes = await fetch(`${base}/api/settings`, {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-Agy-Cmd-Csrf": csrf },
-      body: JSON.stringify({ autoRetryMode: "off", planTier: "paid" })
+      body: JSON.stringify({ autoRetryMode: "off", planTier: "paid", boostAfterPlanApproval: false })
     });
     assert.equal(updRes.status, 200);
     const updData = await updRes.json();
     assert.equal(updData.settings.autoRetryMode, "off");
     assert.equal(updData.settings.planTier, "paid");
     assert.equal(updData.settings.boostEnabled, true);
+    assert.equal(updData.settings.boostAfterPlanApproval, false);
     assert.equal(updData.settings.configuredByUser, true);
 
     // Hook immediately sees autoRetryMode="off" -> suggests /goal instead of arming auto-retry
