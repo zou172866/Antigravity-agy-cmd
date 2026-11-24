@@ -20,7 +20,7 @@ Once installed, it runs automatically in the background during every chat to han
 
 - **Auto-route built-in workflows by task**: matches `/grill-me`, `/plan`, `/run-workflow`, and related workflows based on scope;
 - **Stop-hook auto-retry guard**: keeps the agent investigating and fixing when tests or build checks fail instead of stopping early;
-- **Auto-dispatch multi-agent execution on plan approval**: with Pro / Ultra Boost enabled, approving a plan automatically launches `DeepCoder` / `DeepInvestigator` to execute and verify;
+- **Auto-dispatch Boost on approved plans and hard debugging**: with Pro / Ultra Boost enabled, approving a plan, asking to investigate or fix hard bugs (such as deadlocks, race conditions, or memory leaks), or hitting repeated failures automatically launches `DeepCoder` / `DeepInvestigator` to investigate, execute, and verify;
 - **Auto multi-agent dispatch**: automatically selects the right multi-agent mode for the task while keeping simple tasks in the main conversation.
 - **Fresh-perspective stuck recovery (all tiers)**: when repeated fixes fail, gives one available investigator a read-only diagnosis task. The main agent checks the proposed fix.
 - **Anti-bypass read-only plan guard**: when read-only Plan Mode blocks writing the plan file, forces an inline plan in chat and blocks `exit_plan_mode` so the agent cannot bypass approval and silently edit code;
@@ -67,7 +67,7 @@ To prevent free accounts from hitting errors on paid-only commands, `agy-cmd` sh
 After installing, open the right-hand **agy-cmd Auto-Router** Sidecar panel (or click `sidecar://agy-cmd/panel/` in chat) and confirm:
 
 1. **Auto-retry limit**: choose **Off (0)**, **Fixed count (1–50)**, or **Unlimited**.
-2. **Account tier**: if you subscribe to **Google AI Pro / Ultra**, switch to **Pro / Ultra** to enable Boost. The panel’s **Use Boost after plan approval** switch is on by default. When you click **Approve** or reply “implement the plan”, `agy-cmd` outputs `[agy-cmd → 计划获批，自动 Boost]` and directly dispatches Antigravity’s hidden `DeepCoder` / `DeepInvestigator` Boost subagents once without requiring manual `/boost` input (falling back to standard tools only if invocation fails), with deduplication across background-task wakeups. Turn off this switch to keep only `/boost` reminders for stuck tasks.
+2. **Account tier**: if you subscribe to **Google AI Pro / Ultra**, switch to **Pro / Ultra** to enable Boost. The panel’s **Use Boost after plan approval** switch is on by default. When you click **Approve** or reply “implement the plan”, `agy-cmd` outputs `[agy-cmd → 计划获批，自动 Boost]` and directly dispatches Antigravity’s hidden `DeepCoder` / `DeepInvestigator` Boost subagents once without requiring manual `/boost` input (falling back to standard tools only if invocation fails), with deduplication across background-task wakeups. Turn off this switch to keep automatic Boost dispatch only for hard debugging requests (such as deadlocks, race conditions, or memory leaks) and repeated failures.
 
 ## Features
 
@@ -106,7 +106,7 @@ Prevents free accounts from triggering paid-only errors and stops blind retry lo
 
 - **Plan and quota**. Google offers `/boost` and `/teamwork` on paid plans. The App offers `/swarm` and `/run-workflow` on all plans. The plugin skips automatic use of the latter two in free mode to conserve weekly quota. You can explicitly request either for the current task in a supported App session. In the IDE or when availability is unknown, automatic routing stays in the main session. [Boost and plan comparison](https://antigravity.google/docs/boost/) · [Dynamic Workflows](https://antigravity.google/docs/dynamic-workflows/)
 - **Optional independent review**. In free mode you can enable a review after plan implementation in the Sidecar. The main agent edits and runs checks, then hands the changed paths, relevant diff and evidence to one `cmd-verifier` with file-reading access. The option defaults to off. If the role is unavailable, the main agent reports that the independent review was skipped.
-- **Stuck-loop recovery**: after 3 consecutive command failures or 2 identical edit-fail cycles, the plugin instructs the agent to pause blind edits and switch to independent root-cause diagnosis.
+- **Hard-task & stuck-loop recovery**: on free plans (or with Boost off), 3 consecutive command failures or 2 identical edit-fail cycles pause blind edits and switch to read-only root-cause diagnosis; with paid Boost enabled, explicit hard debugging requests or repeated failures automatically dispatch `DeepInvestigator` / `DeepCoder` while the main session verifies the result.
 
 The [routing research](docs/research/multi-agent-routing-best-practices.md) and [free-tier design proposal](docs/proposals/free-tier-v2.3.md) explain the choices. The hooks and installer have been tested locally. Dispatching the reviewer on a live free account in the App and IDE still needs verification.
 

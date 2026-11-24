@@ -20,7 +20,7 @@
 
 - **按不同任务自动路由指令**：根据任务范围自动匹配 `/grill-me`、`/plan`、`/run-workflow` 等内置能力；
 - **测试未过自动续跑**：在测试或验证还没通过时让 AI 接着排查修复，不提前停工；
-- **确认计划实施自动调用多智能体**：会员开启 Boost 后，批准方案或回复“按计划执行”即自动调度 `DeepCoder` / `DeepInvestigator` 执行与验收；
+- **计划获批与疑难排查自动调用 Boost**：会员开启 Boost 后，批准方案、明确要求排查或修复竞态/死锁等疑难问题，或多次修复仍失败时，自动调度 `DeepCoder` / `DeepInvestigator` 排查、执行与验收；
 - **自动调用多智能体**：会根据任务自动调用合适的多智能体模式，简单任务由主会话直接完成。
 - **卡壳时自动换视角排查（全套餐可用）**：反复修错未果时，将只读诊断任务交给一个可用的调查角色，由主 Agent 验证修复结果。
 - **只读模式防绕过审批**：在只读模式拒绝写方案文件时，强制正文直接输出方案等你确认，严禁自动跳过审批偷偷改代码；
@@ -67,7 +67,7 @@ python ~/.agents/skills/agy-cmd/scripts/setup_auto_router.py --install --standal
 安装完成后，请打开软件右侧边栏的「agy-cmd 自动路由」面板（也可以在聊天框点击 `sidecar://agy-cmd/panel/` 打开），确认两项设置：
 
 1. **自动重试次数**：选择「不用重试（0 次）」「指定次数（1～50 次）」或「一直重试」。
-2. **账号档位**：如果你开通了 Google AI Pro / Ultra 会员，可以切换到「Pro / Ultra 会员」，开启 Boost 自动接入。「计划获批后自动使用 Boost」默认开启。点击「批准」或在方案后回复“按计划执行”，插件会提示 `[agy-cmd → 计划获批，自动 Boost]` 并直接调度隐藏的 `DeepCoder` / `DeepInvestigator` 子智能体执行与验证，无需手动输入 `/boost`（仅在调用报错时才回退为普通工具执行），且后台任务唤醒不会重复触发。你可以单独关闭这个开关，保留卡壳时的 Boost 提醒。
+2. **账号档位**：如果你开通了 Google AI Pro / Ultra 会员，可以切换到「Pro / Ultra 会员」，开启 Boost 自动接入。「计划获批后自动使用 Boost」默认开启。点击「批准」或在方案后回复“按计划执行”，插件会提示 `[agy-cmd → 计划获批，自动 Boost]` 并直接调度隐藏的 `DeepCoder` / `DeepInvestigator` 子智能体执行与验证，无需手动输入 `/boost`（仅在调用报错时才回退为普通工具执行），且后台任务唤醒不会重复触发。你可以单独关闭这个开关，仅保留排查竞态、死锁等疑难任务或多次修复仍失败时的自动 Boost 派工。
 
 ## agy-cmd 有哪些功能？
 
@@ -106,7 +106,7 @@ python ~/.agents/skills/agy-cmd/scripts/setup_auto_router.py --install --standal
 
 - **套餐与配额**。Google 将 `/boost`、`/teamwork` 列为付费功能。App 的 `/swarm`、`/run-workflow` 对所有套餐开放。插件在免费模式下默认顺序执行以节省周配额，用户可以在支持的 App 会话里明确要求本次使用后两项。在 IDE 或宿主能力未知时，自动路由留在主会话。[官方套餐对照](https://antigravity.google/docs/boost/) · [工作流说明](https://antigravity.google/docs/dynamic-workflows/)
 - **可选独立复核**。免费用户可在侧栏打开计划实施后的独立复核，默认关闭。主 Agent 负责改代码、跑验证，再把本次改动路径、关键 diff 和验证证据交给一位仅可读文件的 `cmd-verifier`。宿主未提供该角色时，主 Agent 会说明独立复核未完成。
-- **卡壳换思路**：当命令连续失败 3 次，或者连改两次还是报同一个错时，插件会让 AI 先停下反复试错，重新检查报错原因后再给出办法。
+- **疑难排查与卡壳换思路**：免费版或关闭 Boost 时，命令连续失败 3 次或连改两次仍报同一个错，插件会让 AI 停下反复试错，改为只读排查原因；会员开启 Boost 后，遇到明确的疑难排查或反复失败会自动调度 `DeepInvestigator` / `DeepCoder` 介入，由主会话核对结果。
 
 Hook 和安装流程已通过本地测试，真实免费账号在 App 和 IDE 中调度复核角色仍待验证。[多智能体路由调研](docs/research/multi-agent-routing-best-practices.md) · [免费档设计提案](docs/proposals/free-tier-v2.3.md)
 

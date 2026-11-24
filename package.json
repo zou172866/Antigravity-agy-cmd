@@ -3,7 +3,7 @@
   "version": "2.3.0",
   "private": true,
   "type": "module",
-  "description": "Antigravity desktop/IDE auto-router plugin with Stop auto-retry guard, tier-safe defaults, and right-hand Sidecar control panel.",
+  "description": "Google Antigravity Desktop/IDE plugin: task-based command and multi-agent routing, auto Boost for approved plans and hard debugging, read-only stuck recovery, anti-bypass plan guard, Stop-hook auto-retry, and right-hand panel.",
   "homepage": "https://github.com/zou172866/Antigravity-agy-cmd#readme",
   "repository": {
     "type": "git",
