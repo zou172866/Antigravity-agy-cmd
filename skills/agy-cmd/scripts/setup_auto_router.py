@@ -657,7 +657,7 @@ def sync_plugin_bundle_if_needed(target_plugin_dir: Path) -> bool:
 
     ignore_fn = shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo")
     target_plugin_dir.mkdir(parents=True, exist_ok=True)
-    for item_name in ("plugin.json", "hooks.json", "package.json", "README.md", "install.ps1", "install.sh"):
+    for item_name in ("plugin.json", "hooks.json", "package.json", "README.md", "README.zh-CN.md", "install.ps1", "install.sh"):
         src_file = source_root / item_name
         if src_file.is_file():
             shutil.copy2(src_file, target_plugin_dir / item_name)
