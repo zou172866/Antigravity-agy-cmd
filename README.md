@@ -1,12 +1,14 @@
 <div align="center">
 
+[简体中文](README.zh-CN.md) · **English**
+
 <img src="assets/logo.svg" alt="agy-cmd logo" width="80" />
 
 # agy-cmd
 
 **Google Antigravity plugin: auto-route commands · Stop-hook auto-retry · auto multi-agent dispatch · fresh-perspective stuck recovery · anti-bypass plan guard**
 
-[简体中文](README.zh-CN.md) · English · [How to Install](#how-to-install) · [Features](#features) · [CLI Management](#cli-management)
+[How to Install](#how-to-install) · [Features](#features) · [CLI Management](#cli-management)
 
 </div>
 

@@ -1,12 +1,14 @@
 <div align="center">
 
+**简体中文** · [English](README.md)
+
 <img src="assets/logo.svg" alt="agy-cmd logo" width="80" />
 
 # agy-cmd
 
 **Google Antigravity 桌面端插件：按任务自动路由指令 · 测试未过自动续跑 · 自动调用多智能体 · 卡壳时自动换视角排查 · 防止偷偷改代码**
 
-简体中文 · [English](README.md) · [怎么安装](#怎么安装-agy-cmd) · [核心功能](#agy-cmd-有哪些功能) · [命令行管理](#怎么用命令行管理)
+[怎么安装](#怎么安装-agy-cmd) · [核心功能](#agy-cmd-有哪些功能) · [命令行管理](#怎么用命令行管理)
 
 </div>
 
