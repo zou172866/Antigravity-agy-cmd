@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import vm from "node:vm";
 
 import {
   createDefaultSettings,
@@ -14,7 +15,8 @@ import { runPostToolUse } from "../hooks/post-tool-use.mjs";
 import { runPreInvocation } from "../hooks/pre-invocation.mjs";
 import { runSessionStart } from "../hooks/session-start.mjs";
 import { runStop } from "../hooks/stop.mjs";
-import { createStandaloneServer } from "../sidecars/panel/server.mjs";
+import { dispatchPanelApi } from "../sidecars/panel/api-handler.mjs";
+import { createStandaloneServer, renderPanelHtml } from "../sidecars/panel/server.mjs";
 
 function makeTmpDir(prefix = "agy-cmd-v21-") {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -43,6 +45,8 @@ test("defaults: strictly starts in Free-Tier Safe Mode (boostEnabled=false) with
   assert.equal(s.autoRetryMode, "count");
   assert.equal(s.autoRetryMax, 3);
   assert.equal(s.autoRetryScope, "smart");
+  assert.equal(s.deliveryTestGateEnabled, false);
+  assert.equal(s.deliveryTestCommand, "");
   assert.equal(s.configuredByUser, false);
   assert.equal(s.onboardingShown, false);
 
@@ -492,6 +496,10 @@ test("Sidecar HTTP server: serves UI, persists settings, blocks CSRF/cross-origi
     assert.ok(html.includes(csrf));
     assert.ok(html.includes("安装后首次确认提醒"));
     assert.ok(html.includes('id="chk-free-plan-review"'));
+    assert.ok(html.includes('id="chk-delivery-gate"'));
+    assert.ok(html.includes('id="inp-delivery-cmd"'));
+    assert.ok(html.includes('id="btn-save-delivery-cmd"'));
+    assert.ok(html.includes('id="btn-clear-delivery-cmd"'));
 
     // 2. Security: GET /api/state -> 405; missing CSRF -> 401; cross-site -> 403
     const getApi = await fetch(`${base}/api/state`);
@@ -527,6 +535,9 @@ test("Sidecar HTTP server: serves UI, persists settings, blocks CSRF/cross-origi
     assert.equal(stData.settings.boostEnabled, false);
     assert.equal(stData.settings.boostAfterPlanApproval, false);
     assert.equal(stData.settings.freePlanReviewEnabled, false);
+    assert.equal(stData.settings.deliveryTestGateEnabled, false);
+    assert.equal(stData.settings.deliveryTestCommand, "");
+    assert.match(stData.deliveryGateStatusZh, /交付测试门禁：关闭/);
     assert.equal(stData.settings.configuredByUser, false);
 
     const reviewPatch = (value) => fetch(`${base}/api/settings`, {
@@ -549,6 +560,37 @@ test("Sidecar HTTP server: serves UI, persists settings, blocks CSRF/cross-origi
       body: JSON.stringify({ autoRetryMax: 999 })
     });
     assert.equal(badPatch.status, 400);
+
+    // 4b. Delivery test gate validation & persistence (independent of tier/boost, preserves custom command on toggle off)
+    const gatePost = (patch) =>
+      fetch(`${base}/api/settings`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Agy-Cmd-Csrf": csrf },
+        body: JSON.stringify(patch)
+      });
+    assert.equal((await gatePost({ deliveryTestGateEnabled: "yes" })).status, 400);
+    assert.equal((await gatePost({ deliveryTestCommand: "npm test\necho hi" })).status, 400);
+    assert.equal((await gatePost({ deliveryTestCommand: "a".repeat(241) })).status, 400);
+    assert.equal((await gatePost({ deliveryTestCommand: 123 })).status, 400);
+
+    const gateOnRes = await gatePost({
+      deliveryTestGateEnabled: true,
+      deliveryTestCommand: "  npm run typecheck  &&  npm test  "
+    });
+    assert.equal(gateOnRes.status, 200);
+    const gateOnData = await gateOnRes.json();
+    assert.equal(gateOnData.settings.deliveryTestGateEnabled, true);
+    assert.equal(gateOnData.settings.deliveryTestCommand, "npm run typecheck && npm test");
+    assert.equal(gateOnData.settings.planTier, "free");
+    assert.equal(gateOnData.settings.boostEnabled, false);
+    assert.match(gateOnData.deliveryGateStatusZh, /自定义命令：npm run typecheck && npm test/);
+
+    const gateOffRes = await gatePost({ deliveryTestGateEnabled: false });
+    assert.equal(gateOffRes.status, 200);
+    const gateOffData = await gateOffRes.json();
+    assert.equal(gateOffData.settings.deliveryTestGateEnabled, false);
+    assert.equal(gateOffData.settings.deliveryTestCommand, "npm run typecheck && npm test");
+    assert.equal(readSettings(dir).deliveryTestCommand, "npm run typecheck && npm test");
 
     // 5. Update via Sidecar UI -> sets autoRetryMode="off", planTier="paid" -> immediately read by hooks!
     const updRes = await fetch(`${base}/api/settings`, {
@@ -577,4 +619,130 @@ test("Sidecar HTTP server: serves UI, persists settings, blocks CSRF/cross-origi
   } finally {
     await new Promise((resolve) => server.close(resolve));
   }
+});
+
+test("Sidecar UI index.html: Delivery Test Gate toggle, custom command save/clear, dirty-input poll protection, and off-retry warning", async () => {
+  const dir = makeTmpDir("agy-cmd-gate-ui-");
+  const htmlSource = renderPanelHtml("vm-csrf");
+  const scriptBlocks = [...htmlSource.matchAll(/<script>([\s\S]*?)<\/script>/gi)];
+  const mainScript = scriptBlocks[scriptBlocks.length - 1][1];
+
+  const elements = new Map();
+  const makeEl = (id) => {
+    const listeners = new Map();
+    return {
+      id,
+      hidden: id === "delivery-gate-box" || id === "btn-clear-delivery-cmd" || id === "delivery-off-warn",
+      value: id === "inp-max" ? "3" : "",
+      checked: false,
+      disabled: false,
+      textContent: "",
+      style: { getPropertyValue: () => "" },
+      dataset: {},
+      classList: {
+        _s: new Set(),
+        add(c) { this._s.add(c); },
+        remove(c) { this._s.delete(c); },
+        toggle(c, force) {
+          const on = force === undefined ? !this._s.has(c) : Boolean(force);
+          if (on) this._s.add(c);
+          else this._s.delete(c);
+          return on;
+        },
+        contains(c) { return this._s.has(c); }
+      },
+      setAttribute() {},
+      addEventListener(type, fn) {
+        if (!listeners.has(type)) listeners.set(type, []);
+        listeners.get(type).push(fn);
+      },
+      async trigger(type, ev = { preventDefault() {} }) {
+        for (const fn of listeners.get(type) || []) {
+          await fn(ev);
+        }
+      }
+    };
+  };
+  const getEl = (id) => {
+    if (!elements.has(id)) elements.set(id, makeEl(id));
+    return elements.get(id);
+  };
+
+  let pollCb = null;
+  const ctx = {
+    document: {
+      hidden: false,
+      activeElement: null,
+      documentElement: { style: { getPropertyValue: () => "" }, setAttribute() {} },
+      getElementById: getEl,
+      querySelectorAll: () => []
+    },
+    window: {
+      addEventListener() {},
+      fetch: async (urlPath, opts = {}) => {
+        const out = dispatchPanelApi(urlPath, JSON.parse(opts.body || "{}"), { stateDir: dir });
+        return { ok: out.status >= 200 && out.status < 300, status: out.status, json: async () => structuredClone(out.body) };
+      }
+    },
+    navigator: {},
+    requestAnimationFrame: (fn) => fn(),
+    setTimeout: () => 1,
+    clearTimeout() {},
+    setInterval: (fn) => {
+      pollCb = fn;
+      return 1;
+    }
+  };
+  ctx.window.window = ctx.window;
+  vm.runInNewContext(mainScript, ctx);
+  await new Promise((r) => setTimeout(r, 15));
+
+  // Initial render: gate OFF, custom box hidden
+  assert.equal(getEl("chk-delivery-gate").checked, false);
+  assert.equal(getEl("delivery-gate-box").hidden, true);
+  assert.match(getEl("lbl-gate-status").textContent, /交付测试门禁：关闭/);
+
+  // Toggle gate ON -> custom box opens
+  getEl("chk-delivery-gate").checked = true;
+  await getEl("chk-delivery-gate").trigger("change");
+  assert.equal(readSettings(dir).deliveryTestGateEnabled, true);
+  assert.equal(getEl("delivery-gate-box").hidden, false);
+  assert.equal(getEl("delivery-off-warn").hidden, true);
+
+  // Typing unsaved command marks dirty -> 3s poll must NOT overwrite the input!
+  getEl("inp-delivery-cmd").value = "npm run typecheck && npm test";
+  await getEl("inp-delivery-cmd").trigger("input");
+  assert.equal(getEl("btn-clear-delivery-cmd").hidden, false);
+  assert.ok(typeof pollCb === "function");
+  pollCb();
+  await new Promise((r) => setTimeout(r, 15));
+  assert.equal(getEl("inp-delivery-cmd").value, "npm run typecheck && npm test");
+
+  // Save custom command via Save button -> persists and updates status
+  await getEl("btn-save-delivery-cmd").trigger("click");
+  assert.equal(readSettings(dir).deliveryTestCommand, "npm run typecheck && npm test");
+  assert.match(getEl("lbl-gate-status").textContent, /自定义命令：npm run typecheck && npm test/);
+
+  // External autoRetryMode=off update -> poll shows warning banner when gate is ON
+  updateSettings(dir, { autoRetryMode: "off" });
+  pollCb();
+  await new Promise((r) => setTimeout(r, 15));
+  assert.equal(getEl("delivery-off-warn").hidden, false);
+
+  // Clear button resets custom command back to auto-detect
+  await getEl("btn-clear-delivery-cmd").trigger("click");
+  assert.equal(readSettings(dir).deliveryTestCommand, "");
+  assert.equal(getEl("inp-delivery-cmd").value, "");
+  assert.equal(getEl("btn-clear-delivery-cmd").hidden, true);
+
+  // Tab normalizes cleanly; IME composing Enter does NOT save; emptying input keeps Clear visible when server has a saved command
+  getEl("inp-delivery-cmd").value = "npm\trun\ttest";
+  await getEl("inp-delivery-cmd").trigger("input");
+  await getEl("inp-delivery-cmd").trigger("keydown", { key: "Enter", isComposing: true, preventDefault() {} });
+  assert.equal(readSettings(dir).deliveryTestCommand, "");
+  await getEl("inp-delivery-cmd").trigger("keydown", { key: "Enter", isComposing: false, preventDefault() {} });
+  assert.equal(readSettings(dir).deliveryTestCommand, "npm run test");
+  getEl("inp-delivery-cmd").value = "";
+  await getEl("inp-delivery-cmd").trigger("input");
+  assert.equal(getEl("btn-clear-delivery-cmd").hidden, false);
 });

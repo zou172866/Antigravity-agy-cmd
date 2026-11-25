@@ -127,6 +127,43 @@ class TestSetupAutoRouterCLI(unittest.TestCase):
             self.assertTrue(set_option("--plan-tier", "free")["freePlanReviewEnabled"])
             self.assertFalse(set_option("--free-plan-review", "off")["freePlanReviewEnabled"])
 
+    def test_delivery_test_gate_and_custom_cmd_cli(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp)
+            path = state / "settings.json"
+            for legacy in (
+                {"version": 1},
+                {"version": 2, "deliveryTestGateEnabled": "true", "deliveryTestCommand": "npm test\nrm -rf /"},
+            ):
+                path.write_text(json.dumps(legacy), encoding="utf-8")
+                loaded = router.load_settings(state)
+                self.assertFalse(loaded["deliveryTestGateEnabled"])
+                self.assertNotIn("\n", loaded["deliveryTestCommand"])
+
+            def set_option(*args: str) -> dict:
+                result = run_cli(*args, "--state-dir", tmp, "--json")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                return json.loads(result.stdout)["settings"]
+
+            on = set_option("--delivery-test-gate", "on", "--delivery-test-cmd", "  npm run typecheck  &&  npm test  ")
+            self.assertTrue(on["deliveryTestGateEnabled"])
+            self.assertEqual(on["deliveryTestCommand"], "npm run typecheck && npm test")
+            self.assertEqual(on["planTier"], "free")
+            self.assertFalse(on["boostEnabled"])
+            self.assertIn("自定义：npm run typecheck && npm test", router.format_settings_summary(on))
+
+            off = set_option("--delivery-test-gate", "off")
+            self.assertFalse(off["deliveryTestGateEnabled"])
+            self.assertEqual(off["deliveryTestCommand"], "npm run typecheck && npm test")
+
+            cleared = set_option("--delivery-test-cmd", "")
+            self.assertEqual(cleared["deliveryTestCommand"], "")
+
+            bad_multiline = run_cli("--delivery-test-cmd", "npm test\necho bad", "--state-dir", tmp)
+            self.assertNotEqual(bad_multiline.returncode, 0)
+            bad_long = run_cli("--delivery-test-cmd", "a" * 241, "--state-dir", tmp)
+            self.assertNotEqual(bad_long.returncode, 0)
+
     def _create_valid_plugin_skeleton(self, p_dir: Path) -> None:
         (p_dir / "rules").mkdir(parents=True, exist_ok=True)
         (p_dir / "hooks").mkdir(parents=True, exist_ok=True)

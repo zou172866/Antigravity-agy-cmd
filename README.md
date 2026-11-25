@@ -93,6 +93,12 @@ Prevents the agent from stopping early while tests or build checks are still fai
 
 When you ask the AI to edit code or fix a bug and verification fails, the `Stop` hook automatically nudges it to keep investigating and fixing until checks pass or the configured retry limit is reached.
 
+You can also opt into the **Delivery Test Gate (run full tests before delivery)** toggle in the panel (off by default, works across all tiers and ordinary coding turns):
+
+- **Custom verification command or detected project tests**: after any substantive source edit, the agent must run and pass the full check suite (supports single commands or `&&` chains such as `npm run typecheck && npm test`) *after* the latest edit before delivering; missing checks are nudged and failing checks loop within your retry budget until green.
+- **No existing test command & no custom command**: conservatively allows delivery without modifying repo test setup, while instructing the agent to explicitly disclose the missing test coverage at the end of its response.
+- Say `skip tests` or `这次跳过测试` in a prompt to bypass the gate for that single turn.
+
 For an approved implementation plan in free mode, the plugin can also request one missing project check after a confirmed source edit. This uses the existing retry budget. Documentation edits, a canceled turn or an outstanding approval do not trigger this reminder.
 
 It lets the agent stop immediately when:
@@ -138,6 +144,11 @@ python skills/agy-cmd/scripts/setup_auto_router.py --auto-retry infinite
 # Switch account tier
 python skills/agy-cmd/scripts/setup_auto_router.py --plan-tier free
 python skills/agy-cmd/scripts/setup_auto_router.py --plan-tier paid --boost on
+
+# Toggle Delivery Test Gate (off by default) and optionally configure a custom verification command
+python skills/agy-cmd/scripts/setup_auto_router.py --delivery-test-gate on
+python skills/agy-cmd/scripts/setup_auto_router.py --delivery-test-cmd "npm run typecheck && npm test"
+python skills/agy-cmd/scripts/setup_auto_router.py --delivery-test-gate off
 
 # Enable one independent review after implementing an approved plan in free mode
 python skills/agy-cmd/scripts/setup_auto_router.py --free-plan-review on

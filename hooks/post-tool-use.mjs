@@ -16,6 +16,7 @@ import {
   resolveStateDir
 } from "./lib/common.mjs";
 import { classifyToolEvents } from "./lib/detector.mjs";
+import { readSettings } from "./lib/settings.mjs";
 import { appendEvents, readState } from "./lib/state.mjs";
 import {
   findTranscriptStep,
@@ -47,10 +48,17 @@ export async function runPostToolUse(rawInput, env = process.env, nowMs = Date.n
 
   const stateDir = resolveStateDir(env);
   const convId = resolveConversationId(payload, env);
+  const settings = readSettings(stateDir);
+  const state = readState(stateDir, convId);
+  const deliveryGate = settings.deliveryTestGateEnabled
+    ? state.deliveryGate || { key: `turn:${state.userTurnCount || 0}`, requested: null }
+    : null;
   const events = classifyToolEvents(payload, nowMs, {
     transcriptStep,
     hasTranscriptPath: Boolean(transcriptPath),
-    plan: readState(stateDir, convId).freePlan
+    plan: state.freePlan,
+    deliveryGate,
+    deliveryTestCommand: settings.deliveryTestCommand
   });
   if (events.length === 0) {
     return {};

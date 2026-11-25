@@ -38,6 +38,13 @@ description: Antigravity 桌面端/IDE 高阶能力自动路由与内置斜杠�
   python scripts/setup_auto_router.py --plan-tier paid --boost on
   python scripts/setup_auto_router.py --boost off
   ```
+- **交付前强制测试门禁（改后必测，全绿交付）**。默认关闭，免费与付费全套餐通用。开启后，只要本轮实质修改了源码，必须在最后一次修改后跑通全量测试（或面板/CLI 手填的自定义验证命令）才放行交付；项目无现成测试且未填自定义命令时，保守放行不改仓库并在交付末尾强制说明缺测项。单轮说 `这次跳过测试` 可临时豁免。
+  ```bash
+  python scripts/setup_auto_router.py --delivery-test-gate on
+  python scripts/setup_auto_router.py --delivery-test-cmd "npm run typecheck && npm test"
+  python scripts/setup_auto_router.py --delivery-test-cmd ""
+  python scripts/setup_auto_router.py --delivery-test-gate off
+  ```
 - **免费计划实施后的独立复核**。默认关闭。开启后，主会话实施并验证，每份获批的实施计划最多请一位只读 `cmd-verifier` 复核，会额外消耗配额。付费档沿用原有 Boost 开关。
   ```bash
   python scripts/setup_auto_router.py --free-plan-review on
@@ -76,7 +83,7 @@ description: Antigravity 桌面端/IDE 高阶能力自动路由与内置斜杠�
 | 明确要求排查竞态、死锁等单点疑难，或同一问题跨 ≥2 轮、修改后仍失败 ≥2 次、连续 ≥3 次命令失败 | **按套餐自动派工** | 会员开启 Boost 后，收到 `[agy-cmd → 自动 Boost]` 即直接派一个 `DeepInvestigator` 只读排查，已授权的修复可派 `DeepCoder`。主会话验证结果，角色不可用时接手。免费档或关闭 Boost 时，卡壳可按 `[agy-cmd → 自动换视角排查]` 调用 `dart-reviewer` 或 `research`。 |
 | 日常改代码后命令未过 / 要求修错但测试未绿 | **Stop 自动续跑监工** | 免口令免声明：改过源码后命令失败或要求修错但单测/构建未绿时自动拦截续跑；自然问原因（“为什么挂了/分析报错”）、查看状态、环境探测或等待方案审批时自动识别放行 |
 
-对于免费档已获批的实施计划，只有确认主会话已编辑相关源码、能识别对应检查且缺少改后验证证据时，Stop 才在本次允许的续跑额度内提醒补验，最多一次。
+对于免费档已获批的实施计划，只有确认主会话已编辑相关源码、能识别对应检查且缺少改后验证证据时，Stop 才在本次允许的续跑额度内提醒补验，最多一次。若用户在面板开启了「交付前强制测试门禁」，则对所有套餐与所有实质改源码的轮次生效：有自定义验证命令或可识别项目测试时，须在最后一次修改后全部通过才放行；无现成测试时保守放行并要求在回复末尾说明缺测项。
 
 ### 模式 C：指令选型参谋与分类速查
 

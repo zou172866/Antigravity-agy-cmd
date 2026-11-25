@@ -93,6 +93,12 @@ python ~/.agents/skills/agy-cmd/scripts/setup_auto_router.py --install --standal
 
 当你让 AI 改代码或修错，但测试、运行验证还没通过时，插件会自动让 AI 继续排查修改，直到验证通过或达到设定的重试上限。
 
+当你在面板开启可选的**「交付前强制测试门禁（改后必测，全绿交付）」**（默认关闭，全套餐可用）后，无论是否走计划审批，只要当轮实质修改了源码：
+
+- **有自定义验证命令或现成测试**：必须在最后一次代码改动之后跑通全部验证命令（支持单条或 `&&` 组合命令，如 `npm run typecheck && npm test`）才允许交付；改完漏跑会被拦截补测，跑挂则按自动重试上限继续修到全绿。
+- **项目无现成测试且未填自定义命令**：保守放行、不私自改动仓库测试结构，并在交付末尾强制说明缺测项与原因。
+- 某次提问不想触发门禁，顺带说一句 `这次跳过测试` 即可单轮豁免。
+
 免费模式下，执行已批准的实施计划时，如果主 Agent 确实写了源码，且漏跑了可识别的项目检查，插件可在现有重试额度内提醒补跑一次。纯文档修改、用户取消和等待批准均不会触发这次提醒。
 
 在下面几种情况下，插件会自动放行并立即停下：
@@ -138,6 +144,11 @@ python skills/agy-cmd/scripts/setup_auto_router.py --auto-retry infinite
 # 切换免费版或会员版
 python skills/agy-cmd/scripts/setup_auto_router.py --plan-tier free
 python skills/agy-cmd/scripts/setup_auto_router.py --plan-tier paid --boost on
+
+# 开启或关闭交付前强制测试门禁（默认关闭），并可选配置自定义验证命令
+python skills/agy-cmd/scripts/setup_auto_router.py --delivery-test-gate on
+python skills/agy-cmd/scripts/setup_auto_router.py --delivery-test-cmd "npm run typecheck && npm test"
+python skills/agy-cmd/scripts/setup_auto_router.py --delivery-test-gate off
 
 # 免费档在实施已批准的计划后进行一次独立复核
 python skills/agy-cmd/scripts/setup_auto_router.py --free-plan-review on

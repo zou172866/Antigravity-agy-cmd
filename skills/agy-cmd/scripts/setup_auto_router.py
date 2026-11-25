@@ -22,6 +22,7 @@ RULE_FILENAME = "agy-auto-router.md"
 MIN_RETRY_MAX = 1
 MAX_RETRY_MAX = 50
 DEFAULT_RETRY_MAX = 3
+MAX_DELIVERY_CMD_LEN = 240
 
 GITHUB_REPO_URL = "https://github.com/zou172866/Antigravity-agy-cmd"
 GH_STAR_COMMAND = "gh api -X PUT /user/starred/zou172866/Antigravity-agy-cmd"
@@ -50,7 +51,7 @@ RULE_BODY = """# Antigravity 自动路由 (agy-cmd)
 - **防报错套餐感知与自动续跑**（禁推 CLI 专属 `/undo`、`/branch`、`/effort`；本轮已用对应 `/` 指令则不重复提示）：
   1. **疑难任务与卡壳排错**：收到钩子的 `[agy-cmd → 自动 Boost]` 时，直接用 `invoke_subagent` 派一个角色。只读排查或待审批时用 `DeepInvestigator`，已授权的修复可用 `DeepCoder`。主会话验证结果，角色调用失败则接手。收到 `[agy-cmd → 自动换视角排查]` 时，给可用的 `dart-reviewer` 派只读排查任务，备选 `research`；都不可用时由主会话逐一验证假设。
   2. **防停机自动续跑（Stop 监工）**：改代码或修错后若存在现成测试/构建命令，结束前优先实跑验证以便 `agy-cmd` `Stop` 钩子无感核验并在未通过时按面板设定次数自动续跑；仅当收到钩子明确提示时输出 `[agy-cmd → 自动续跑已启用]` 或 `[agy-cmd → 建议 /goal]`。
-  3. **调节重试/Boost 与指令选型**：当用户调节自动重试次数、切换会员/Boost 开关，或查询对比指令时，读 `agy-cmd` `SKILL.md`（可附 `[agy-cmd 自动路由](sidecar://agy-cmd/panel/)` 面板入口）。
+  3. **调节面板设置与指令选型**：当用户调节自动重试次数、开关交付前测试门禁/自定义验证命令、切换会员/Boost 开关，或查询对比指令时，读 `agy-cmd` `SKILL.md`（可附 `[agy-cmd 自动路由](sidecar://agy-cmd/panel/)` 面板入口）。
 """
 
 RULE_CONTENT = RULE_FRONTMATTER + RULE_BODY
@@ -293,6 +294,24 @@ def normalize_star_prompt_state(raw: object) -> dict:
     }
 
 
+def sanitize_delivery_test_command(raw: object, *, strict: bool = False) -> str:
+    if strict:
+        if not isinstance(raw, str):
+            raise SystemExit("ERROR：--delivery-test-cmd 必须是字符串。")
+        if re.search(r"[\x00-\x08\x0a-\x1f\x7f]", raw):
+            raise SystemExit("ERROR：--delivery-test-cmd 仅支持单行命令，不能包含换行或控制字符。")
+        cleaned = re.sub(r"[ \t]+", " ", raw.strip())
+        if len(cleaned) > MAX_DELIVERY_CMD_LEN:
+            raise SystemExit(
+                f"ERROR：--delivery-test-cmd 长度不能超过 {MAX_DELIVERY_CMD_LEN} 字符（收到：{len(cleaned)}）。"
+            )
+        return cleaned
+    if not isinstance(raw, str):
+        return ""
+    cleaned = re.sub(r"[\x00-\x1f\x7f]+", " ", raw).strip()
+    return re.sub(r"[ \t]+", " ", cleaned)[:MAX_DELIVERY_CMD_LEN]
+
+
 def default_settings() -> dict:
     return {
         "version": 2,
@@ -303,6 +322,8 @@ def default_settings() -> dict:
         "autoRetryMode": "count",
         "autoRetryMax": DEFAULT_RETRY_MAX,
         "autoRetryScope": "smart",
+        "deliveryTestGateEnabled": False,
+        "deliveryTestCommand": "",
         "freeFallbackEnabled": True,
         "planFallbackEnabled": True,
         "configuredByUser": False,
@@ -344,6 +365,8 @@ def load_settings(state_dir: Path) -> dict:
         base["planTier"] = "free"
         base["boostEnabled"] = False
     base["freePlanReviewEnabled"] = base.get("freePlanReviewEnabled") is True
+    base["deliveryTestGateEnabled"] = base.get("deliveryTestGateEnabled") is True
+    base["deliveryTestCommand"] = sanitize_delivery_test_command(base.get("deliveryTestCommand"), strict=False)
     base["starPrompt"] = normalize_star_prompt_state(base.get("starPrompt"))
     return base
 
@@ -373,7 +396,12 @@ def format_settings_summary(settings: dict) -> str:
     else:
         review = "开启" if settings.get("freePlanReviewEnabled") is True else "关闭"
         tier_str = f"免费版默认（独立复核{review}）"
-    return f"自动重试={retry_str} | 套餐档位={tier_str}"
+    if settings.get("deliveryTestGateEnabled") is True:
+        custom_cmd = sanitize_delivery_test_command(settings.get("deliveryTestCommand"), strict=False)
+        gate_str = f"开启（自定义：{custom_cmd}）" if custom_cmd else "开启（自动探测）"
+    else:
+        gate_str = "关闭"
+    return f"自动重试={retry_str} | 交付门禁={gate_str} | 套餐档位={tier_str}"
 
 
 def parse_auto_retry_arg(raw_val: str) -> tuple[str, int | None]:
@@ -402,6 +430,8 @@ def apply_settings_cli(
     plan_tier: str | None,
     boost_flag: str | None,
     free_plan_review: str | None = None,
+    delivery_test_gate: str | None = None,
+    delivery_test_cmd: str | None = None,
 ) -> dict:
     with _with_settings_lock(state_dir):
         current = load_settings(state_dir)
@@ -429,6 +459,10 @@ def apply_settings_cli(
             current["boostEnabled"] = want_on
         if free_plan_review is not None:
             current["freePlanReviewEnabled"] = free_plan_review == "on"
+        if delivery_test_gate is not None:
+            current["deliveryTestGateEnabled"] = delivery_test_gate == "on"
+        if delivery_test_cmd is not None:
+            current["deliveryTestCommand"] = sanitize_delivery_test_command(delivery_test_cmd, strict=True)
 
         current["configuredByUser"] = True
         current["onboardingShown"] = True
@@ -772,6 +806,17 @@ def main(argv: list[str] | None = None) -> int:
         help="开启或关闭免费档计划实施后的单次独立复核",
     )
     parser.add_argument(
+        "--delivery-test-gate",
+        choices=["on", "off"],
+        default=None,
+        help="开启或关闭交付前强制测试门禁（改后必测，全绿交付；无现成测试时保守放行并说明缺测）",
+    )
+    parser.add_argument(
+        "--delivery-test-cmd",
+        default=None,
+        help="设置交付测试门禁的自定义验证命令（支持 && 组合；传空字符串清空并回退自动探测）",
+    )
+    parser.add_argument(
         "--standalone",
         action="store_true",
         help="强制使用独立规则模式（~/.gemini/config/rules/agy-auto-router.md）",
@@ -794,7 +839,16 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     has_settings_mutation = any(
-        x is not None for x in (args.auto_retry, args.retry_scope, args.plan_tier, args.boost, args.free_plan_review)
+        x is not None
+        for x in (
+            args.auto_retry,
+            args.retry_scope,
+            args.plan_tier,
+            args.boost,
+            args.free_plan_review,
+            args.delivery_test_gate,
+            args.delivery_test_cmd,
+        )
     )
     has_lifecycle_action = any((args.install, args.remove, args.status, args.sync_check))
     if not has_settings_mutation and not has_lifecycle_action:
@@ -818,6 +872,8 @@ def main(argv: list[str] | None = None) -> int:
             plan_tier=args.plan_tier,
             boost_flag=args.boost,
             free_plan_review=args.free_plan_review,
+            delivery_test_gate=args.delivery_test_gate,
+            delivery_test_cmd=args.delivery_test_cmd,
         )
         if not args.json:
             print(f"已更新 agy-cmd 运行设置（{state_dir / 'settings.json'}）：")

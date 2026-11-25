@@ -4,6 +4,7 @@ import path from "node:path";
 import { sanitizeConversationId } from "../../hooks/lib/common.mjs";
 import {
   evaluateStarPrompt,
+  formatDeliveryGateSummaryZh,
   formatRetrySummaryZh,
   readSettings,
   setStarPromptState,
@@ -115,6 +116,7 @@ export function buildPanelStatePayload(stateDir, rawConvId = "", { markStarTrigg
     settings,
     starPrompt,
     summaryZh: formatRetrySummaryZh(settings),
+    deliveryGateStatusZh: formatDeliveryGateSummaryZh(settings),
     boostStatusZh:
       settings.planTier === "paid" && settings.boostEnabled
         ? "Pro/Ultra 会员 · 已开启 /boost 自动接入"

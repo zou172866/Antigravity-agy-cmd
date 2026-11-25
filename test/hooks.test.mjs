@@ -1815,3 +1815,352 @@ test("real Antigravity runtime: pre-flush background/workflow wakeup repeating l
   assert.match(realTurn2.injectSteps[0].systemMessage.systemMessage, /unresolved debug issue across 2 turns/);
   assert.equal(readState(dir, "dbg-wake").userTurnCount, 2);
 });
+
+async function deliveryGateFixture(
+  t,
+  { settings = {}, task = "修改登录校验逻辑", files = { "package.json": JSON.stringify({ scripts: { test: "node --test" } }) } } = {}
+) {
+  const dir = makeTmpDir("agy-cmd-gate-");
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const env = makeEnv(path.join(dir, "data"));
+  const workspace = path.join(dir, "project");
+  fs.mkdirSync(workspace, { recursive: true });
+  for (const [rel, content] of Object.entries(files)) {
+    const fp = path.join(workspace, rel);
+    fs.mkdirSync(path.dirname(fp), { recursive: true });
+    fs.writeFileSync(fp, content, "utf8");
+  }
+  updateSettings(env.AGY_CMD_STATE_DIR, settings);
+  const transcriptPath = path.join(dir, "transcript.jsonl");
+  const rows = [{ step_index: 0, type: "USER_INPUT", content: task }];
+  fs.writeFileSync(transcriptPath, rows.map((row) => JSON.stringify(row)).join("\n") + "\n");
+  const base = { conversationId: "gate-conv", cwd: workspace, workspacePaths: [workspace], transcriptPath };
+  const pre = (extra = {}, nowMs = Date.now()) =>
+    runPreInvocation({ ...base, initialNumSteps: rows.length, invocationNum: 1, lastUserInput: task, ...extra }, env, nowMs);
+  assert.deepEqual(await pre({ invocationNum: 0 }), {});
+  const post = (stepIdx, name, args, toolResponse, nowMs = Date.now()) =>
+    runPostToolUse({ ...base, stepIdx, toolCall: { name, args }, toolResponse }, env, nowMs);
+  const edit = (idx, target = "src/app.ts") =>
+    post(
+      idx,
+      "edit_file",
+      {
+        Path: JSON.stringify(path.join(workspace, target)),
+        Target: JSON.stringify("return 1;"),
+        Replacement: JSON.stringify("return 2;")
+      },
+      "Made 1 replacement in " + target + " at line 2."
+    );
+  const command = (idx, cmd, response, cwd = workspace) =>
+    post(idx, "run_command", { CommandLine: cmd, Cwd: cwd }, response);
+  const stop = (extra = {}, nowMs = Date.now()) =>
+    runStop({ ...base, terminationReason: "NO_TOOL_CALL", fullyIdle: true, ...extra }, env, nowMs);
+  const stats = () => readSettings(env.AGY_CMD_STATE_DIR).stats.totalAutoRetries;
+  const append = (row) => fs.appendFileSync(transcriptPath, JSON.stringify(row) + "\n");
+  return { pre, post, edit, command, stop, stats, append, workspace, env };
+}
+
+test("delivery test gate: off by default; when enabled enforces post-edit pass across tiers, invalidates stale passes, and resists unrelated ok commands", async (t) => {
+  // Default OFF: ordinary edit without tests stops immediately
+  const off = await deliveryGateFixture(t, { settings: { deliveryTestGateEnabled: false } });
+  await off.edit(1);
+  assert.deepEqual(await off.stop(), { decision: "allow" });
+
+  // Paid tier + ordinary non-plan turn with gate ON
+  const f = await deliveryGateFixture(t, {
+    settings: { planTier: "paid", deliveryTestGateEnabled: true, autoRetryMode: "count", autoRetryMax: 5 }
+  });
+  await f.command(1, "npm test", "Command exited with code 0.");
+  await f.edit(2);
+  // Pre-edit green test does not clear post-edit requirement; MODEL_STOP is also gated
+  const nudge1 = await f.stop({ terminationReason: "MODEL_STOP" });
+  assert.equal(nudge1.decision, "continue");
+  assert.match(nudge1.reason, /交付测试门禁.*npm test/);
+  assert.equal(f.stats(), 0);
+
+  // Failing test cannot be washed away by unrelated echo ok
+  await f.command(3, "npm test", "Command exited with code 1.");
+  await f.command(4, "echo ok", "Command exited with code 0.");
+  const failCont = await f.stop();
+  assert.equal(failCont.decision, "continue");
+  assert.match(failCont.reason, /自动续跑.*npm test/);
+  assert.equal(f.stats(), 1);
+
+  // Fix edit invalidates stale failure -> prompts for fresh re-run without inflating failure stats
+  await f.edit(5);
+  const nudge2 = await f.stop();
+  assert.equal(nudge2.decision, "continue");
+  assert.match(nudge2.reason, /交付测试门禁.*npm test/);
+  assert.equal(f.stats(), 1);
+
+  // Running npm test after last edit and passing clears the gate cleanly
+  await f.command(6, "npm.cmd test", "Command exited with code 0.");
+  assert.deepEqual(await f.stop({ terminationReason: "MODEL_STOP" }), { decision: "allow" });
+});
+
+test("delivery test gate: custom verification command supports single, && chains (combined, piecewise, run_checks), and package scoping", async (t) => {
+  const f = await deliveryGateFixture(t, {
+    settings: {
+      deliveryTestGateEnabled: true,
+      deliveryTestCommand: "npm run typecheck && npm test",
+      autoRetryMode: "count",
+      autoRetryMax: 6
+    },
+    files: {
+      "package.json": JSON.stringify({ scripts: {} }),
+      "pkg-a/package.json": JSON.stringify({ scripts: {} }),
+      "pkg-b/package.json": JSON.stringify({ scripts: {} })
+    }
+  });
+  await f.edit(1, "pkg-a/index.ts");
+  const missingBoth = await f.stop();
+  assert.equal(missingBoth.decision, "continue");
+  assert.match(missingBoth.reason, /npm run typecheck && npm test/);
+
+  // Sibling package pass cannot clear pkg-a
+  await f.command(2, "npm run typecheck && npm test", "Command exited with code 0.", path.join(f.workspace, "pkg-b"));
+  const stillMissing = await f.stop();
+  assert.equal(stillMissing.decision, "continue");
+  assert.match(stillMissing.reason, /pkg-a/);
+
+  // Running only the first subcommand still flags the missing second subcommand
+  await f.command(3, "npm run typecheck", "Command exited with code 0.", path.join(f.workspace, "pkg-a"));
+  const missingSecond = await f.stop();
+  assert.equal(missingSecond.decision, "continue");
+  assert.match(missingSecond.reason, /npm test/);
+  assert.doesNotMatch(missingSecond.reason, /typecheck/);
+
+  // Running the second subcommand at workspace root (ancestor of pkg-a) completes the custom gate!
+  await f.command(4, "npm test", "Command exited with code 0.", f.workspace);
+  assert.deepEqual(await f.stop(), { decision: "allow" });
+
+  // After a new edit, run_checks covering both commands passes in one step
+  await f.edit(5, "pkg-a/index.ts");
+  await f.post(
+    6,
+    "run_checks",
+    {
+      cwd: path.join(f.workspace, "pkg-a"),
+      commands: [{ command: "npm run typecheck" }, { command: "npm test" }]
+    },
+    "Checks: 2/2 passed"
+  );
+  assert.deepEqual(await f.stop(), { decision: "allow" });
+});
+
+test("delivery test gate: no-test projects conservatively allow delivery with one-shot disclosure injection; multi-ecosystem auto-detection is strict", async (t) => {
+  // 1. Plain project with NO test script and NO custom command -> PreInvocation injects once, Stop allows
+  const noTest = await deliveryGateFixture(t, {
+    settings: { deliveryTestGateEnabled: true, deliveryTestCommand: "" },
+    files: { "package.json": JSON.stringify({ name: "plain-web", scripts: {} }) }
+  });
+  await noTest.edit(1, "src/index.ts");
+  const disclosed = await noTest.pre();
+  assert.equal(disclosed.injectSteps?.length, 1);
+  assert.match(disclosed.injectSteps[0].systemMessage.systemMessage, /保守放行.*缺测项/);
+  // Strictly one-shot per turn
+  assert.deepEqual(await noTest.pre(), {});
+  // Stop conservatively allows without trapping
+  assert.deepEqual(await noTest.stop(), { decision: "allow" });
+
+  // 2. Python pytest.ini auto-detection: filtered subset cannot pass, full pytest -q passes
+  const py = await deliveryGateFixture(t, {
+    settings: { deliveryTestGateEnabled: true },
+    files: { "pytest.ini": "[pytest]\n" }
+  });
+  await py.edit(1, "app.py");
+  const pyNudge = await py.stop();
+  assert.equal(pyNudge.decision, "continue");
+  assert.match(pyNudge.reason, /pytest/);
+  await py.command(2, "pytest tests/test_one.py", "Command exited with code 0.");
+  assert.equal((await py.stop()).decision, "continue");
+  await py.command(3, "python -m pytest -q", "Command exited with code 0.");
+  assert.deepEqual(await py.stop(), { decision: "allow" });
+
+  // 3. Go module WITH *_test.go detects `go test ./...`; Go module WITHOUT test files conservatively allows
+  const goWithTests = await deliveryGateFixture(t, {
+    settings: { deliveryTestGateEnabled: true },
+    files: { "go.mod": "module example.com/app\n", "auth/auth_test.go": "package auth\n" }
+  });
+  await goWithTests.edit(1, "auth/auth.go");
+  assert.match((await goWithTests.stop()).reason, /go test \.\/\.\.\./);
+  await goWithTests.command(2, "go test ./auth", "Command exited with code 0.");
+  assert.equal((await goWithTests.stop()).decision, "continue");
+  await goWithTests.command(3, "go test -v ./...", "Command exited with code 0.");
+  assert.deepEqual(await goWithTests.stop(), { decision: "allow" });
+
+  const goNoTests = await deliveryGateFixture(t, {
+    settings: { deliveryTestGateEnabled: true },
+    files: { "go.mod": "module example.com/script\n" }
+  });
+  await goNoTests.edit(1, "main.go");
+  assert.match((await goNoTests.pre()).injectSteps?.[0]?.systemMessage.systemMessage, /保守放行/);
+  assert.deepEqual(await goNoTests.stop(), { decision: "allow" });
+});
+
+test("delivery test gate: honors skip requests, write_file overwrite, goal_only scope, autoRetryMode=off 1-shot cap, and infinite-mode anti-loop brake", async (t) => {
+  // 1. Single-turn skip tests
+  const skipped = await deliveryGateFixture(t, {
+    settings: { deliveryTestGateEnabled: true },
+    task: "重构入口，这次跳过测试"
+  });
+  await skipped.edit(1);
+  assert.deepEqual(await skipped.stop(), { decision: "allow" });
+
+  // 2. Pure docs & comment edits never trigger gate
+  const docsOnly = await deliveryGateFixture(t, { settings: { deliveryTestGateEnabled: true } });
+  await docsOnly.edit(1, "README.md");
+  await docsOnly.post(
+    2,
+    "edit_file",
+    { Path: path.join(docsOnly.workspace, "src/app.ts"), Target: "// old", Replacement: "// new" },
+    "Made 1 replacement in src/app.ts"
+  );
+  assert.deepEqual(await docsOnly.stop(), { decision: "allow" });
+
+  // 3. write_file with Overwrite: true + executable code DOES trigger gate even under goal_only scope
+  const overwrite = await deliveryGateFixture(t, {
+    settings: { deliveryTestGateEnabled: true, autoRetryScope: "goal_only", autoRetryMode: "count", autoRetryMax: 2 }
+  });
+  await overwrite.post(
+    1,
+    "write_file",
+    { Path: path.join(overwrite.workspace, "src/app.ts"), Overwrite: true, Content: "export const x = 42;\n" },
+    "Created file."
+  );
+  assert.match((await overwrite.stop()).reason, /交付测试门禁.*npm test/);
+
+  // 4. autoRetryMode === "off": allows at most 1 missing-test reminder and 0 failure retries
+  const offRetry = await deliveryGateFixture(t, {
+    settings: { deliveryTestGateEnabled: true, autoRetryMode: "off" }
+  });
+  await offRetry.edit(1);
+  assert.match((await offRetry.stop()).reason, /交付测试门禁/);
+  await offRetry.command(2, "npm test", "Command exited with code 1.");
+  assert.deepEqual(await offRetry.stop(), { decision: "allow" });
+
+  // 5. Infinite mode anti-loop brake: 2 consecutive ignored nudges (only unrelated read-only cmds) release Stop
+  const inf = await deliveryGateFixture(t, {
+    settings: { deliveryTestGateEnabled: true, autoRetryMode: "infinite" }
+  });
+  await inf.edit(1);
+  assert.match((await inf.stop()).reason, /交付测试门禁/);
+  await inf.command(2, "git status", "Command exited with code 0.");
+  assert.match((await inf.stop()).reason, /交付测试门禁/);
+  await inf.command(3, "git diff", "Command exited with code 0.");
+  assert.deepEqual(await inf.stop(), { decision: "allow" });
+
+  // 6. Background test started before later edit cannot clear the later edit when it completes
+  const bg = await deliveryGateFixture(t, { settings: { deliveryTestGateEnabled: true } });
+  await bg.command(1, "npm test", "Tool is running as a background task with task id: gate-conv/task-1");
+  await bg.edit(2);
+  bg.append({
+    step_index: 3,
+    type: "SYSTEM_MESSAGE",
+    content: "[Message] timestamp=2026-01-01 sender=gate-conv/task-1 finished with result:\nCommand exited with code 0."
+  });
+  assert.match((await bg.stop()).reason, /交付测试门禁.*npm test/);
+});
+
+test("delivery test gate hardening: blocks shell bypasses (|| true, ;), resolves leading/mid-chain cd, handles trailing slashes, secret-like tokens, fenced skip prose, polyglot dirs, and unflushed Turn-2 isolation", async (t) => {
+  // 1. Shell bypasses (`|| true`, `; echo done`, `| cat`) cannot clear custom or auto gates
+  for (const bypassCmd of ["npm test && echo ok || true", "npm test; echo done", "npm test | cat"]) {
+    const bypass = await deliveryGateFixture(t, {
+      settings: { deliveryTestGateEnabled: true, deliveryTestCommand: "npm test", autoRetryMax: 10 }
+    });
+    await bypass.edit(1);
+    await bypass.command(2, bypassCmd, "Command exited with code 0.");
+    assert.equal((await bypass.stop()).decision, "continue");
+    await bypass.command(3, "npm test", "Command exited with code 0.");
+    assert.deepEqual(await bypass.stop(), { decision: "allow" });
+  }
+
+  // 2. Leading & mid-chain cd attribution + custom `cd backend && pytest`
+  const cdFix = await deliveryGateFixture(t, {
+    settings: { deliveryTestGateEnabled: true, autoRetryMax: 10 },
+    files: {
+      "pkg-a/package.json": JSON.stringify({ scripts: { test: "node --test" } }),
+      "pkg-b/package.json": JSON.stringify({ scripts: { test: "node --test" } })
+    }
+  });
+  await cdFix.edit(1, "pkg-a/app.ts");
+  // Mid-chain cd to sibling pkg-b must NOT clear pkg-a
+  await cdFix.command(2, "echo hi && cd pkg-b && npm test", "Command exited with code 0.", cdFix.workspace);
+  assert.match((await cdFix.stop()).reason, /pkg-a/);
+  // Leading cd into pkg-a (or PowerShell Set-Location) DOES clear pkg-a
+  await cdFix.command(3, "Set-Location pkg-a; npm test", "Command exited with code 0.", cdFix.workspace);
+  assert.deepEqual(await cdFix.stop(), { decision: "allow" });
+
+  // Custom `cd backend && pytest` from root clears edits cleanly
+  const cdCustom = await deliveryGateFixture(t, {
+    settings: { deliveryTestGateEnabled: true, deliveryTestCommand: "cd backend && pytest", autoRetryMax: 5 },
+    files: { "backend/app.py": "x = 1\n", "frontend/app.ts": "export const a = 1;\n" }
+  });
+  await cdCustom.edit(1, "frontend/app.ts");
+  assert.match((await cdCustom.stop()).reason, /cd backend && pytest/);
+  await cdCustom.command(2, "cd backend && pytest", "Command exited with code 0.", cdCustom.workspace);
+  assert.deepEqual(await cdCustom.stop(), { decision: "allow" });
+
+  // 3. Trailing slash in workspacePaths/cwd & secret-like env var in custom command (`TEST_TOKEN=dummy npm test`)
+  const tokFix = await deliveryGateFixture(t, {
+    settings: { deliveryTestGateEnabled: true, deliveryTestCommand: "TEST_TOKEN=dummy npm test" }
+  });
+  await tokFix.edit(1);
+  await tokFix.command(2, "TEST_TOKEN=dummy npm test", "Command exited with code 0.", tokFix.workspace + path.sep);
+  assert.deepEqual(await tokFix.stop(), { decision: "allow" });
+
+  // 4. Fenced code block containing `do not run tests` does NOT bypass gate; URL / inline-comment edit DOES trigger gate
+  const fenced = await deliveryGateFixture(t, {
+    settings: { deliveryTestGateEnabled: true },
+    task: "更新接口地址。\n```md\nNote: do not run tests in template.\n```"
+  });
+  await fenced.post(
+    1,
+    "edit_file",
+    {
+      Path: path.join(fenced.workspace, "src/api.ts"),
+      Target: 'const url = "https://old.example"; // endpoint',
+      Replacement: 'const url = "https://new.example"; // endpoint'
+    },
+    "Made 1 replacement in src/api.ts"
+  );
+  assert.match((await fenced.stop()).reason, /交付测试门禁.*npm test/);
+
+  // 5. Polyglot directory (empty package.json + pytest.ini) detects pytest
+  const poly = await deliveryGateFixture(t, {
+    settings: { deliveryTestGateEnabled: true },
+    files: { "package.json": JSON.stringify({ name: "hybrid", scripts: {} }), "pytest.ini": "[pytest]\n" }
+  });
+  await poly.edit(1, "worker.py");
+  assert.match((await poly.stop()).reason, /pytest/);
+
+  // 6. Cross-package staleGateFailure: pkg-a failure is NOT suppressed by an edit in pkg-b
+  const crossPkg = await deliveryGateFixture(t, {
+    settings: { deliveryTestGateEnabled: true, autoRetryMax: 5 },
+    files: {
+      "pkg-a/package.json": JSON.stringify({ scripts: { test: "node --test" } }),
+      "pkg-b/package.json": JSON.stringify({ scripts: { test: "node --test" } })
+    }
+  });
+  await crossPkg.edit(1, "pkg-a/app.ts");
+  await crossPkg.command(2, "npx tsc --noEmit", "Command exited with code 1.", path.join(crossPkg.workspace, "pkg-a"));
+  await crossPkg.edit(3, "pkg-b/app.ts");
+  const crossStop = await crossPkg.stop();
+  assert.equal(crossStop.decision, "continue");
+  assert.match(crossStop.reason, /自动续跑/);
+
+  // 7. Unflushed Turn 2 must NOT inherit Turn 1's failed test onto a pure read-only question
+  const turnIso = await deliveryGateFixture(t, {
+    settings: { deliveryTestGateEnabled: true, autoRetryMax: 5 },
+    task: "修改登录逻辑"
+  });
+  await turnIso.edit(1);
+  await turnIso.command(2, "npm test", "Command exited with code 1.");
+  // Turn 2 starts 5s later BEFORE transcript flushes Turn 2 USER_INPUT (transcript still ends at step:0)
+  const turn2Ts = Date.now() + 5000;
+  await turnIso.pre({ invocationNum: 0, initialNumSteps: 5, lastUserInput: "解释一下为什么报错？" }, turn2Ts);
+  assert.deepEqual(
+    await turnIso.stop({ lastUserInput: "解释一下为什么报错？" }, turn2Ts + 100),
+    { decision: "allow" }
+  );
+});

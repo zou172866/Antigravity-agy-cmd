@@ -11,7 +11,19 @@ import {
 import { createDefaultState } from "./state.mjs";
 import { normalizeSettings, parseTurnRetryOverride } from "./settings.mjs";
 import { isPlanApprovalNotice, stripTranscriptStepHeaders } from "./transcript.mjs";
-import { advancePlan, pendingPlanChecks, planPreferences, planToolEvidence, requestedProjectCheck } from "./plan-verification.mjs";
+import {
+  advanceDeliveryGate,
+  advancePlan,
+  deliveryEventOrder,
+  deliveryGateToolEvidence,
+  evaluateDeliveryGateStatus,
+  matchesCustomCheckCommand,
+  pathKey,
+  pendingPlanChecks,
+  planPreferences,
+  planToolEvidence,
+  requestedProjectCheck
+} from "./plan-verification.mjs";
 
 const EDIT_TOOL_NAMES = new Set([
   "edit_file",
@@ -422,10 +434,25 @@ export function classifyToolEvents(payload, nowMs = Date.now(), options = {}) {
   const needsPreInvocationResolve = Boolean(
     hasTranscriptPath && stepIdx !== null && !payloadResponseText && !useTranscriptStep
   );
+  const extractedCmd = extractCommandString(bareTool, effectiveArgs);
   const planEvidence = options.plan && planToolEvidence(
-    options.plan, bareTool, effectiveArgs, payload, extractCommandString(bareTool, effectiveArgs)
+    options.plan, bareTool, effectiveArgs, payload, extractedCmd
   );
-  const planFields = planEvidence ? { planEvidence } : {};
+  const deliveryEvidence = options.deliveryGate
+    ? deliveryGateToolEvidence(
+        options.deliveryGate,
+        bareTool,
+        effectiveArgs,
+        payload,
+        extractedCmd,
+        options.deliveryTestCommand || ""
+      )
+    : null;
+  const planFields = {
+    ...(planEvidence ? { planEvidence } : {}),
+    ...(deliveryEvidence ? { deliveryEvidence } : {})
+  };
+  const hasVerificationEvidence = Boolean(planEvidence || deliveryEvidence);
 
   // 1. Edit / write tools (including apply_edits with optional inline verify)
   if (EDIT_TOOL_NAMES.has(bareTool)) {
@@ -466,7 +493,7 @@ export function classifyToolEvents(payload, nowMs = Date.now(), options = {}) {
         stepIdx,
         kind: "edit",
         ...planFields,
-        ...(planEvidence && editOutcome.applied ? { applied: true } : {}),
+        ...(hasVerificationEvidence && editOutcome.applied ? { applied: true } : {}),
         tool: bareTool,
         failed: editOutcome.editFailed,
         abortedNoWrite: editOutcome.editFailed,
@@ -487,7 +514,7 @@ export function classifyToolEvents(payload, nowMs = Date.now(), options = {}) {
         kind: "cmd",
         tool: "apply_edits:verify",
         ...planFields,
-        ...(planEvidence ? { terminal: true } : {}),
+        ...(hasVerificationEvidence ? { terminal: true } : {}),
         failed: editOutcome.verifyResult.failed,
         isVerify: true,
         cmd: sanitizeSnippet(verifyCmd, 64),
@@ -500,12 +527,15 @@ export function classifyToolEvents(payload, nowMs = Date.now(), options = {}) {
 
   // 2. Command / verification tools
   if (CMD_TOOL_NAMES.has(bareTool)) {
-    const cmdStr = extractCommandString(bareTool, effectiveArgs);
-    const isVerify = bareTool === "run_checks" || VERIFY_CMD_RE.test(cmdStr);
+    const cmdStr = extractedCmd;
+    const matchesCustom = Boolean(
+      options.deliveryTestCommand && matchesCustomCheckCommand(cmdStr, options.deliveryTestCommand)
+    );
+    const isVerify = bareTool === "run_checks" || VERIFY_CMD_RE.test(cmdStr) || matchesCustom;
     const isBenignCmd = bareTool === "run_command" && isBenignSearchCommand(cmdStr);
     const isReadOnlyCmd = bareTool === "run_command" && isReadOnlyInspectCommand(cmdStr);
 
-    if ((stepIsRunning || (planEvidence && BG_RUNNING_RE.test(stripTranscriptStepHeaders(responseText)))) && !payloadExplicitError) {
+    if ((stepIsRunning || (hasVerificationEvidence && BG_RUNNING_RE.test(stripTranscriptStepHeaders(responseText)))) && !payloadExplicitError) {
       // Background task not finished yet; record as pending so PreInvocation resolves from completion SYSTEM_MESSAGE
       return [
         {
@@ -539,7 +569,7 @@ export function classifyToolEvents(payload, nowMs = Date.now(), options = {}) {
         tool: bareTool,
         failed: cmdOutcome.failed,
         ...planFields,
-        ...(planEvidence && cmdOutcome.terminal ? { terminal: true } : {}),
+        ...(hasVerificationEvidence && cmdOutcome.terminal ? { terminal: true } : {}),
         isVerify,
         ...(isBenignCmd ? { isBenignSearchCmd: true } : {}),
         ...(isReadOnlyCmd ? { isReadOnlyCmd: true } : {}),
@@ -583,6 +613,8 @@ export function reconcileEventsWithTranscript(events, transcriptTail = null, pre
     const txStep = stepIdx !== null && stepsByIndex ? stepsByIndex.get(stepIdx) : null;
     const bgTask = stepIdx !== null && taskResults ? taskResults.get(stepIdx) : null;
 
+    const hasEv = Boolean(ev.planEvidence || ev.deliveryEvidence);
+
     if (ev.kind === "cmd" && ev.tool !== "apply_edits:verify") {
       if (bgTask) {
         const outcome = classifyCommandOutcome(
@@ -592,11 +624,11 @@ export function reconcileEventsWithTranscript(events, transcriptTail = null, pre
           bgTask.text,
           false
         );
-        nextCache[key] = { kind: "cmd", failed: outcome.failed, errSig: outcome.errSig, ...(ev.planEvidence ? { terminal: Boolean(outcome.terminal) } : {}) };
+        nextCache[key] = { kind: "cmd", failed: outcome.failed, errSig: outcome.errSig, ...(hasEv ? { terminal: Boolean(outcome.terminal) } : {}) };
         resolvedEvents.push({
           ...ev,
           failed: outcome.failed,
-          ...(ev.planEvidence ? { terminal: Boolean(outcome.terminal) } : {}),
+          ...(hasEv ? { terminal: Boolean(outcome.terminal) } : {}),
           errSig: outcome.errSig,
           pending: false,
           backgroundRunning: false
@@ -622,12 +654,12 @@ export function reconcileEventsWithTranscript(events, transcriptTail = null, pre
         );
         const receipt = outcome.terminal ? outcome : !txExplicitErr && (ev.terminal ? ev : cached?.terminal ? cached : null);
         const terminal = Boolean(receipt);
-        const failed = (ev.planEvidence && terminal) ? receipt.failed : outcome.failed;
-        nextCache[key] = { kind: "cmd", failed, errSig: outcome.errSig, ...(ev.planEvidence ? { terminal } : {}) };
+        const failed = (hasEv && terminal) ? receipt.failed : outcome.failed;
+        nextCache[key] = { kind: "cmd", failed, errSig: outcome.errSig, ...(hasEv ? { terminal } : {}) };
         resolvedEvents.push({
           ...ev,
           failed,
-          ...(ev.planEvidence ? { terminal } : {}),
+          ...(hasEv ? { terminal } : {}),
           errSig: outcome.errSig,
           pending: false,
           backgroundRunning: false
@@ -640,7 +672,7 @@ export function reconcileEventsWithTranscript(events, transcriptTail = null, pre
         resolvedEvents.push({
           ...ev,
           failed: Boolean(cached.failed),
-          ...(ev.planEvidence ? { terminal: Boolean(cached.terminal) } : {}),
+          ...(hasEv ? { terminal: Boolean(cached.terminal) } : {}),
           errSig: cached.errSig || "",
           pending: false,
           backgroundRunning: false
@@ -659,7 +691,7 @@ export function reconcileEventsWithTranscript(events, transcriptTail = null, pre
 
     if (ev.kind === "edit") {
       if (txStep) {
-        if (txStep.status === "RUNNING" && ev.planEvidence) continue;
+        if (txStep.status === "RUNNING" && hasEv) continue;
         const txErr = nonEmptyString(txStep.error);
         const txExplicitErr = txStep.status === "ERROR" || Boolean(txErr);
         const editOut = classifyEditOutcome(
@@ -672,7 +704,7 @@ export function reconcileEventsWithTranscript(events, transcriptTail = null, pre
         );
         nextCache[key] = {
           kind: "edit",
-          ...(ev.planEvidence ? { applied: editOut.applied || Boolean(ev.applied) } : {}),
+          ...(hasEv ? { applied: editOut.applied || Boolean(ev.applied) } : {}),
           failed: editOut.editFailed,
           planModeWriteBlocked: editOut.planModeWriteBlocked,
           verifyResult: editOut.verifyResult
@@ -680,7 +712,7 @@ export function reconcileEventsWithTranscript(events, transcriptTail = null, pre
         resolvedEvents.push({
           ...ev,
           failed: editOut.editFailed,
-          ...(ev.planEvidence ? { applied: editOut.applied || Boolean(ev.applied) } : {}),
+          ...(hasEv ? { applied: editOut.applied || Boolean(ev.applied) } : {}),
           abortedNoWrite: editOut.editFailed,
           planModeWriteBlocked: ev.planModeWriteBlocked || editOut.planModeWriteBlocked,
           pending: false
@@ -691,7 +723,9 @@ export function reconcileEventsWithTranscript(events, transcriptTail = null, pre
             stepIdx,
             kind: "cmd",
             tool: "apply_edits:verify",
-            ...(ev.planEvidence ? { planEvidence: ev.planEvidence, terminal: true } : {}),
+            ...(ev.planEvidence ? { planEvidence: ev.planEvidence } : {}),
+            ...(ev.deliveryEvidence ? { deliveryEvidence: ev.deliveryEvidence } : {}),
+            ...(hasEv ? { terminal: true } : {}),
             failed: editOut.verifyResult.failed,
             isVerify: true,
             cmd: ev.verifyCmd || "verify",
@@ -707,7 +741,7 @@ export function reconcileEventsWithTranscript(events, transcriptTail = null, pre
           ...ev,
           failed: Boolean(cached.failed),
           abortedNoWrite: Boolean(cached.failed),
-          ...(ev.planEvidence ? { applied: Boolean(cached.applied) } : {}),
+          ...(hasEv ? { applied: Boolean(cached.applied) } : {}),
           planModeWriteBlocked: Boolean(ev.planModeWriteBlocked || cached.planModeWriteBlocked),
           pending: false
         });
@@ -717,7 +751,9 @@ export function reconcileEventsWithTranscript(events, transcriptTail = null, pre
             stepIdx,
             kind: "cmd",
             tool: "apply_edits:verify",
-            ...(ev.planEvidence ? { planEvidence: ev.planEvidence, terminal: true } : {}),
+            ...(ev.planEvidence ? { planEvidence: ev.planEvidence } : {}),
+            ...(ev.deliveryEvidence ? { deliveryEvidence: ev.deliveryEvidence } : {}),
+            ...(hasEv ? { terminal: true } : {}),
             failed: Boolean(cached.verifyResult.failed),
             isVerify: true,
             cmd: ev.verifyCmd || "verify",
@@ -1101,6 +1137,7 @@ export function evaluatePreInvocation(payload, events = [], prevStateInput = nul
 
     if (activeSlash.has("compact")) {
       nextState.freePlan = null;
+      nextState.deliveryGate = null;
       nextState.debugTurnStreak = 0;
       nextState.boostAlerted = false;
       nextState.lastBoostPassTs = 0;
@@ -1165,6 +1202,56 @@ export function evaluatePreInvocation(payload, events = [], prevStateInput = nul
       nextState.freePlan = advanced;
       stateChanged = true;
     }
+  }
+
+  // Delivery Test Gate per-turn ledger (all tiers, opt-in via deliveryTestGateEnabled)
+  if (effSettings.deliveryTestGateEnabled) {
+    const isPlanFollowup =
+      approvedNotice || (Boolean(transcriptTail?.latestInputFollowsPlan) && confirmsPlan(rawLastUserInput));
+    if (isNewUserTurn || !nextState.deliveryGate) {
+      const gateKey = `turn:${nextState.userTurnCount || 0}`;
+      const inheritedSource = isPlanFollowup
+        ? unwrapUserRequestText(nonEmptyString(transcriptTail?.planRequest) || prevState.lastUserInput)
+        : "";
+      const strippedUserProse = rawLastUserInput.replace(/```[\s\S]*?```/g, " ");
+      const strippedInheritedProse = inheritedSource.replace(/```[\s\S]*?```/g, " ");
+      const gatePrefs = planPreferences(strippedUserProse);
+      const inheritedPrefs = strippedInheritedProse
+        ? planPreferences(strippedInheritedProse)
+        : { skipCheck: false };
+      const wsRoots = payload.workspacePaths ?? payload.workspace_paths;
+      const gateRequested =
+        requestedProjectCheck(rawLastUserInput, wsRoots) ||
+        (inheritedSource
+          ? requestedProjectCheck(inheritedSource + "\n" + (transcriptTail?.planCheckText || ""), wsRoots)
+          : null);
+      nextState.deliveryGate = {
+        key: gateKey,
+        skipCheck: Boolean(gatePrefs.skipCheck || inheritedPrefs.skipCheck),
+        requested: gateRequested,
+        wroteSource: false,
+        noCmdNoticed: false,
+        lastProgressStep: -1,
+        consecutiveNoTestNudges: 0,
+        scopes: {},
+        customReceipts: {}
+      };
+      stateChanged = true;
+    }
+    if (nextState.deliveryGate) {
+      const advancedGate = advanceDeliveryGate(
+        nextState.deliveryGate,
+        effectiveEvents,
+        effSettings.deliveryTestCommand
+      );
+      if (advancedGate !== nextState.deliveryGate) {
+        nextState.deliveryGate = advancedGate;
+        stateChanged = true;
+      }
+    }
+  } else if (nextState.deliveryGate !== null) {
+    nextState.deliveryGate = null;
+    stateChanged = true;
   }
 
   // 3. Priority 1: Read-only Plan Mode blocked artifact write_file
@@ -1446,6 +1533,43 @@ export function evaluatePreInvocation(payload, events = [], prevStateInput = nul
     };
   }
 
+  // 7. Priority 5: Delivery Test Gate conservative missing-test disclosure (once per turn)
+  const activeGate = effSettings.deliveryTestGateEnabled ? nextState.deliveryGate : null;
+  if (
+    activeGate &&
+    activeGate.wroteSource &&
+    !activeGate.skipCheck &&
+    !activeGate.noCmdNoticed &&
+    !uiOnly &&
+    activeSlash.size === 0 &&
+    !activePlanBlock &&
+    !transcriptTail?.awaitingUserApprovalOrQuestion
+  ) {
+    const gateStatus = evaluateDeliveryGateStatus(activeGate, effSettings.deliveryTestCommand);
+    if (
+      gateStatus.untestedScopes.length > 0 &&
+      gateStatus.pendingChecks.length === 0 &&
+      gateStatus.failedChecks.length === 0
+    ) {
+      nextState.deliveryGate = { ...activeGate, noCmdNoticed: true };
+      stateChanged = true;
+      const dirs = gateStatus.untestedScopes.map((s) => JSON.stringify(s.dir)).join("、");
+      return {
+        nextState,
+        injectStep: buildInjectStep({
+          uiOnly,
+          systemMessage:
+            `[agy-cmd 交付测试门禁 · 保守放行提示] 本轮在以下目录修改了源码，但未检测到现成的自动测试命令，且面板未配置自定义验证命令：${dirs}。` +
+            `请保持保守放行，不要私自修改仓库或强行新增测试框架；但在最终交付回复末尾必须明确说明「未检测到现成测试命令 / 缺测项及原因」（如已执行其他手动检查请一并如实列出），严禁宣称测试已通过。`
+        }),
+        shouldResetEvents,
+        reasonCode: "delivery_gate_no_test_disclosure",
+        stateChanged,
+        metrics
+      };
+    }
+  }
+
   return {
     nextState,
     injectStep: null,
@@ -1493,7 +1617,9 @@ export function evaluateStop(payload, events = [], prevStateInput = null, option
   const termReason = rawTerm.toUpperCase();
   const freeModelStop = termReason === "MODEL_STOP" && effSettings.planTier === "free" &&
     Boolean(prevState.freePlan) && (payload.fullyIdle ?? payload.fully_idle) === true;
-  if ((!freeModelStop && termReason !== "NO_TOOL_CALL") || STOP_ALLOW_REASONS.has(termReason)) {
+  const gateModelStop = termReason === "MODEL_STOP" && effSettings.deliveryTestGateEnabled === true &&
+    (payload.fullyIdle ?? payload.fully_idle) === true;
+  if ((!freeModelStop && !gateModelStop && termReason !== "NO_TOOL_CALL") || STOP_ALLOW_REASONS.has(termReason)) {
     return {
       decision: "allow",
       reason: "",
@@ -1576,29 +1702,132 @@ export function evaluateStop(payload, events = [], prevStateInput = null, option
     nextState.freePlan = plan;
     stateChanged = true;
   }
+
+  const rawDeliveryGate = effSettings.deliveryTestGateEnabled
+    ? nextState.deliveryGate || {
+        key: `turn:${nextState.userTurnCount || 0}`,
+        skipCheck: false,
+        requested: null,
+        wroteSource: false,
+        noCmdNoticed: false,
+        lastProgressStep: -1,
+        consecutiveNoTestNudges: 0,
+        scopes: {},
+        customReceipts: {}
+      }
+    : null;
+  const deliveryGate = rawDeliveryGate
+    ? advanceDeliveryGate(rawDeliveryGate, effectiveEvents, effSettings.deliveryTestCommand)
+    : null;
+  if (deliveryGate && deliveryGate !== nextState.deliveryGate) {
+    nextState.deliveryGate = deliveryGate;
+    stateChanged = true;
+  }
+  const strippedStopProse = rawLastUserInput.replace(/```[\s\S]*?```/g, " ");
+  const userSkipTests = Boolean(planPreferences(strippedStopProse).skipCheck || deliveryGate?.skipCheck);
+  const skipDeliveryGate =
+    !deliveryGate ||
+    userSkipTests ||
+    turnOverride?.mode === "off" ||
+    Boolean(transcriptTail?.latestPlanModeDenial);
+  const gateStatus =
+    deliveryGate && !skipDeliveryGate
+      ? evaluateDeliveryGateStatus(deliveryGate, effSettings.deliveryTestCommand)
+      : { pendingChecks: [], failedChecks: [], untestedScopes: [], allPassed: true };
+  const gateFailedCheck = gateStatus.failedChecks[0] || null;
+  const gatePendingChecks = gateStatus.pendingChecks;
+
   // A scope outside this plan, another package's green test or arbitrary
   // successful command cannot clear a known failed project check.
-  const skipPlanChecks = plan && (plan.skipCheck || planPreferences(rawLastUserInput).skipCheck);
+  const skipPlanChecks = plan && (plan.skipCheck || planPreferences(strippedStopProse).skipCheck);
   const checks = plan && !skipPlanChecks &&
     !transcriptTail?.latestPlanModeDenial ? pendingPlanChecks(plan) : [];
-  const scopedFailure = checks.find(check => check.failed);
+  const scopedFailure = gateFailedCheck || checks.find(check => check.failed);
   const stalePlanFailure = plan && metrics.lastFailureIsVerify && effectiveEvents.some(ev =>
     ev.failed && ev.kind === "cmd" && ev.ts === metrics.latestFailureTs && ev.planEvidence?.key === plan.key &&
     Number.isSafeInteger(ev.stepIdx) && plan.scopes[ev.planEvidence.checked?.scope]?.editStep > ev.stepIdx);
+  const staleGateFailure = Boolean(
+    deliveryGate &&
+    !skipDeliveryGate &&
+    gatePendingChecks.length > 0 &&
+    !gateFailedCheck &&
+    metrics.lastFailureIsVerify &&
+    effectiveEvents.some((ev, idx) => {
+      if (
+        !ev.failed ||
+        ev.kind !== "cmd" ||
+        ev.ts !== metrics.latestFailureTs ||
+        ev.deliveryEvidence?.key !== deliveryGate.key
+      ) {
+        return false;
+      }
+      const evOrder = deliveryEventOrder(ev, idx);
+      const checkedEntries = Array.isArray(ev.deliveryEvidence?.checked) ? ev.deliveryEvidence.checked : [];
+      if (checkedEntries.length === 0) return false;
+      return checkedEntries.some(entry => {
+        const runKey = pathKey(entry?.runDir || "");
+        if (!runKey) return false;
+        const sc = deliveryGate.scopes?.[runKey];
+        if (sc && sc.editStep !== undefined && sc.editStep > evOrder) return true;
+        return Object.values(deliveryGate.scopes || {}).some(
+          item =>
+            item.editStep !== undefined &&
+            item.editStep > evOrder &&
+            pathKey(item.root || "") === runKey
+        );
+      });
+    })
+  );
   const hasUnresolvedTurnFailure = Boolean(scopedFailure) ||
     (metrics.consecutiveCmdFailures >= 1 && metrics.latestFailureTs >= turnFloorTs &&
-     !stalePlanFailure && !(skipPlanChecks && metrics.lastFailureIsVerify));
+     !stalePlanFailure && !staleGateFailure &&
+     !((skipPlanChecks || (effSettings.deliveryTestGateEnabled && userSkipTests)) && metrics.lastFailureIsVerify));
   const explicitNoEdit = !turnGoal && !metrics.hasTurnEdit && NEGATED_EDIT_INTENT_RE.test(intentProse);
   const smartTriggered =
     !explicitNoEdit &&
-    (metrics.hasTurnEdit || plan?.wroteSource ||
+    (metrics.hasTurnEdit || plan?.wroteSource || deliveryGate?.wroteSource ||
       (metrics.lastFailureIsVerify && hasDirectFixOrChangeIntent(intentProse)));
-  const retryPolicy = resolveEffectiveRetryPolicy(
+  const baseRetryPolicy = resolveEffectiveRetryPolicy(
     effSettings,
     turnOverride,
     turnGoal,
     smartTriggered
   );
+  const deliveryGateActive = Boolean(
+    deliveryGate && !skipDeliveryGate && (gateFailedCheck || gatePendingChecks.length > 0)
+  );
+  if (termReason === "MODEL_STOP" && !freeModelStop && !deliveryGateActive) {
+    return {
+      decision: "allow",
+      reason: "",
+      reasonCode: "term_model_stop",
+      nextState,
+      stateChanged,
+      metrics
+    };
+  }
+  // When the user explicitly opted into the Delivery Test Gate:
+  // - If autoRetryMode is count/infinite, enforce gate even when autoRetryScope is goal_only.
+  // - If autoRetryMode is off (and not explicitly overridden per-turn), still allow 1 missing-test
+  //   reminder while keeping failure auto-retries disabled.
+  let retryPolicy = baseRetryPolicy;
+  if (!retryPolicy.active && deliveryGateActive && turnOverride?.mode !== "off") {
+    if (effSettings.autoRetryMode !== "off") {
+      retryPolicy = {
+        mode: effSettings.autoRetryMode,
+        max: effSettings.autoRetryMode === "infinite" ? Infinity : effSettings.autoRetryMax,
+        active: true,
+        overridden: false
+      };
+    } else if (!hasUnresolvedTurnFailure && gatePendingChecks.length > 0) {
+      retryPolicy = {
+        mode: "count",
+        max: 1,
+        active: true,
+        overridden: false
+      };
+    }
+  }
 
   if (!retryPolicy.active) {
     return {
@@ -1611,12 +1840,20 @@ export function evaluateStop(payload, events = [], prevStateInput = null, option
     };
   }
 
-  const missingCheck = !hasUnresolvedTurnFailure && !plan?.reminded && checks.length > 0 &&
+  const gateNudges = Number(deliveryGate?.consecutiveNoTestNudges || 0);
+  const gateMissingCheck =
+    deliveryGateActive &&
+    !hasUnresolvedTurnFailure &&
+    gatePendingChecks.length > 0 &&
+    gateNudges < 2 &&
+    (payload.fullyIdle ?? payload.fully_idle) !== false;
+  const missingCheck = !effSettings.deliveryTestGateEnabled &&
+    !hasUnresolvedTurnFailure && !plan?.reminded && checks.length > 0 &&
     (payload.fullyIdle ?? payload.fully_idle) === true &&
     (freeModelStop || nonEmptyString(payload.terminationReason ?? payload.termination_reason).toUpperCase() === "NO_TOOL_CALL");
-  if (!hasUnresolvedTurnFailure && !missingCheck) {
-    if ((!plan && nextState.turnAutoRetries !== 0) || nextState.lastContinueEventSig !== "") {
-      if (!plan) nextState.turnAutoRetries = 0;
+  if (!hasUnresolvedTurnFailure && !missingCheck && !gateMissingCheck) {
+    if ((!plan && !deliveryGate && nextState.turnAutoRetries !== 0) || nextState.lastContinueEventSig !== "") {
+      if (!plan && !deliveryGate) nextState.turnAutoRetries = 0;
       nextState.lastContinueEventSig = "";
       stateChanged = true;
     }
@@ -1666,6 +1903,22 @@ export function evaluateStop(payload, events = [], prevStateInput = null, option
   nextState.turnAutoRetries = nextRetryNum;
   nextState.lastContinueEventSig = currentEventSig;
   stateChanged = true;
+
+  if (gateMissingCheck) {
+    nextState.deliveryGate = { ...deliveryGate, consecutiveNoTestNudges: gateNudges + 1 };
+    const tasks = gatePendingChecks.map(({ dir, command }) => JSON.stringify(dir) + " → " + command).join("；");
+    return {
+      decision: "continue",
+      reasonCode: "delivery_gate_missing_verification",
+      nextState,
+      stateChanged,
+      metrics,
+      reason:
+        "[agy-cmd 交付测试门禁] 本轮已修改源码，尚缺最后一次修改之后的完整测试通过结果。请在以下目录运行对应验证命令并确认全部通过后再交付：" +
+        tasks +
+        "。若环境不可用或存在必须由用户确认的阻塞，请直接说明缺测项与原因并停下（无需再运行命令）。"
+    };
+  }
 
   if (missingCheck) {
     nextState.freePlan = { ...plan, reminded: true };

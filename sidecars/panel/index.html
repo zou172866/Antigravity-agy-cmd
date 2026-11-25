@@ -436,6 +436,98 @@
     }
     .free-lock-note[hidden] { display: none; }
 
+    .gate-section {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      padding-top: 8px;
+      border-top: 1px dashed var(--border);
+    }
+    .gate-box {
+      border: 1px dashed var(--border-strong);
+      background: var(--bg-subtle);
+      border-radius: 9px;
+      padding: 9px 10px;
+      display: flex;
+      flex-direction: column;
+      gap: 7px;
+    }
+    .gate-box[hidden] { display: none; }
+    .gate-cmd-label {
+      font-size: 11.5px;
+      font-weight: 650;
+      color: var(--text-secondary);
+    }
+    .cmd-row {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .cmd-input {
+      flex: 1;
+      min-width: 0;
+      height: 28px;
+      padding: 0 8px;
+      border-radius: 7px;
+      border: 1px solid var(--border);
+      background: var(--bg-card);
+      color: var(--text-primary);
+      font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+      font-size: 11.5px;
+    }
+    .cmd-input:focus {
+      outline: none;
+      border-color: var(--accent-border);
+    }
+    .cmd-btn {
+      flex: none;
+      height: 28px;
+      padding: 0 10px;
+      border-radius: 7px;
+      border: 1px solid var(--btn-primary-bg);
+      background: var(--btn-primary-bg);
+      color: var(--btn-primary-fg);
+      font-size: 11.5px;
+      font-weight: 650;
+      cursor: pointer;
+    }
+    .cmd-btn:hover {
+      background: var(--btn-primary-hover);
+      border-color: var(--btn-primary-hover);
+    }
+    .cmd-btn-ghost {
+      flex: none;
+      height: 28px;
+      padding: 0 8px;
+      border-radius: 7px;
+      border: 1px solid var(--border-strong);
+      background: var(--bg-card);
+      color: var(--text-secondary);
+      font-size: 11.5px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    .cmd-btn-ghost:hover {
+      background: var(--bg-hover);
+      color: var(--text-primary);
+    }
+    .cmd-btn-ghost[hidden] { display: none; }
+    .gate-sub-hint {
+      font-size: 11px;
+      color: var(--text-muted);
+      line-height: 1.4;
+    }
+    .gate-warn-note {
+      font-size: 11.5px;
+      padding: 7px 9px;
+      border-radius: 7px;
+      background: var(--warn-soft);
+      border: 1px solid var(--warn-border);
+      color: var(--warn-text);
+      line-height: 1.45;
+    }
+    .gate-warn-note[hidden] { display: none; }
+
     .status-bar { display: flex; flex-direction: column; gap: 5px; font-size: 12px; color: var(--text-primary); }
     .status-line { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
     .status-muted { color: var(--text-secondary); }
@@ -601,6 +693,39 @@
         </label>
       </div>
 
+      <div class="gate-section">
+        <label class="toggle-row" id="row-delivery-gate">
+          <div class="row-text">
+            <b id="delivery-gate-label">交付前强制测试门禁（改后必测，全绿交付）</b>
+            <small id="delivery-gate-help">默认关闭。开启后，改完源码必须先跑通全量测试才允许交付；项目无现成测试时保守放行并强制说明缺测。</small>
+          </div>
+          <input id="chk-delivery-gate" type="checkbox" role="switch" aria-labelledby="delivery-gate-label" aria-describedby="delivery-gate-help">
+        </label>
+
+        <div id="delivery-gate-box" class="gate-box" hidden>
+          <label class="gate-cmd-label" for="inp-delivery-cmd">自定义验证命令（可选，留空自动探测项目测试）</label>
+          <div class="cmd-row">
+            <input
+              id="inp-delivery-cmd"
+              class="cmd-input"
+              type="text"
+              maxlength="240"
+              placeholder="例如：npm run typecheck &amp;&amp; npm test"
+              autocomplete="off"
+              spellcheck="false"
+            >
+            <button id="btn-save-delivery-cmd" class="cmd-btn" type="button">保存</button>
+            <button id="btn-clear-delivery-cmd" class="cmd-btn-ghost" type="button" hidden>清空</button>
+          </div>
+          <div class="gate-sub-hint">
+            支持单条或 <code>&amp;&amp;</code> 组合命令；保存后优先生效，关闭门禁仍保留已填命令。
+          </div>
+          <div id="delivery-off-warn" class="gate-warn-note" hidden>
+            当前「自动重试」已关闭：未跑测试时最多提醒补跑 1 次，测挂后不会自动修复；如需修到全绿，请在上方改选「指定次数」或「一直重试」。
+          </div>
+        </div>
+      </div>
+
       <div class="hint-foot">
         安全刹车：即使选「一直重试」，手动点击停止按钮、AI 停下向你提问（无新命令/改动）或触及宿主安全上限时仍会立即停机。
       </div>
@@ -680,13 +805,16 @@
         <div class="status-line">
           <span class="status-muted" id="lbl-boost-status">—</span>
         </div>
+        <div class="status-line">
+          <span class="status-muted" id="lbl-gate-status">—</span>
+        </div>
         <div class="status-line" style="margin-top:2px">
           <span class="status-muted">累计自动拦截续跑：<strong id="lbl-total-retries">0</strong> 次</span>
           <button id="btn-reset-stats" class="link-btn" type="button">清零统计</button>
         </div>
       </div>
       <div class="hint-foot">
-        💡 单轮临时口令：在任意提问里顺带说 <code>这次最多重试 5 次</code>、<code>这次一直重试</code> 或 <code>这次不用重试</code> 即可仅对当轮生效。
+        💡 单轮临时口令：在任意提问里顺带说 <code>这次最多重试 5 次</code>、<code>这次一直重试</code>、<code>这次不用重试</code> 或 <code>这次跳过测试</code> 即可仅对当轮生效。
       </div>
     </section>
   </div>
@@ -706,6 +834,11 @@
       let starPromptInFlight = false;
       let pendingStarResolution = null;
       let starCopyHideTimer = null;
+      let deliveryCmdDirty = false;
+      let lastSavedDeliveryCmd = "";
+      let deliveryCmdEditSeq = 0;
+      let apiMutationSeq = 0;
+      let latestAppliedMutationSeq = 0;
 
       // Sync theme strictly from Antigravity's actual host --background luminance
       // (never from OS prefers-color-scheme, avoiding dark-OS + light-App white text mismatch).
@@ -776,8 +909,15 @@
       const chkFreePlanReview = $("chk-free-plan-review");
       const chkFreeFb = $("chk-free-fb");
       const chkPlanFb = $("chk-plan-fb");
+      const chkDeliveryGate = $("chk-delivery-gate");
+      const deliveryGateBox = $("delivery-gate-box");
+      const inpDeliveryCmd = $("inp-delivery-cmd");
+      const btnSaveDeliveryCmd = $("btn-save-delivery-cmd");
+      const btnClearDeliveryCmd = $("btn-clear-delivery-cmd");
+      const deliveryOffWarn = $("delivery-off-warn");
       const lblSummary = $("lbl-summary");
       const lblBoostStatus = $("lbl-boost-status");
+      const lblGateStatus = $("lbl-gate-status");
       const lblTotalRetries = $("lbl-total-retries");
       const btnResetStats = $("btn-reset-stats");
       const toastEl = $("toast");
@@ -1005,15 +1145,31 @@
         chkFreeFb.checked = Boolean(s.freeFallbackEnabled);
         chkPlanFb.checked = Boolean(s.planFallbackEnabled);
 
+        const gateOn = s.deliveryTestGateEnabled === true;
+        if (chkDeliveryGate) chkDeliveryGate.checked = gateOn;
+        setElementHidden(deliveryGateBox, !gateOn);
+        const savedCmd = typeof s.deliveryTestCommand === "string" ? s.deliveryTestCommand : "";
+        lastSavedDeliveryCmd = savedCmd;
+        if (inpDeliveryCmd && !deliveryCmdDirty && document.activeElement !== inpDeliveryCmd) {
+          inpDeliveryCmd.value = savedCmd;
+        }
+        const curCmdVal = inpDeliveryCmd ? inpDeliveryCmd.value.trim() : savedCmd;
+        setElementHidden(btnClearDeliveryCmd, !savedCmd && !curCmdVal);
+        setElementHidden(deliveryOffWarn, !(gateOn && s.autoRetryMode === "off"));
+
         lblSummary.textContent = data.summaryZh || "";
         lblBoostStatus.textContent = data.boostStatusZh || "";
+        if (lblGateStatus) lblGateStatus.textContent = data.deliveryGateStatusZh || "";
         lblTotalRetries.textContent = String(s.stats?.totalAutoRetries ?? 0);
         renderStarMilestoneBanner(data.starPrompt || s.starPrompt);
       }
 
       async function savePatch(patch, toastText = "设置已实时生效") {
+        const mutSeq = ++apiMutationSeq;
         try {
           const data = await callApi("/api/settings", patch);
+          if (mutSeq < latestAppliedMutationSeq) return;
+          latestAppliedMutationSeq = mutSeq;
           render(data);
           showToast(toastText);
         } catch (err) {
@@ -1023,38 +1179,38 @@
 
       retryModeBtns.forEach((btn) => {
         btn.addEventListener("click", () => {
-          savePatch({ autoRetryMode: btn.dataset.retryMode });
+          return savePatch({ autoRetryMode: btn.dataset.retryMode });
         });
       });
 
       presetBtns.forEach((btn) => {
         btn.addEventListener("click", () => {
-          savePatch({ autoRetryMode: "count", autoRetryMax: Number(btn.dataset.preset) });
+          return savePatch({ autoRetryMode: "count", autoRetryMax: Number(btn.dataset.preset) });
         });
       });
 
       btnDec.addEventListener("click", () => {
         const cur = Number(inpMax.value) || 3;
         const next = Math.max(1, cur - 1);
-        savePatch({ autoRetryMode: "count", autoRetryMax: next });
+        return savePatch({ autoRetryMode: "count", autoRetryMax: next });
       });
 
       btnInc.addEventListener("click", () => {
         const cur = Number(inpMax.value) || 3;
         const next = Math.min(50, cur + 1);
-        savePatch({ autoRetryMode: "count", autoRetryMax: next });
+        return savePatch({ autoRetryMode: "count", autoRetryMax: next });
       });
 
       inpMax.addEventListener("change", () => {
         const raw = Number(inpMax.value);
         const clamped = Number.isFinite(raw) ? Math.min(50, Math.max(1, Math.floor(raw))) : 3;
         inpMax.value = String(clamped);
-        savePatch({ autoRetryMode: "count", autoRetryMax: clamped });
+        return savePatch({ autoRetryMode: "count", autoRetryMax: clamped });
       });
 
       scopeRadios.forEach((r) => {
         r.addEventListener("change", () => {
-          if (r.checked) savePatch({ autoRetryScope: r.value });
+          if (r.checked) return savePatch({ autoRetryScope: r.value });
         });
       });
 
@@ -1062,33 +1218,99 @@
         btn.addEventListener("click", () => {
           const tier = btn.dataset.tier;
           const msg = tier === "paid" ? "已切换至会员模式并开启 Boost 接入" : "已切回免费安全模式（关闭 Boost 防报错）";
-          savePatch({ planTier: tier }, msg);
+          return savePatch({ planTier: tier }, msg);
         });
       });
 
       chkBoost.addEventListener("change", () => {
-        savePatch({ boostEnabled: chkBoost.checked });
+        return savePatch({ boostEnabled: chkBoost.checked });
       });
 
       chkPlanBoost.addEventListener("change", () => {
-        savePatch({ boostAfterPlanApproval: chkPlanBoost.checked });
+        return savePatch({ boostAfterPlanApproval: chkPlanBoost.checked });
       });
 
       chkFreePlanReview.addEventListener("change", () => {
-        savePatch({ freePlanReviewEnabled: chkFreePlanReview.checked });
+        return savePatch({ freePlanReviewEnabled: chkFreePlanReview.checked });
       });
 
       chkFreeFb.addEventListener("change", () => {
-        savePatch({ freeFallbackEnabled: chkFreeFb.checked });
+        return savePatch({ freeFallbackEnabled: chkFreeFb.checked });
       });
 
       chkPlanFb.addEventListener("change", () => {
-        savePatch({ planFallbackEnabled: chkPlanFb.checked });
+        return savePatch({ planFallbackEnabled: chkPlanFb.checked });
       });
 
+      if (chkDeliveryGate) {
+        chkDeliveryGate.addEventListener("change", () => {
+          const on = chkDeliveryGate.checked;
+          return savePatch(
+            { deliveryTestGateEnabled: on },
+            on ? "已开启交付前强制测试门禁" : "已关闭交付前强制测试门禁"
+          );
+        });
+      }
+
+      async function saveDeliveryCmd(rawVal, toastText) {
+        const mutSeq = ++apiMutationSeq;
+        const editSeqAtStart = deliveryCmdEditSeq;
+        try {
+          const data = await callApi("/api/settings", { deliveryTestCommand: rawVal });
+          if (mutSeq < latestAppliedMutationSeq) return;
+          latestAppliedMutationSeq = mutSeq;
+          if (editSeqAtStart === deliveryCmdEditSeq) {
+            deliveryCmdDirty = false;
+            if (inpDeliveryCmd) {
+              inpDeliveryCmd.value = typeof data.settings?.deliveryTestCommand === "string"
+                ? data.settings.deliveryTestCommand
+                : "";
+            }
+          }
+          render(data);
+          showToast(toastText);
+        } catch (err) {
+          showToast(`保存失败：${err.message}`);
+        }
+      }
+
+      if (inpDeliveryCmd) {
+        inpDeliveryCmd.addEventListener("input", () => {
+          deliveryCmdEditSeq += 1;
+          const curVal = inpDeliveryCmd.value.trim();
+          deliveryCmdDirty = curVal !== lastSavedDeliveryCmd;
+          setElementHidden(btnClearDeliveryCmd, !lastSavedDeliveryCmd && !curVal);
+        });
+        inpDeliveryCmd.addEventListener("keydown", (ev) => {
+          if (ev.isComposing || ev.keyCode === 229) return;
+          if (ev.key === "Enter") {
+            ev.preventDefault();
+            const val = inpDeliveryCmd.value.trim();
+            return saveDeliveryCmd(val, val ? "自定义验证命令已保存" : "已清空自定义命令（回退自动探测）");
+          }
+        });
+      }
+
+      if (btnSaveDeliveryCmd) {
+        btnSaveDeliveryCmd.addEventListener("click", () => {
+          const val = inpDeliveryCmd ? inpDeliveryCmd.value.trim() : "";
+          return saveDeliveryCmd(val, val ? "自定义验证命令已保存" : "已清空自定义命令（回退自动探测）");
+        });
+      }
+
+      if (btnClearDeliveryCmd) {
+        btnClearDeliveryCmd.addEventListener("click", () => {
+          deliveryCmdEditSeq += 1;
+          return saveDeliveryCmd("", "已清空自定义命令（回退自动探测）");
+        });
+      }
+
       btnAckOnboard.addEventListener("click", async () => {
+        const mutSeq = ++apiMutationSeq;
         try {
           const data = await callApi("/api/dismiss-onboarding", {});
+          if (mutSeq < latestAppliedMutationSeq) return;
+          latestAppliedMutationSeq = mutSeq;
           render(data);
           showToast("已确认当前设置");
         } catch (err) {
@@ -1097,7 +1319,7 @@
       });
 
       btnResetStats.addEventListener("click", () => {
-        savePatch({ resetStats: true }, "统计已清零");
+        return savePatch({ resetStats: true }, "统计已清零");
       });
 
       if (githubStarLink) {
@@ -1114,8 +1336,10 @@
       }
 
       async function refresh() {
+        const mutAtStart = apiMutationSeq;
         try {
           const data = await callApi("/api/state", {});
+          if (mutAtStart !== apiMutationSeq) return;
           render(data);
         } catch {}
       }

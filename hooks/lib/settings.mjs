@@ -5,6 +5,7 @@ import path from "node:path";
 export const MIN_RETRY_MAX = 1;
 export const MAX_RETRY_MAX = 50;
 export const DEFAULT_RETRY_MAX = 3;
+export const MAX_DELIVERY_CMD_LEN = 240;
 export const SETTINGS_VERSION = 2;
 
 export const GITHUB_REPO_URL = "https://github.com/zou172866/Antigravity-agy-cmd";
@@ -57,6 +58,8 @@ export function createDefaultSettings() {
     autoRetryMode: "count",
     autoRetryMax: DEFAULT_RETRY_MAX,
     autoRetryScope: "smart",
+    deliveryTestGateEnabled: false,
+    deliveryTestCommand: "",
     freeFallbackEnabled: true,
     planFallbackEnabled: true,
     configuredByUser: false,
@@ -232,6 +235,34 @@ export function clampRetryMax(val, fallback = DEFAULT_RETRY_MAX) {
   return Math.min(MAX_RETRY_MAX, Math.max(MIN_RETRY_MAX, Math.floor(n)));
 }
 
+export function sanitizeDeliveryTestCommand(raw, { strict = false } = {}) {
+  if (strict) {
+    if (typeof raw !== "string") {
+      const err = new Error("deliveryTestCommand must be a string");
+      err.statusCode = 400;
+      throw err;
+    }
+    if (/[\x00-\x08\x0a-\x1f\x7f]/.test(raw)) {
+      const err = new Error("deliveryTestCommand must be a single-line command without control characters");
+      err.statusCode = 400;
+      throw err;
+    }
+    const normalized = raw.trim().replace(/[ \t]+/g, " ");
+    if (normalized.length > MAX_DELIVERY_CMD_LEN) {
+      const err = new Error(`deliveryTestCommand must be at most ${MAX_DELIVERY_CMD_LEN} characters`);
+      err.statusCode = 400;
+      throw err;
+    }
+    return normalized;
+  }
+  if (typeof raw !== "string") return "";
+  return raw
+    .replace(/[\x00-\x1f\x7f]+/g, " ")
+    .trim()
+    .replace(/[ \t]+/g, " ")
+    .slice(0, MAX_DELIVERY_CMD_LEN);
+}
+
 export function normalizeSettings(raw = {}) {
   const def = createDefaultSettings();
   const src = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
@@ -280,6 +311,8 @@ export function normalizeSettings(raw = {}) {
     autoRetryMode,
     autoRetryMax,
     autoRetryScope,
+    deliveryTestGateEnabled: src.deliveryTestGateEnabled === true,
+    deliveryTestCommand: sanitizeDeliveryTestCommand(src.deliveryTestCommand, { strict: false }),
     freeFallbackEnabled,
     planFallbackEnabled,
     configuredByUser,
@@ -418,6 +451,19 @@ export function updateSettings(stateDir, patch = {}, options = {}) {
         throw err;
       }
       next.autoRetryScope = patch.autoRetryScope;
+    }
+
+    if ("deliveryTestGateEnabled" in patch) {
+      if (typeof patch.deliveryTestGateEnabled !== "boolean") {
+        const err = new Error("deliveryTestGateEnabled must be a boolean");
+        err.statusCode = 400;
+        throw err;
+      }
+      next.deliveryTestGateEnabled = patch.deliveryTestGateEnabled;
+    }
+
+    if ("deliveryTestCommand" in patch) {
+      next.deliveryTestCommand = sanitizeDeliveryTestCommand(patch.deliveryTestCommand, { strict: true });
     }
 
     if ("boostAfterPlanApproval" in patch) {
@@ -672,4 +718,15 @@ export function formatRetrySummaryZh(settings = {}) {
     return `一直重试直至全绿（${scopeLabel}）`;
   }
   return `最多重试 ${s.autoRetryMax} 次（${scopeLabel}）`;
+}
+
+export function formatDeliveryGateSummaryZh(settings = {}) {
+  const s = normalizeSettings(settings);
+  if (!s.deliveryTestGateEnabled) {
+    return "交付测试门禁：关闭（按默认防停机策略运行）";
+  }
+  if (s.deliveryTestCommand) {
+    return `交付测试门禁：已开启 · 自定义命令：${s.deliveryTestCommand}`;
+  }
+  return "交付测试门禁：已开启 · 自动探测项目测试（无测项保守放行并说明）";
 }

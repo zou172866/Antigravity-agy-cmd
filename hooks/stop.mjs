@@ -60,7 +60,10 @@ export async function runStop(rawInput, env = process.env, nowMs = Date.now()) {
     }
 
     if (verdict.decision === "continue") {
-      if (verdict.reasonCode !== "approved_plan_missing_verification") {
+      if (
+        verdict.reasonCode !== "approved_plan_missing_verification" &&
+        verdict.reasonCode !== "delivery_gate_missing_verification"
+      ) {
         recordAutoRetryStat(stateDir, convId, new Date(nowMs).toISOString());
       }
       return {
