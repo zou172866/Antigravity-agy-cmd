@@ -1,9 +1,9 @@
 {
   "name": "agy-cmd",
-  "version": "2.3.1",
+  "version": "2.4.0",
   "private": true,
   "type": "module",
-  "description": "Google Antigravity Desktop/IDE plugin: task-based command and multi-agent routing, auto Boost for approved plans and hard debugging, read-only stuck recovery, anti-bypass plan guard, Stop-hook auto-retry, and right-hand panel.",
+  "description": "Google Antigravity Desktop/IDE plugin: task-based command and multi-agent routing, opt-in delivery test gate with custom verification commands, auto Boost for hard debugging, read-only stuck recovery, anti-bypass plan guard, Stop-hook auto-retry, and right-hand panel.",
   "homepage": "https://github.com/zou172866/Antigravity-agy-cmd#readme",
   "repository": {
     "type": "git",
