@@ -8,6 +8,8 @@
 
 **Google Antigravity 桌面端插件：按任务自动路由指令 · 测试未过自动续跑 · 自动调用多智能体 · 卡壳时自动换视角排查 · 防止偷偷改代码**
 
+[![Clones](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/zou172866/repo-traffic-archive/main/badges/Antigravity-agy-cmd.json)](https://github.com/zou172866/repo-traffic-archive)
+
 [怎么安装](#怎么安装-agy-cmd) · [核心功能](#agy-cmd-有哪些功能) · [命令行管理](#怎么用命令行管理)
 
 </div>

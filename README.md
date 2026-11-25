@@ -8,6 +8,8 @@
 
 **Google Antigravity plugin: auto-route commands · Stop-hook auto-retry · auto multi-agent dispatch · fresh-perspective stuck recovery · anti-bypass plan guard**
 
+[![Clones](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/zou172866/repo-traffic-archive/main/badges/Antigravity-agy-cmd.json)](https://github.com/zou172866/repo-traffic-archive)
+
 [How to Install](#how-to-install) · [Features](#features) · [CLI Management](#cli-management)
 
 </div>
