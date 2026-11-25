@@ -52,7 +52,7 @@ export function createDefaultSettings() {
     // Default strictly to Free-Tier Safe Mode so non-subscribers never hit /boost errors.
     planTier: "free",
     boostEnabled: false,
-    boostAfterPlanApproval: true,
+    boostAfterPlanApproval: false,
     freePlanReviewEnabled: false,
     autoRetryMode: "count",
     autoRetryMax: DEFAULT_RETRY_MAX,

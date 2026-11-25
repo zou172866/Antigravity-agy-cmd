@@ -648,9 +648,9 @@
         <label class="toggle-row" id="row-plan-boost" hidden>
           <div class="row-text">
             <b id="plan-boost-label">计划获批后自动使用 Boost</b>
-            <small id="plan-boost-help">默认开启。会员 Boost 接入开启时，点「批准」或回复「按计划执行」即可触发。</small>
+            <small id="plan-boost-help">默认关闭。按需开启；会员 Boost 接入开启时，点「批准」或回复「按计划执行」即可触发。</small>
           </div>
-          <input id="chk-plan-boost" type="checkbox" role="switch" aria-labelledby="plan-boost-label" aria-describedby="plan-boost-help" checked>
+          <input id="chk-plan-boost" type="checkbox" role="switch" aria-labelledby="plan-boost-label" aria-describedby="plan-boost-help">
         </label>
 
         <label class="toggle-row">
@@ -1000,7 +1000,7 @@
         chkFreePlanReview.checked = s.freePlanReviewEnabled === true;
         chkBoost.checked = !isFree && Boolean(s.boostEnabled);
         chkBoost.disabled = isFree;
-        chkPlanBoost.checked = s.boostAfterPlanApproval !== false;
+        chkPlanBoost.checked = s.boostAfterPlanApproval === true;
 
         chkFreeFb.checked = Boolean(s.freeFallbackEnabled);
         chkPlanFb.checked = Boolean(s.planFallbackEnabled);

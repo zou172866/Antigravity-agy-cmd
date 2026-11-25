@@ -38,6 +38,7 @@ test("defaults: strictly starts in Free-Tier Safe Mode (boostEnabled=false) with
   assert.equal(s.version, 2);
   assert.equal(s.planTier, "free");
   assert.equal(s.boostEnabled, false);
+  assert.equal(s.boostAfterPlanApproval, false);
   assert.equal(s.freePlanReviewEnabled, false);
   assert.equal(s.autoRetryMode, "count");
   assert.equal(s.autoRetryMax, 3);
@@ -524,7 +525,7 @@ test("Sidecar HTTP server: serves UI, persists settings, blocks CSRF/cross-origi
     const stData = await stRes.json();
     assert.equal(stData.settings.planTier, "free");
     assert.equal(stData.settings.boostEnabled, false);
-    assert.equal(stData.settings.boostAfterPlanApproval, true);
+    assert.equal(stData.settings.boostAfterPlanApproval, false);
     assert.equal(stData.settings.freePlanReviewEnabled, false);
     assert.equal(stData.settings.configuredByUser, false);
 
@@ -553,14 +554,14 @@ test("Sidecar HTTP server: serves UI, persists settings, blocks CSRF/cross-origi
     const updRes = await fetch(`${base}/api/settings`, {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-Agy-Cmd-Csrf": csrf },
-      body: JSON.stringify({ autoRetryMode: "off", planTier: "paid", boostAfterPlanApproval: false })
+      body: JSON.stringify({ autoRetryMode: "off", planTier: "paid", boostAfterPlanApproval: true })
     });
     assert.equal(updRes.status, 200);
     const updData = await updRes.json();
     assert.equal(updData.settings.autoRetryMode, "off");
     assert.equal(updData.settings.planTier, "paid");
     assert.equal(updData.settings.boostEnabled, true);
-    assert.equal(updData.settings.boostAfterPlanApproval, false);
+    assert.equal(updData.settings.boostAfterPlanApproval, true);
     assert.equal(updData.settings.freePlanReviewEnabled, true);
     assert.equal(updData.settings.configuredByUser, true);
 

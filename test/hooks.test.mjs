@@ -19,7 +19,7 @@ import {
   evaluatePreInvocation,
   unwrapCliFilterCommand
 } from "../hooks/lib/detector.mjs";
-import { maybeGcStaleSessions, readEvents } from "../hooks/lib/state.mjs";
+import { maybeGcStaleSessions, readEvents, readState } from "../hooks/lib/state.mjs";
 import { isSubagentTranscript } from "../hooks/lib/transcript.mjs";
 import { runPostToolUse } from "../hooks/post-tool-use.mjs";
 import { runPreInvocation } from "../hooks/pre-invocation.mjs";
@@ -217,14 +217,14 @@ test("paid Boost hands an approved plan to the executor once through the desktop
   updateSettings(dir, { planTier: "paid", boostEnabled: false });
   assert.deepEqual(await run("disabled", [request(approval)]), {});
   updateSettings(dir, { boostEnabled: true });
-  updateSettings(dir, { boostAfterPlanApproval: false });
+  assert.equal(readSettings(dir).boostAfterPlanApproval, false);
   assert.deepEqual(await run("plan-boost-off", [request(approval)]), {});
   assert.deepEqual(await run("plan-boost-chat-off", [plan, request("按计划执行")]), {});
+  updateSettings(dir, { boostAfterPlanApproval: true });
   updateSettings(dir, { planTier: "free" });
   const paidAgain = updateSettings(dir, { planTier: "paid" });
   assert.equal(paidAgain.boostEnabled, true);
-  assert.equal(paidAgain.boostAfterPlanApproval, false);
-  updateSettings(dir, { boostAfterPlanApproval: true });
+  assert.equal(paidAgain.boostAfterPlanApproval, true);
   for (const [name, steps] of [
     ["button", [request(approval)]],
     ["inline", [plan, request("按计划执行")]],
@@ -1743,4 +1743,75 @@ test("detector classifies stringified apply_edits.edits and Error [HOST_SERIALIZ
   assert.equal(corruptEvents.length, 1);
   assert.equal(corruptEvents[0].failed, true);
   assert.equal(corruptEvents[0].abortedNoWrite, true);
+});
+
+test("real Antigravity runtime: pre-flush background/workflow wakeup repeating lastUserInput does not false-fire Boost", async (t) => {
+  const dir = makeTmpDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const env = makeEnv(dir);
+  updateSettings(dir, { planTier: "paid", boostEnabled: true });
+
+  // 1. Exact replay of read-only /run-workflow audit prompt containing "异常兜底":
+  //    Turn 1 starts background workflow; wakeup PreInvocation runs BEFORE completion SYSTEM_MESSAGE flushes.
+  const reviewPrompt =
+    "请按同一套审查清单（输入校验、异常兜底、边界条件、并发安全），对 src/ 目录下全部 5 个 .mjs 文件逐一做只读检查，不要改代码。";
+  const reviewTx = writeTranscript(dir, "wf-wakeup.jsonl", [
+    { step_index: 0, source: "USER_EXPLICIT", type: "USER_INPUT", status: "DONE", content: `<USER_REQUEST>\n${reviewPrompt}\n</USER_REQUEST>` }
+  ]);
+  assert.deepEqual(
+    await runPreInvocation({ conversationId: "wf-1", transcriptPath: reviewTx, invocationNum: 0, initialNumSteps: 1, lastUserInput: reviewPrompt }, env, 20000),
+    {}
+  );
+  assert.equal(readState(dir, "wf-1").debugTurnStreak, 0);
+
+  appendTranscript(reviewTx, [
+    { step_index: 26, source: "MODEL", type: "GENERIC", status: "RUNNING", content: "Tool is running as a background task with task id: wf-1/task-26" },
+    { step_index: 27, source: "MODEL", type: "PLANNER_RESPONSE", status: "DONE", content: "[agy-cmd → /run-workflow] 已启动并行审查。" }
+  ]);
+  assert.deepEqual(
+    await runPreInvocation({ conversationId: "wf-1", transcriptPath: reviewTx, invocationNum: 0, initialNumSteps: 28, lastUserInput: reviewPrompt }, env, 21000),
+    {}
+  );
+  const wfState = readState(dir, "wf-1");
+  assert.equal(wfState.userTurnCount, 1);
+  assert.equal(wfState.debugTurnStreak, 0);
+  assert.equal(wfState.boostAlerted, false);
+
+  // 2. Even on a real debug Turn 1 (debugTurnStreak=1), pre-flush wakeup repeating lastUserInput
+  //    must NOT bump turn/streak or trigger Boost; a real flushed Turn 2 with identical text MUST still escalate.
+  const dbgPrompt = "接口抛异常了，帮我排查登录流程";
+  const dbgTx = writeTranscript(dir, "dbg-wakeup.jsonl", [
+    { step_index: 0, source: "USER_EXPLICIT", type: "USER_INPUT", status: "DONE", content: `<USER_REQUEST>\n${dbgPrompt}\n</USER_REQUEST>` }
+  ]);
+  assert.deepEqual(
+    await runPreInvocation({ conversationId: "dbg-wake", transcriptPath: dbgTx, invocationNum: 0, initialNumSteps: 1, lastUserInput: dbgPrompt }, env, 22000),
+    {}
+  );
+  assert.equal(readState(dir, "dbg-wake").debugTurnStreak, 1);
+
+  appendTranscript(dbgTx, [
+    { step_index: 5, source: "MODEL", type: "GENERIC", status: "RUNNING", content: "Tool is running as a background task with task id: dbg-wake/task-5" },
+    { step_index: 6, source: "MODEL", type: "PLANNER_RESPONSE", status: "DONE", content: "正在等待后台排查结果。" }
+  ]);
+  // Pre-flush wakeup: same step:0, repeated lastUserInput -> must stay Turn 1, no false Boost
+  assert.deepEqual(
+    await runPreInvocation({ conversationId: "dbg-wake", transcriptPath: dbgTx, invocationNum: 0, initialNumSteps: 7, lastUserInput: dbgPrompt }, env, 23000),
+    {}
+  );
+  assert.equal(readState(dir, "dbg-wake").userTurnCount, 1);
+  assert.equal(readState(dir, "dbg-wake").debugTurnStreak, 1);
+  assert.equal(readState(dir, "dbg-wake").boostAlerted, false);
+
+  // Real Turn 2 flushed at step:9 with identical text -> MUST advance turn & trigger multi-turn Boost
+  appendTranscript(dbgTx, [
+    { step_index: 9, source: "USER_EXPLICIT", type: "USER_INPUT", status: "DONE", content: `<USER_REQUEST>\n${dbgPrompt}\n</USER_REQUEST>` }
+  ]);
+  const realTurn2 = await runPreInvocation(
+    { conversationId: "dbg-wake", transcriptPath: dbgTx, invocationNum: 0, initialNumSteps: 10, lastUserInput: dbgPrompt },
+    env,
+    24000
+  );
+  assert.equal(realTurn2.injectSteps?.length, 1);
+  assert.match(realTurn2.injectSteps[0].systemMessage.systemMessage, /unresolved debug issue across 2 turns/);
+  assert.equal(readState(dir, "dbg-wake").userTurnCount, 2);
 });

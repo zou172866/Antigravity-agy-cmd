@@ -24,7 +24,7 @@ Once installed, it runs automatically in the background during every chat to han
 
 - **Auto-route built-in workflows by task**: matches `/grill-me`, `/plan`, `/run-workflow`, and related workflows based on scope;
 - **Stop-hook auto-retry guard**: keeps the agent investigating and fixing when tests or build checks fail instead of stopping early;
-- **Auto-dispatch Boost on approved plans and hard debugging**: with Pro / Ultra Boost enabled, approving a plan, asking to investigate or fix hard bugs (such as deadlocks, race conditions, or memory leaks), or hitting repeated failures automatically launches `DeepCoder` / `DeepInvestigator` to investigate, execute, and verify;
+- **Auto-dispatch Boost on hard debugging and stuck loops**: with Pro / Ultra Boost enabled, asking to investigate or fix hard bugs (such as deadlocks, race conditions, or memory leaks) or hitting repeated failures automatically launches `DeepCoder` / `DeepInvestigator` to investigate, execute, and verify (plan-approval Boost dispatch is also available as an optional toggle in the panel);
 - **Auto multi-agent dispatch**: automatically selects the right multi-agent mode for the task while keeping simple tasks in the main conversation.
 - **Fresh-perspective stuck recovery (all tiers)**: when repeated fixes fail, gives one available investigator a read-only diagnosis task. The main agent checks the proposed fix.
 - **Anti-bypass read-only plan guard**: when read-only Plan Mode blocks writing the plan file, forces an inline plan in chat and blocks `exit_plan_mode` so the agent cannot bypass approval and silently edit code;
@@ -71,7 +71,7 @@ To prevent free accounts from hitting errors on paid-only commands, `agy-cmd` sh
 After installing, open the right-hand **agy-cmd Auto-Router** Sidecar panel (or click `sidecar://agy-cmd/panel/` in chat) and confirm:
 
 1. **Auto-retry limit**: choose **Off (0)**, **Fixed count (1–50)**, or **Unlimited**.
-2. **Account tier**: if you subscribe to **Google AI Pro / Ultra**, switch to **Pro / Ultra** to enable Boost. The panel’s **Use Boost after plan approval** switch is on by default. When you click **Approve** or reply “implement the plan”, `agy-cmd` outputs `[agy-cmd → 计划获批，自动 Boost]` and directly dispatches Antigravity’s hidden `DeepCoder` / `DeepInvestigator` Boost subagents once without requiring manual `/boost` input (falling back to standard tools only if invocation fails), with deduplication across background-task wakeups. Turn off this switch to keep automatic Boost dispatch only for hard debugging requests (such as deadlocks, race conditions, or memory leaks) and repeated failures.
+2. **Account tier**: if you subscribe to **Google AI Pro / Ultra**, switch to **Pro / Ultra** to enable automatic Boost dispatch for hard debugging requests (such as deadlocks, race conditions, or memory leaks) and repeated failures. The panel’s **Use Boost after plan approval** switch is off by default; turn it on if you also want clicking **Approve** or replying “implement the plan” to output `[agy-cmd → 计划获批，自动 Boost]` and directly dispatch Antigravity’s hidden `DeepCoder` / `DeepInvestigator` Boost subagents once without requiring manual `/boost` input (falling back to standard tools only if invocation fails), with deduplication across background-task wakeups.
 
 ## Features
 
@@ -81,7 +81,7 @@ No need to memorize or manually pick built-in Antigravity slash commands for eve
 
 - **1–2 files, explanations, or local lookups**: responds directly with zero extra prompts or banners.
 - **Ambiguous requirements**: asks a focused multiple-choice clarification question first.
-- **3+ files or higher-risk edits**: drafts an implementation plan for your approval before touching project files (even in read-only plan mode, it writes the plan inline and waits for confirmation); when Pro / Ultra Boost is enabled, approving the plan displays `[agy-cmd → 计划获批，自动 Boost]` and dispatches `DeepCoder` / `DeepInvestigator` strictly once while preserving `Stop` auto-retry state across background-task wakeups.
+- **3+ files or higher-risk edits**: drafts an implementation plan for your approval before touching project files (even in read-only plan mode, it writes the plan inline and waits for confirmation); if you opt into **Use Boost after plan approval** under Pro / Ultra Boost, approving the plan displays `[agy-cmd → 计划获批，自动 Boost]` and dispatches `DeepCoder` / `DeepInvestigator` strictly once while preserving `Stop` auto-retry state across background-task wakeups.
 - **A self-contained side task**, such as tracing a call chain or inspecting a UI, can go to one subagent. Simple lookups stay in the main session.
 - **Repeated work** on five or more similar items runs in batches by default. With the panel set to a paid tier and the command available in the App, the plugin can choose `/run-workflow` to apply the same check to each item and collect structured results.
 - **Separate modules that need to agree on an interface** can use `/swarm` in the App. Set the interface, give each writer distinct files and name the integration check. A single recurring failure fits `/boost`. A multi-day migration with separately verifiable milestones fits `/teamwork`. [Routing examples](skills/agy-cmd/references/desktop-commands-matrix.md)

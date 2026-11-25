@@ -62,7 +62,7 @@ const SOFT_CONTINUATION_RE =
   /(?:还是不行|依然不行|仍然不行|没修好|还没解决|还是没解决|还是没好|\b(?:didn'?t\s+fix|still\s+broken|still\s+doesn'?t\s+work|not\s+fixed(?:\s+yet)?)\b)/i;
 
 const DEBUG_INITIAL_RE =
-  /(?:报错|出错|失败|排查|调试|修一下.*(?:错|bug|问题)|异常|崩溃|死锁|竞态|卡死|跑不通|测不过|通不过|\b(?:error|exception|traceback|stack\s*trace|failing|failed|bug|crash|deadlock|race\s+condition|broken|debug|fix\s+(?:this|the)\s+(?:bug|error|issue|crash|failure))\b)/i;
+  /(?:报错|出错|失败|排查|调试|修一下.*(?:错|bug|问题)|异常(?!处理|兜底|边界|路径|分支|场景|情况|恢复|安全|校验|测试|用例|单测)|崩溃|死锁|竞态|卡死|跑不通|测不过|通不过|\b(?:error|exception|traceback|stack\s*trace|failing|failed|bug|crash|deadlock|race\s+condition|broken|debug|fix\s+(?:this|the)\s+(?:bug|error|issue|crash|failure))\b)/i;
 
 const HARD_DEBUG_TASK_RE =
   /死锁|竞态|并发竞争|内存泄漏|(?:偶发|间歇性).{0,16}(?:失败|崩溃|超时)|(?:算法|性能).{0,8}瓶颈|\b(?:deadlocks?|(?:data|thread) races?|race conditions?|memory leaks?|(?:intermittent|flaky) (?:ci|tests?|crashes|failures?|timeouts?)|(?:algorithmic|performance) bottlenecks?)\b/i;
@@ -1034,15 +1034,34 @@ export function evaluatePreInvocation(payload, events = [], prevStateInput = nul
   const activeSlash = extractActiveSlashCommands(turnInput);
   const intentProse = extractProseForIntent(turnInput);
 
-  // 2. Detect new user turn entry (excluding background-task wakeups that carry no new USER_INPUT)
+  // 2. Detect new user turn entry (excluding background-task, subagent, swarm, and Stop wakeups
+  //    that carry no new USER_INPUT — Antigravity often runs PreInvocation before flushing the
+  //    wakeup SYSTEM_MESSAGE while repeating the previous turn's lastUserInput in the payload)
   const latestTxUserKey = nonEmptyString(transcriptTail?.latestUserInputKey);
+  const latestPlanPromptKey = nonEmptyString(transcriptTail?.latestPlanPromptKey);
   const sameTxTurnKey =
     Boolean(latestTxUserKey) && latestTxUserKey === (nextState.lastTurnUserInputKey || "");
+  const isDirectUnflushedNotice =
+    Boolean(rawPayloadInput) &&
+    isPlanApprovalNotice(rawPayloadInput) &&
+    !transcriptTail?.tailRolledOverWithoutUserInput &&
+    rawPayloadInput !== latestTranscriptInput;
+  const isFreshPlanApprovalClick =
+    isDirectUnflushedNotice ||
+    (Boolean(rawPayloadInput) &&
+      isPlanApprovalNotice(rawPayloadInput) &&
+      !transcriptTail?.tailRolledOverWithoutUserInput &&
+      Boolean(transcriptTail?.awaitingUserApprovalOrQuestion) &&
+      latestPlanPromptKey !== "" &&
+      latestPlanPromptKey !== (nextState.lastPlanBoostPromptKey || ""));
   const isWakeupWithNoNewInput =
     !rawPayloadInput ||
-    (sameTxTurnKey &&
-      Boolean(transcriptTail?.hasBgTaskCompletionSinceUserInput) &&
-      rawLastUserInput === nextState.lastUserInput);
+    (!isFreshPlanApprovalClick &&
+      rawLastUserInput === nextState.lastUserInput &&
+      ((sameTxTurnKey &&
+        (Boolean(transcriptTail?.hasBgTaskCompletionSinceUserInput) ||
+          Boolean(transcriptTail?.hasPlannerResponseSinceUserInput))) ||
+        Boolean(transcriptTail?.tailRolledOverWithoutUserInput)));
   const isBgTaskWakeup =
     !isMidTurn &&
     invocationNum === 0 &&
@@ -1178,13 +1197,7 @@ export function evaluatePreInvocation(payload, events = [], prevStateInput = nul
   }
 
   const paidBoostActive = effSettings.planTier === "paid" && effSettings.boostEnabled === true;
-  const isDirectUnflushedNotice =
-    Boolean(rawPayloadInput) &&
-    isPlanApprovalNotice(rawPayloadInput) &&
-    !transcriptTail?.tailRolledOverWithoutUserInput &&
-    rawPayloadInput !== latestTranscriptInput;
   const noticeHash = isPlanApprovalNotice(inputEnvelope) ? hashText(inputEnvelope) : "";
-  const latestPlanPromptKey = nonEmptyString(transcriptTail?.latestPlanPromptKey);
   const planBoostKey = isDirectUnflushedNotice
     ? `notice:${noticeHash}:${initialNumSteps ?? nextState.userTurnCount}`
     : latestTxUserKey || `turn:${nextState.userTurnCount}`;
