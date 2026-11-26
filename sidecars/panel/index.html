@@ -130,6 +130,8 @@
     .header-actions {
       display: inline-flex;
       align-items: center;
+      flex-wrap: wrap;
+      justify-content: flex-end;
       flex-shrink: 0;
       margin-left: auto;
       gap: 6px;
@@ -202,6 +204,12 @@
       border-color: var(--accent-border);
       background: var(--accent-soft);
       color: var(--accent);
+      font-weight: 700;
+    }
+    .ver-check-btn.is-on {
+      border-color: var(--ok-border);
+      background: var(--ok-soft);
+      color: var(--ok-text);
       font-weight: 700;
     }
     .ver-dot {
@@ -748,7 +756,14 @@
           <span id="version-check-dot" class="ver-dot hidden" aria-hidden="true" hidden></span>
           <span id="version-check-label">检查更新</span>
         </button>
-        <span class="ver-pill">v2.5.1</span>
+        <button
+          id="auto-update-install-btn"
+          class="ver-check-btn"
+          type="button"
+          aria-pressed="false"
+          title="默认关闭。开启后仅对同主版本且通过 SHA-256 校验的 Release 自动静默升级，单版本失败自动熔断，跨大版本仍需手动确认。"
+        >自动更新：关</button>
+        <span class="ver-pill">v2.5.2</span>
       </div>
     </div>
 
@@ -997,13 +1012,6 @@
         </div>
         <input id="chk-auto-update-check" type="checkbox" role="switch" checked aria-labelledby="auto-update-check-label" aria-describedby="auto-update-check-help">
       </label>
-      <label class="toggle-row" id="row-auto-update-install">
-        <div class="row-text">
-          <b id="auto-update-install-label">发现新版本自动静默更新</b>
-          <small id="auto-update-install-help">默认关闭。开启后仅对同主版本且通过 SHA-256 校验的 Release 自动升级，单版本失败自动熔断，跨大版本仍需手动确认。</small>
-        </div>
-        <input id="chk-auto-update-install" type="checkbox" role="switch" aria-labelledby="auto-update-install-label" aria-describedby="auto-update-install-help">
-      </label>
       <div class="hint-foot">
         💡 单轮临时口令：在任意提问里顺带说 <code>这次最多重试 5 次</code>、<code>这次一直重试</code>、<code>这次不用重试</code> 或 <code>这次跳过测试</code> 即可仅对当轮生效。
       </div>
@@ -1032,6 +1040,7 @@
       let apiMutationSeq = 0;
       let latestAppliedMutationSeq = 0;
       let currentPluginVersion = "";
+      let autoUpdateInstallEnabled = false;
       let autoVersionCheckDone = false;
       let autoVersionCheckTimer = null;
       let versionReloadTimer = null;
@@ -1119,7 +1128,7 @@
       const chkFreeFb = $("chk-free-fb");
       const chkPlanFb = $("chk-plan-fb");
       const chkAutoUpdateCheck = $("chk-auto-update-check");
-      const chkAutoUpdateInstall = $("chk-auto-update-install");
+      const autoUpdateInstallBtn = $("auto-update-install-btn");
       const chkDeliveryGate = $("chk-delivery-gate");
       const deliveryGateBox = $("delivery-gate-box");
       const inpDeliveryCmd = $("inp-delivery-cmd");
@@ -1728,7 +1737,12 @@
         chkFreeFb.checked = Boolean(s.freeFallbackEnabled);
         chkPlanFb.checked = Boolean(s.planFallbackEnabled);
         if (chkAutoUpdateCheck) chkAutoUpdateCheck.checked = s.autoUpdateCheck !== false;
-        if (chkAutoUpdateInstall) chkAutoUpdateInstall.checked = s.autoUpdateInstall === true;
+        autoUpdateInstallEnabled = s.autoUpdateInstall === true;
+        if (autoUpdateInstallBtn) {
+          autoUpdateInstallBtn.textContent = autoUpdateInstallEnabled ? "自动更新：开" : "自动更新：关";
+          autoUpdateInstallBtn.classList.toggle("is-on", autoUpdateInstallEnabled);
+          autoUpdateInstallBtn.setAttribute("aria-pressed", autoUpdateInstallEnabled ? "true" : "false");
+        }
         if (data.autoUpdateNotice && data.autoUpdateNotice.version) {
           if (versionCheckState.dismissedAutoNoticeVersion !== data.autoUpdateNotice.version) {
             versionCheckState.autoUpdatedNotice = data.autoUpdateNotice;
@@ -1846,12 +1860,12 @@
         });
       }
 
-      if (chkAutoUpdateInstall) {
-        chkAutoUpdateInstall.addEventListener("change", () => {
-          const on = chkAutoUpdateInstall.checked;
+      if (autoUpdateInstallBtn) {
+        autoUpdateInstallBtn.addEventListener("click", () => {
+          const next = !autoUpdateInstallEnabled;
           return savePatch(
-            { autoUpdateInstall: on },
-            on ? "已开启自动静默更新（仅同主版本 + SHA-256）" : "已关闭自动静默更新（改回手动点击更新）"
+            { autoUpdateInstall: next },
+            next ? "已开启自动静默更新（仅同主版本 + SHA-256）" : "已关闭自动静默更新（改回手动点击更新）"
           );
         });
       }

@@ -1389,9 +1389,9 @@ test("auto-update-install: 4 guardrails (opt-in default off, SHA-256 required, s
       await new Promise((resolve) => srv.close(resolve));
     }
 
-    // 3. Panel UI VM test: renders auto-updated notice banner and dismisses via /api/auto-update-ack + toggle switch
+    // 3. Panel UI VM test: renders auto-updated notice banner and dismisses via /api/auto-update-ack + topbar toggle button
     const htmlSource = renderPanelHtml("vm-auto-csrf");
-    assert.ok(htmlSource.includes('id="chk-auto-update-install"'));
+    assert.ok(htmlSource.includes('id="auto-update-install-btn"'));
     const scriptBlocks = [...htmlSource.matchAll(/<script>([\s\S]*?)<\/script>/gi)];
     const mainScript = scriptBlocks[scriptBlocks.length - 1][1];
     const els = new Map();
@@ -1502,7 +1502,7 @@ test("auto-update-install: 4 guardrails (opt-in default off, SHA-256 required, s
     vm.runInContext(mainScript, sandbox);
     await new Promise((r) => setTimeout(r, 20));
 
-    assert.equal(getEl("chk-auto-update-install").checked, false);
+    assert.equal(getEl("auto-update-install-btn").textContent, "自动更新：关");
     assert.equal(getEl("version-update-banner").dataset.state, "auto-updated");
     assert.match(getEl("version-status-text").textContent, /已自动更新至 v2\.5\.1（原 v2\.5\.0）/);
 
@@ -1511,9 +1511,9 @@ test("auto-update-install: 4 guardrails (opt-in default off, SHA-256 required, s
     assert.equal(getEl("version-update-banner").hidden, true);
     assert.ok(uiCalls.some((c) => c.urlPath === AUTO_UPDATE_ACK_ROUTE && c.body.dismissNotice === true));
 
-    getEl("chk-auto-update-install").checked = true;
-    await getEl("chk-auto-update-install").trigger("change");
+    await getEl("auto-update-install-btn").trigger("click");
     assert.equal(uiAutoInstall, true);
+    assert.equal(getEl("auto-update-install-btn").textContent, "自动更新：开");
   } finally {
     resetUpdateRuntimeFlags();
     fs.rmSync(stateDir, { recursive: true, force: true });
