@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { sanitizeConversationId } from "../../hooks/lib/common.mjs";
 import {
   evaluateStarPrompt,
@@ -12,6 +13,10 @@ import {
   updateSettings
 } from "../../hooks/lib/settings.mjs";
 import { readState } from "../../hooks/lib/state.mjs";
+import { createVersionChecker, parseVersion, readLocalVersion } from "./version-check.mjs";
+import { createPluginUpdater } from "./version-update.mjs";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 export const NO_STORE_HEADERS = Object.freeze({
   "Cache-Control": "no-store, no-cache, must-revalidate",
@@ -23,6 +28,59 @@ const LOCAL_HTTP_ORIGIN_RE = /^http:\/\/(?:127\.0\.0\.1|localhost|\[::1\])(?::\d
 const VSCODE_WEBVIEW_RE = /^vscode-webview:\/\/[a-z0-9._-]+(?:\/.*)?$/i;
 const STAR_PROMPT_ALLOWED_KEYS = new Set(["state"]);
 const STAR_PROMPT_ALLOWED_STATES = new Set(STAR_PROMPT_TERMINAL_STATES);
+const VERSION_CHECK_ALLOWED_KEYS = new Set(["mode", "fresh"]);
+const PLUGIN_UPDATE_ALLOWED_KEYS = new Set(["version"]);
+
+let _defaultVersionChecker = null;
+let _defaultPluginUpdater = null;
+let _updateInFlight = false;
+let _updateRestartScheduled = false;
+
+export function isPluginUpdateBusy() {
+  return _updateInFlight || _updateRestartScheduled;
+}
+
+export function resetUpdateRuntimeFlags() {
+  _updateInFlight = false;
+  _updateRestartScheduled = false;
+}
+
+export function isAutoUpdateCheckEnabled(stateDir, env = process.env) {
+  const disableFlag = String(env?.AGY_CMD_DISABLE_AUTO_UPDATE_CHECK || "").trim().toLowerCase();
+  if (disableFlag === "1" || disableFlag === "true" || disableFlag === "yes") {
+    return false;
+  }
+  try {
+    return readSettings(stateDir).autoUpdateCheck !== false;
+  } catch {
+    return true;
+  }
+}
+
+export function getDefaultVersionChecker() {
+  if (!_defaultVersionChecker) {
+    _defaultVersionChecker = createVersionChecker({
+      getCurrentVersion: () => readLocalVersion()
+    });
+  }
+  return _defaultVersionChecker;
+}
+
+export function getDefaultPluginUpdater() {
+  if (!_defaultPluginUpdater) {
+    _defaultPluginUpdater = createPluginUpdater({
+      sidecarDirectory: __dirname,
+      checkVersion: getDefaultVersionChecker()
+    });
+  }
+  return _defaultPluginUpdater;
+}
+
+function isPlainJsonObject(val) {
+  if (!val || typeof val !== "object" || Array.isArray(val)) return false;
+  const proto = Object.getPrototypeOf(val);
+  return proto === Object.prototype || proto === null;
+}
 
 function matchesSameLoopbackHostPort(headerUrlStr, hostHeader) {
   try {
@@ -113,6 +171,7 @@ export function buildPanelStatePayload(stateDir, rawConvId = "", { markStarTrigg
 
   return {
     ok: true,
+    version: readLocalVersion(),
     settings,
     starPrompt,
     summaryZh: formatRetrySummaryZh(settings),
@@ -173,6 +232,106 @@ export function handleStarPromptMutation(stateDir, rawData) {
       starPrompt: res.starPrompt,
       alreadyResolved: Boolean(res.alreadyResolved)
     }
+  };
+}
+
+export async function handleVersionCheck(
+  rawData,
+  { stateDir = "", checker = null, autoCheckEnabled = null, env = process.env } = {}
+) {
+  const data = rawData === undefined ? {} : rawData;
+  if (!isPlainJsonObject(data)) {
+    return {
+      status: 400,
+      body: { ok: false, error: "Request body must be a JSON object" }
+    };
+  }
+  for (const key of Object.keys(data)) {
+    if (!VERSION_CHECK_ALLOWED_KEYS.has(key)) {
+      return {
+        status: 400,
+        body: { ok: false, error: `Unexpected field '${key}' in request body` }
+      };
+    }
+  }
+  const mode = data.mode === undefined ? "manual" : data.mode;
+  if (mode !== "manual" && mode !== "auto") {
+    return {
+      status: 400,
+      body: { ok: false, error: "Invalid 'mode' value: expected 'manual' or 'auto'" }
+    };
+  }
+  if (data.fresh !== undefined && typeof data.fresh !== "boolean") {
+    return {
+      status: 400,
+      body: { ok: false, error: "Field 'fresh' must be a boolean" }
+    };
+  }
+  const allowAuto =
+    typeof autoCheckEnabled === "boolean" ? autoCheckEnabled : isAutoUpdateCheckEnabled(stateDir, env);
+  if (mode === "auto" && !allowAuto) {
+    return {
+      status: 200,
+      body: {
+        ok: true,
+        status: "idle",
+        currentVersion: readLocalVersion(),
+        disabled: true
+      }
+    };
+  }
+  const resolvedChecker = checker || getDefaultVersionChecker();
+  const result = await resolvedChecker(mode, { fresh: Boolean(data.fresh) });
+  return {
+    status: 200,
+    body: result
+  };
+}
+
+export async function handlePluginUpdate(
+  rawData,
+  { updater = null, onUpdated = null } = {}
+) {
+  if (!isPlainJsonObject(rawData)) {
+    return {
+      status: 400,
+      body: { ok: false, error: "Request body must be a JSON object" }
+    };
+  }
+  for (const key of Object.keys(rawData)) {
+    if (!PLUGIN_UPDATE_ALLOWED_KEYS.has(key)) {
+      return {
+        status: 400,
+        body: { ok: false, error: `Unexpected field '${key}' in request body` }
+      };
+    }
+  }
+  const parsed = typeof rawData.version === "string" ? parseVersion(rawData.version) : null;
+  if (!parsed) {
+    return {
+      status: 400,
+      body: { ok: false, error: "Invalid or missing 'version' SemVer string" }
+    };
+  }
+  const resolvedUpdater = updater || getDefaultPluginUpdater();
+  let result;
+  _updateInFlight = true;
+  try {
+    result = await resolvedUpdater(parsed.version);
+  } finally {
+    _updateInFlight = false;
+  }
+  if (result?.status === "updated" && typeof onUpdated === "function") {
+    _updateRestartScheduled = true;
+    try {
+      onUpdated(result);
+    } catch {
+      _updateRestartScheduled = false;
+    }
+  }
+  return {
+    status: 200,
+    body: result
   };
 }
 

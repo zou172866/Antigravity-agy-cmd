@@ -14,17 +14,28 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { isDirectRun, resolveStateDir } from "../../hooks/lib/common.mjs";
 import {
   dispatchPanelApi,
+  getDefaultVersionChecker,
+  handlePluginUpdate,
+  handleVersionCheck,
   isAllowedLocalRequest,
+  isAutoUpdateCheckEnabled,
+  isPluginUpdateBusy,
   NO_STORE_HEADERS,
   timingSafeEqualStr
 } from "./api-handler.mjs";
+import { readLocalVersion, VERSION_ROUTE } from "./version-check.mjs";
+import { hasActiveUpdateMarker, UPDATE_MARKER_NAME, UPDATE_ROUTE } from "./version-update.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const HTML_PATH = path.join(__dirname, "index.html");
 const MAX_BODY_BYTES = 32 * 1024;
 const WATCHED_BACKEND_FILES = [
   fileURLToPath(import.meta.url),
+  path.resolve(__dirname, "../../plugin.json"),
   path.join(__dirname, "api-handler.mjs"),
+  path.join(__dirname, "version-check.mjs"),
+  path.join(__dirname, "update-archive.mjs"),
+  path.join(__dirname, "version-update.mjs"),
   path.resolve(__dirname, "../../hooks/lib/settings.mjs"),
   path.resolve(__dirname, "../../hooks/lib/state.mjs"),
   path.resolve(__dirname, "../../hooks/lib/common.mjs")
@@ -42,7 +53,11 @@ function snapshotBackendMtimes() {
 
 export function renderPanelHtml(csrfToken = "") {
   const tpl = fs.readFileSync(HTML_PATH, "utf8");
-  return tpl.replace(/__AGY_CMD_CSRF__/g, csrfToken);
+  const localVer = readLocalVersion();
+  const withVersion = localVer
+    ? tpl.replace(/<span class="ver-pill">v[^<]*<\/span>/, `<span class="ver-pill">v${localVer}</span>`)
+    : tpl;
+  return withVersion.replace(/__AGY_CMD_CSRF__/g, csrfToken);
 }
 
 function readJsonBody(req, maxBytes = MAX_BODY_BYTES) {
@@ -121,7 +136,11 @@ function scheduleOversizedSocketClose(req, res) {
 
 export function createStandaloneServer({
   stateDir = resolveStateDir(process.env),
-  csrfToken = crypto.randomBytes(24).toString("hex")
+  csrfToken = crypto.randomBytes(24).toString("hex"),
+  versionChecker = null,
+  pluginUpdater = null,
+  autoUpdateCheckEnabled = null,
+  onUpdated = null
 } = {}) {
   const sendJson = (res, status, payload, extraHeaders = {}) => {
     res.writeHead(status, {
@@ -198,6 +217,23 @@ export function createStandaloneServer({
           );
           return;
         }
+        if (url.pathname === VERSION_ROUTE) {
+          const out = await handleVersionCheck(parsed.data, {
+            stateDir,
+            checker: versionChecker,
+            autoCheckEnabled: autoUpdateCheckEnabled
+          });
+          sendJson(res, out.status, out.body);
+          return;
+        }
+        if (url.pathname === UPDATE_ROUTE) {
+          const out = await handlePluginUpdate(parsed.data, {
+            updater: pluginUpdater,
+            onUpdated
+          });
+          sendJson(res, out.status, out.body);
+          return;
+        }
         const out = dispatchPanelApi(url.pathname, parsed.data, { stateDir });
         sendJson(res, out.status, out.body);
         return;
@@ -220,7 +256,11 @@ export function registerSidecarRoutes(
   {
     stateDir = resolveStateDir(process.env),
     csrfToken = "",
-    SidecarResponse = null
+    SidecarResponse = null,
+    versionChecker = null,
+    pluginUpdater = null,
+    autoUpdateCheckEnabled = null,
+    onUpdated = null
   } = {}
 ) {
   const wrapJson = (out) => {
@@ -265,6 +305,31 @@ export function registerSidecarRoutes(
       "POST"
     );
   }
+
+  app.api(
+    VERSION_ROUTE,
+    async (rawData) =>
+      wrapJson(
+        await handleVersionCheck(rawData, {
+          stateDir,
+          checker: versionChecker,
+          autoCheckEnabled: autoUpdateCheckEnabled
+        })
+      ),
+    "POST"
+  );
+
+  app.api(
+    UPDATE_ROUTE,
+    async (rawData) =>
+      wrapJson(
+        await handlePluginUpdate(rawData, {
+          updater: pluginUpdater,
+          onUpdated
+        })
+      ),
+    "POST"
+  );
 }
 
 function shouldUseSidecarSdk(env, hasSidecarApp) {
@@ -301,7 +366,11 @@ async function start() {
 
   if (shouldUseSidecarSdk(process.env, Boolean(SidecarApp))) {
     const bootSig = snapshotBackendMtimes();
+    const updateMarkerPath = path.join(__dirname, "../..", UPDATE_MARKER_NAME);
     const reloadTimer = setInterval(() => {
+      if (isPluginUpdateBusy() || hasActiveUpdateMarker(updateMarkerPath)) {
+        return;
+      }
       const nextSig = snapshotBackendMtimes();
       if (nextSig !== bootSig && !nextSig.split("|").includes("0")) {
         clearInterval(reloadTimer);
@@ -313,8 +382,25 @@ async function start() {
     reloadTimer.unref?.();
 
     const app = new SidecarApp();
-    registerSidecarRoutes(app, { stateDir, csrfToken, SidecarResponse });
+    registerSidecarRoutes(app, {
+      stateDir,
+      csrfToken,
+      SidecarResponse,
+      onUpdated: () => {
+        const restartTimer = setTimeout(() => {
+          process.exit(0);
+        }, 450);
+        restartTimer.unref?.();
+      }
+    });
     await app.run();
+
+    if (isAutoUpdateCheckEnabled(stateDir)) {
+      const startupCheckTimer = setTimeout(() => {
+        void getDefaultVersionChecker()("auto").catch(() => {});
+      }, 1500);
+      startupCheckTimer.unref?.();
+    }
     return;
   }
 

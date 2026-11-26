@@ -62,6 +62,7 @@ export function createDefaultSettings() {
     deliveryTestCommand: "",
     freeFallbackEnabled: true,
     planFallbackEnabled: true,
+    autoUpdateCheck: true,
     configuredByUser: false,
     onboardingShown: false,
     stats: {
@@ -290,6 +291,8 @@ export function normalizeSettings(raw = {}) {
     typeof src.freeFallbackEnabled === "boolean" ? src.freeFallbackEnabled : def.freeFallbackEnabled;
   const planFallbackEnabled =
     typeof src.planFallbackEnabled === "boolean" ? src.planFallbackEnabled : def.planFallbackEnabled;
+  const autoUpdateCheck =
+    typeof src.autoUpdateCheck === "boolean" ? src.autoUpdateCheck : def.autoUpdateCheck;
   const configuredByUser =
     typeof src.configuredByUser === "boolean" ? src.configuredByUser : def.configuredByUser;
   const onboardingShown =
@@ -327,6 +330,7 @@ export function normalizeSettings(raw = {}) {
     deliveryTestCommand: sanitizeDeliveryTestCommand(src.deliveryTestCommand, { strict: false }),
     freeFallbackEnabled,
     planFallbackEnabled,
+    autoUpdateCheck,
     configuredByUser,
     onboardingShown,
     stats: {
@@ -519,6 +523,15 @@ export function updateSettings(stateDir, patch = {}, options = {}) {
         throw err;
       }
       next.planFallbackEnabled = patch.planFallbackEnabled;
+    }
+
+    if ("autoUpdateCheck" in patch) {
+      if (typeof patch.autoUpdateCheck !== "boolean") {
+        const err = new Error("autoUpdateCheck must be a boolean");
+        err.statusCode = 400;
+        throw err;
+      }
+      next.autoUpdateCheck = patch.autoUpdateCheck;
     }
 
     if ("configuredByUser" in patch && typeof patch.configuredByUser === "boolean") {

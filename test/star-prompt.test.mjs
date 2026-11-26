@@ -776,6 +776,15 @@ test("star-5: /api/star-prompt security hardening, SidecarApp contract & zero AI
       assert.equal(/gh\s+api/i.test(src), false, `${rel} must never execute gh api`);
       assert.equal(/api\.github\.com/i.test(src), false, `${rel} must never call GitHub APIs`);
     }
+    for (const rel of [
+      "sidecars/panel/version-check.mjs",
+      "sidecars/panel/update-archive.mjs",
+      "sidecars/panel/version-update.mjs"
+    ]) {
+      const src = fs.readFileSync(path.join(ROOT, rel), "utf8");
+      assert.equal(/gh\s+api/i.test(src), false, `${rel} must never execute gh api`);
+      assert.equal(/\/user\/starred/i.test(src), false, `${rel} must never touch GitHub star endpoints`);
+    }
 
     const rulesMd = fs.readFileSync(path.join(ROOT, "rules", "AGENTS.md"), "utf8");
     assert.equal(rulesMd.includes("zou172866/Antigravity-agy-cmd"), false);

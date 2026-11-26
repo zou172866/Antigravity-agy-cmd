@@ -335,6 +335,7 @@ def default_settings() -> dict:
         "deliveryTestCommand": "",
         "freeFallbackEnabled": True,
         "planFallbackEnabled": True,
+        "autoUpdateCheck": True,
         "configuredByUser": False,
         "onboardingShown": False,
         "stats": {
@@ -379,6 +380,8 @@ def load_settings(state_dir: Path) -> dict:
     base["freePlanReviewEnabled"] = base.get("freePlanReviewEnabled") is True
     base["deliveryTestGateEnabled"] = base.get("deliveryTestGateEnabled") is True
     base["deliveryTestCommand"] = sanitize_delivery_test_command(base.get("deliveryTestCommand"), strict=False)
+    raw_auto_update = base.get("autoUpdateCheck")
+    base["autoUpdateCheck"] = raw_auto_update if isinstance(raw_auto_update, bool) else True
     base["starPrompt"] = normalize_star_prompt_state(base.get("starPrompt"))
     return base
 
@@ -464,6 +467,7 @@ def apply_settings_cli(
     free_plan_review: str | None = None,
     delivery_test_gate: str | None = None,
     delivery_test_cmd: str | None = None,
+    auto_update_check: str | None = None,
 ) -> dict:
     with _with_settings_lock(state_dir):
         current = load_settings(state_dir)
@@ -495,6 +499,8 @@ def apply_settings_cli(
             current["deliveryTestGateEnabled"] = delivery_test_gate == "on"
         if delivery_test_cmd is not None:
             current["deliveryTestCommand"] = sanitize_delivery_test_command(delivery_test_cmd, strict=True)
+        if auto_update_check is not None:
+            current["autoUpdateCheck"] = auto_update_check == "on"
 
         current["configuredByUser"] = True
         current["onboardingShown"] = True
@@ -588,14 +594,18 @@ def validate_sidecar(plugin_dir: Path) -> list[str]:
         fp = panel_dir / req_name
         if not fp.is_file():
             issues.append(f"缺少右侧边栏面板文件：{fp}")
-    server_fp = panel_dir / "server.mjs"
-    if server_fp.is_file():
-        try:
-            srv_src = server_fp.read_text(encoding="utf-8", errors="replace")
-            if "api-handler.mjs" in srv_src and not (panel_dir / "api-handler.mjs").is_file():
-                issues.append(f"缺少右侧边栏面板文件：{panel_dir / 'api-handler.mjs'}")
-        except OSError:
-            pass
+    checked_sources: list[str] = []
+    for entry_name in ("server.mjs", "api-handler.mjs", "version-update.mjs"):
+        entry_fp = panel_dir / entry_name
+        if entry_fp.is_file():
+            try:
+                checked_sources.append(entry_fp.read_text(encoding="utf-8", errors="replace"))
+            except OSError:
+                pass
+    joined_src = "\n".join(checked_sources)
+    for dep_name in ("api-handler.mjs", "version-check.mjs", "update-archive.mjs", "version-update.mjs"):
+        if dep_name in joined_src and not (panel_dir / dep_name).is_file():
+            issues.append(f"缺少右侧边栏面板文件：{panel_dir / dep_name}")
     return issues
 
 
@@ -849,6 +859,12 @@ def main(argv: list[str] | None = None) -> int:
         help="设置交付测试门禁的自定义验证命令（支持 && 组合；传空字符串清空并回退自动探测）",
     )
     parser.add_argument(
+        "--auto-update-check",
+        choices=["on", "off"],
+        default=None,
+        help="开启或关闭右侧边栏启动时自动检查 GitHub Releases 新版本（默认开启）",
+    )
+    parser.add_argument(
         "--standalone",
         action="store_true",
         help="强制使用独立规则模式（~/.gemini/config/rules/agy-auto-router.md）",
@@ -880,6 +896,7 @@ def main(argv: list[str] | None = None) -> int:
             args.free_plan_review,
             args.delivery_test_gate,
             args.delivery_test_cmd,
+            args.auto_update_check,
         )
     )
     has_lifecycle_action = any((args.install, args.remove, args.status, args.sync_check))
@@ -906,6 +923,7 @@ def main(argv: list[str] | None = None) -> int:
             free_plan_review=args.free_plan_review,
             delivery_test_gate=args.delivery_test_gate,
             delivery_test_cmd=args.delivery_test_cmd,
+            auto_update_check=args.auto_update_check,
         )
         if not args.json:
             print(f"已更新 agy-cmd 运行设置（{state_dir / 'settings.json'}）：")

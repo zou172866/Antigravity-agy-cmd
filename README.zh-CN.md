@@ -125,6 +125,7 @@ Hook 和安装流程已通过本地测试，真实免费账号在 App 和 IDE �
 这项功能用于随时查看和修改插件设置，或查询软件自带口令的用法。
 
 - 在软件右侧「agy-cmd 自动路由」面板中点击按钮即可修改重试次数、触发方式和会员档位，点完立即生效。
+- 在面板右上角点击「检查更新」可检查 GitHub Releases 并对已安装插件一键在线自更新（优先校验 Release `.zip` SHA-256，失败自动回滚；打开面板默认自动检查，可在面板开关、命令行 `--auto-update-check off` 或设置环境变量 `AGY_CMD_DISABLE_AUTO_UPDATE_CHECK=1` 关闭）。
 - 在面板右上角可以点击 `★ Star` 前往 GitHub 仓库关注版本更新；累计帮你自动接着修满 3 次后也会提示一次，点击或关闭后不再重复弹出。
 - 在聊天框直接输入“把自动重试改成 5 次”“开启 Boost 接入”或“列出 Antigravity 所有内置斜杠指令的区别”，AI 也会直接帮你改好或列出对比说明。
 
@@ -152,6 +153,10 @@ python skills/agy-cmd/scripts/setup_auto_router.py --delivery-test-gate off
 
 # 免费档在实施已批准的计划后进行一次独立复核
 python skills/agy-cmd/scripts/setup_auto_router.py --free-plan-review on
+
+# 开启或关闭打开右侧面板时自动检查 GitHub Releases 新版本（默认开启）
+python skills/agy-cmd/scripts/setup_auto_router.py --auto-update-check off
+python skills/agy-cmd/scripts/setup_auto_router.py --auto-update-check on
 
 # 检查插件文件是否完整
 python skills/agy-cmd/scripts/setup_auto_router.py --sync-check

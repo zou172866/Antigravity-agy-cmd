@@ -164,6 +164,15 @@ class TestSetupAutoRouterCLI(unittest.TestCase):
             bad_long = run_cli("--delivery-test-cmd", "a" * 241, "--state-dir", tmp)
             self.assertNotEqual(bad_long.returncode, 0)
 
+            # Auto-update-check toggle defaults True and persists cleanly via CLI
+            self.assertTrue(router.load_settings(state)["autoUpdateCheck"])
+            upd_off = set_option("--auto-update-check", "off")
+            self.assertFalse(upd_off["autoUpdateCheck"])
+            self.assertFalse(router.load_settings(state)["autoUpdateCheck"])
+            upd_on = set_option("--auto-update-check", "on")
+            self.assertTrue(upd_on["autoUpdateCheck"])
+            self.assertTrue(router.load_settings(state)["autoUpdateCheck"])
+
     def test_legacy_v2_plan_boost_resets_to_false_on_load_and_install(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             cfg_dir = Path(tmp) / "cfg"
@@ -516,16 +525,17 @@ class TestStarFollowupCliAndState(unittest.TestCase):
             self.assertEqual(list(p_dir.rglob("__pycache__")), [])
             self.assertTrue((p_dir / "test" / "star-prompt.test.mjs").is_file())
 
-            # Drift in sidecar runtime file or missing api-handler.mjs fails --sync-check
-            api_handler_fp = p_dir / "sidecars" / "panel" / "api-handler.mjs"
-            orig_api_handler = api_handler_fp.read_text(encoding="utf-8")
-            api_handler_fp.unlink()
-            missing_api_chk = run_stripped("--sync-check", "--config-dir", str(cfg_dir))
-            self.assertEqual(missing_api_chk.returncode, 2)
-            api_handler_fp.write_text(orig_api_handler + "\n// drifted\n", encoding="utf-8")
-            drifted_chk = run_stripped("--sync-check", "--config-dir", str(cfg_dir))
-            self.assertEqual(drifted_chk.returncode, 2)
-            api_handler_fp.write_text(orig_api_handler, encoding="utf-8")
+            # Drift in sidecar runtime file or missing sidecar update modules fails --sync-check
+            for mod_name in ("api-handler.mjs", "version-check.mjs", "update-archive.mjs", "version-update.mjs"):
+                mod_fp = p_dir / "sidecars" / "panel" / mod_name
+                orig_mod = mod_fp.read_text(encoding="utf-8")
+                mod_fp.unlink()
+                missing_chk = run_stripped("--sync-check", "--config-dir", str(cfg_dir))
+                self.assertEqual(missing_chk.returncode, 2, f"Expected missing {mod_name} to fail --sync-check")
+                mod_fp.write_text(orig_mod + "\n// drifted\n", encoding="utf-8")
+                drifted_chk = run_stripped("--sync-check", "--config-dir", str(cfg_dir))
+                self.assertEqual(drifted_chk.returncode, 2, f"Expected drifted {mod_name} to fail --sync-check")
+                mod_fp.write_text(orig_mod, encoding="utf-8")
 
             ok_chk_json = run_stripped("--sync-check", "--json", "--config-dir", str(cfg_dir))
             self.assertEqual(ok_chk_json.returncode, 0)

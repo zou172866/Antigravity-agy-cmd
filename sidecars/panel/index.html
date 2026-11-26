@@ -31,6 +31,9 @@
       --warn-soft: #fffbeb;
       --warn-border: #f59e0b;
       --warn-btn-bg: #fef3c7;
+      --danger-text: #991b1b;
+      --danger-soft: #fef2f2;
+      --danger-border: #fca5a5;
       --star-glyph: #d97706;
       --btn-primary-bg: #4338ca;
       --btn-primary-hover: #3730a3;
@@ -59,6 +62,9 @@
       --warn-soft: rgba(245, 158, 11, 0.18);
       --warn-border: rgba(251, 191, 36, 0.55);
       --warn-btn-bg: rgba(245, 158, 11, 0.28);
+      --danger-text: #fecaca;
+      --danger-soft: rgba(239, 68, 68, 0.18);
+      --danger-border: rgba(248, 113, 113, 0.55);
       --star-glyph: #fbbf24;
       --btn-primary-bg: #4f46e5;
       --btn-primary-hover: #6366f1;
@@ -165,6 +171,141 @@
       color: var(--accent);
       font-weight: 700;
       white-space: nowrap;
+    }
+
+    .ver-check-btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      height: 24px;
+      padding: 0 8px;
+      border-radius: 999px;
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      color: var(--text-secondary);
+      font-size: 11.5px;
+      font-weight: 600;
+      white-space: nowrap;
+      cursor: pointer;
+      transition: background-color 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+    }
+    .ver-check-btn:hover:not(:disabled) {
+      background: var(--bg-hover);
+      border-color: var(--border-strong);
+      color: var(--text-primary);
+    }
+    .ver-check-btn:disabled {
+      opacity: 0.65;
+      cursor: default;
+    }
+    .ver-check-btn.has-update {
+      border-color: var(--accent-border);
+      background: var(--accent-soft);
+      color: var(--accent);
+      font-weight: 700;
+    }
+    .ver-dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: var(--accent);
+      flex-shrink: 0;
+    }
+
+    .update-banner {
+      border: 1.5px solid var(--border-strong);
+      background: var(--bg-card);
+      color: var(--text-primary);
+      border-radius: var(--radius);
+      padding: 10px 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .update-banner[data-state="available"],
+    .update-banner[data-state="updating"] {
+      border-color: var(--accent-border);
+      background: var(--accent-soft);
+    }
+    .update-banner[data-state="current"],
+    .update-banner[data-state="updated"] {
+      border-color: var(--ok-border);
+      background: var(--ok-soft);
+    }
+    .update-banner[data-state="error"],
+    .update-banner[data-state="check-error"] {
+      border-color: var(--danger-border);
+      background: var(--danger-soft);
+    }
+    .update-banner-main {
+      display: flex;
+      flex-direction: column;
+      gap: 3px;
+    }
+    .update-banner-title {
+      font-size: 12.5px;
+      font-weight: 700;
+      color: var(--text-primary);
+      line-height: 1.4;
+    }
+    .update-banner[data-state="error"] .update-banner-title,
+    .update-banner[data-state="check-error"] .update-banner-title {
+      color: var(--danger-text);
+    }
+    .update-banner-detail {
+      font-size: 11.5px;
+      color: var(--text-secondary);
+      line-height: 1.45;
+      word-break: break-word;
+    }
+    .update-banner-actions {
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+    .update-btn-primary {
+      display: inline-flex;
+      align-items: center;
+      padding: 4px 10px;
+      border-radius: 7px;
+      border: 1px solid var(--btn-primary-bg);
+      background: var(--btn-primary-bg);
+      color: var(--btn-primary-fg);
+      font-size: 12px;
+      font-weight: 650;
+      cursor: pointer;
+      transition: background-color 0.15s ease;
+    }
+    .update-btn-primary:hover:not(:disabled) {
+      background: var(--btn-primary-hover);
+      border-color: var(--btn-primary-hover);
+    }
+    .update-btn-primary:disabled {
+      opacity: 0.65;
+      cursor: default;
+    }
+    .update-btn-ghost {
+      display: inline-flex;
+      align-items: center;
+      padding: 4px 10px;
+      border-radius: 7px;
+      border: 1px solid var(--border-strong);
+      background: var(--bg-card);
+      color: var(--text-secondary);
+      font-size: 12px;
+      font-weight: 600;
+      text-decoration: none;
+      cursor: pointer;
+      transition: background-color 0.15s ease, color 0.15s ease;
+    }
+    .update-btn-ghost:hover:not(:disabled) {
+      background: var(--bg-hover);
+      color: var(--text-primary);
+    }
+    .update-btn-ghost:disabled {
+      opacity: 0.65;
+      cursor: default;
     }
 
     .star-banner {
@@ -597,9 +738,44 @@
           <span class="star-link-glyph" aria-hidden="true">★</span>
           <span>Star</span>
         </a>
-        <span class="ver-pill">v2.4.1</span>
+        <button
+          id="version-check-btn"
+          class="ver-check-btn"
+          type="button"
+          title="从 GitHub Releases 检查 agy-cmd 新版本"
+        >
+          <span id="version-check-dot" class="ver-dot hidden" aria-hidden="true" hidden></span>
+          <span id="version-check-label">检查更新</span>
+        </button>
+        <span class="ver-pill">v2.5.0</span>
       </div>
     </div>
+
+    <section
+      id="version-update-banner"
+      class="update-banner hidden"
+      role="status"
+      aria-live="polite"
+      data-state=""
+      hidden
+    >
+      <div class="update-banner-main">
+        <div id="version-status-text" class="update-banner-title"></div>
+        <div id="version-detail-text" class="update-banner-detail hidden" hidden></div>
+      </div>
+      <div class="update-banner-actions">
+        <button id="version-update-btn" class="update-btn-primary hidden" type="button" hidden>立即更新</button>
+        <a
+          id="version-release-link"
+          class="update-btn-ghost hidden"
+          href="https://github.com/zou172866/Antigravity-agy-cmd/releases"
+          target="_blank"
+          rel="noopener noreferrer"
+          hidden
+        >查看更新说明</a>
+        <button id="version-dismiss-btn" class="update-btn-ghost" type="button">关闭</button>
+      </div>
+    </section>
 
     <div id="onboard-card" class="onboard-card" hidden>
       <div class="onboard-title">⚠️ 安装后首次确认提醒</div>
@@ -813,6 +989,13 @@
           <button id="btn-reset-stats" class="link-btn" type="button">清零统计</button>
         </div>
       </div>
+      <label class="toggle-row" id="row-auto-update-check">
+        <div class="row-text">
+          <b id="auto-update-check-label">打开面板时自动检查更新</b>
+          <small id="auto-update-check-help">默认开启，仅在面板内检查 GitHub Releases；关闭后仍可随时手动点击顶部「检查更新」。</small>
+        </div>
+        <input id="chk-auto-update-check" type="checkbox" role="switch" checked aria-labelledby="auto-update-check-label" aria-describedby="auto-update-check-help">
+      </label>
       <div class="hint-foot">
         💡 单轮临时口令：在任意提问里顺带说 <code>这次最多重试 5 次</code>、<code>这次一直重试</code>、<code>这次不用重试</code> 或 <code>这次跳过测试</code> 即可仅对当轮生效。
       </div>
@@ -826,6 +1009,7 @@
       "use strict";
       const CSRF_TOKEN = "__AGY_CMD_CSRF__";
       const GITHUB_REPO_URL = "https://github.com/zou172866/Antigravity-agy-cmd";
+      const GITHUB_RELEASES_URL = `${GITHUB_REPO_URL}/releases`;
       const GH_STAR_CLI_CMD = "gh api -X PUT /user/starred/zou172866/Antigravity-agy-cmd";
       let toastTimer = null;
       let cachedStarPrompt = null;
@@ -839,6 +1023,21 @@
       let deliveryCmdEditSeq = 0;
       let apiMutationSeq = 0;
       let latestAppliedMutationSeq = 0;
+      let currentPluginVersion = "";
+      let autoVersionCheckDone = false;
+      let autoVersionCheckTimer = null;
+      let versionReloadTimer = null;
+      const versionCheckState = {
+        checking: false,
+        updating: false,
+        updated: false,
+        reloadPending: false,
+        manual: false,
+        dismissedVersion: "",
+        available: null,
+        lastCheck: null,
+        lastUpdate: null
+      };
 
       // Sync theme strictly from Antigravity's actual host --background luminance
       // (never from OS prefers-color-scheme, avoiding dark-OS + light-App white text mismatch).
@@ -909,6 +1108,7 @@
       const chkFreePlanReview = $("chk-free-plan-review");
       const chkFreeFb = $("chk-free-fb");
       const chkPlanFb = $("chk-plan-fb");
+      const chkAutoUpdateCheck = $("chk-auto-update-check");
       const chkDeliveryGate = $("chk-delivery-gate");
       const deliveryGateBox = $("delivery-gate-box");
       const inpDeliveryCmd = $("inp-delivery-cmd");
@@ -928,6 +1128,15 @@
       const starBannerDismissBtn = $("star-banner-dismiss-btn");
       const starBannerCopyCliBtn = $("star-banner-copy-cli-btn");
       const starBannerFeedbackEl = $("star-banner-feedback");
+      const versionCheckBtn = $("version-check-btn");
+      const versionCheckDot = $("version-check-dot");
+      const versionCheckLabel = $("version-check-label");
+      const versionBannerEl = $("version-update-banner");
+      const versionStatusEl = $("version-status-text");
+      const versionDetailEl = $("version-detail-text");
+      const versionUpdateBtn = $("version-update-btn");
+      const versionReleaseLink = $("version-release-link");
+      const versionDismissBtn = $("version-dismiss-btn");
 
       const retryModeBtns = Array.from(document.querySelectorAll("[data-retry-mode]"));
       const presetBtns = Array.from(document.querySelectorAll("[data-preset]"));
@@ -973,6 +1182,346 @@
           throw new Error(data.error || `HTTP ${res.status}`);
         }
         return data;
+      }
+
+      async function callVersionApi(pathname, payload = {}) {
+        const headers = { "Content-Type": "application/json" };
+        if (!window.sidecar?.fetch && CSRF_TOKEN) {
+          headers["X-Agy-Cmd-Csrf"] = CSRF_TOKEN;
+        }
+        const fetchFn = window.sidecar?.fetch
+          ? window.sidecar.fetch.bind(window.sidecar)
+          : window.fetch.bind(window);
+        const res = await fetchFn(pathname, {
+          method: "POST",
+          headers,
+          body: JSON.stringify(payload)
+        });
+        const data = await res.json().catch(() => null);
+        return { ok: Boolean(res?.ok), status: res?.status || 0, data };
+      }
+
+      function isSafeReleaseUrl(url) {
+        return typeof url === "string" && url.startsWith(`${GITHUB_RELEASES_URL}/`);
+      }
+
+      function setVersionPillText(ver) {
+        if (!ver) return;
+        currentPluginVersion = String(ver).replace(/^v/, "");
+        const pills = document.querySelectorAll ? document.querySelectorAll(".ver-pill") : [];
+        if (pills && pills.length > 0) {
+          pills[0].textContent = `v${currentPluginVersion}`;
+        }
+      }
+
+      function formatRateLimitError(retryAt) {
+        if (typeof retryAt !== "number" || !Number.isFinite(retryAt) || retryAt <= Date.now()) {
+          return "已触发 GitHub API 频率限制，请稍后重试。";
+        }
+        try {
+          const time = new Intl.DateTimeFormat(undefined, {
+            hour: "2-digit",
+            minute: "2-digit",
+            second: "2-digit",
+            hourCycle: "h23"
+          }).format(retryAt);
+          return `已触发 GitHub API 频率限制，请在 ${time} 后重试。`;
+        } catch {
+          return "已触发 GitHub API 频率限制，请稍后重试。";
+        }
+      }
+
+      function formatVersionError(payload, isUpdate) {
+        const reason = payload?.reason || "";
+        if (reason === "rateLimit") return formatRateLimitError(payload?.retryAt);
+        if (reason === "http") return `GitHub 返回 HTTP ${payload?.httpStatus || "--"}。`;
+        const messages = {
+          timeout: "连接 GitHub 超时。",
+          noRelease: "未找到已发布的 GitHub Release。",
+          invalidRelease: "GitHub Release 版本元数据无效。",
+          network: "连接 GitHub 时发生网络错误。",
+          localVersion: "无法读取本地插件版本号。",
+          busy: "正在执行另一次更新，请稍候。",
+          releaseChanged: "目标版本已变化或不再高于当前版本。",
+          releaseCheck: "连接 GitHub 检查版本时失败。",
+          download: "从 GitHub 下载更新压缩包失败。",
+          redirect: "下载更新包时拦截到未授权的重定向域名。",
+          size: "更新压缩包体积超出安全上限。",
+          integrity: "更新压缩包 SHA-256 完整性校验失败。",
+          archive: "更新压缩包完整性或路径安全校验失败。",
+          version: "更新包内版本号与目标 Release 不一致。",
+          incomplete: "更新包缺少必需运行文件或权限校验未通过。",
+          notInstalled: "仅支持对已安装的 agy-cmd 插件目录执行在线自更新。",
+          gitCheckout: "检测到当前运行在 Git 源码目录中，请使用 git pull 或重新运行安装脚本升级。",
+          permission: "替换插件文件时权限不足。",
+          locked: "部分插件文件被运行中进程占用，请关闭 Antigravity 或改用命令行脚本更新。",
+          pathConflict: "替换目标存在文件/目录或符号链接冲突。",
+          recovery: "更新与回滚均失败，已保留备份目录以便手动恢复。"
+        };
+        const base = messages[reason] || (isUpdate ? "替换已安装插件文件时出错。" : "连接 GitHub 时发生网络错误。");
+        const restored = isUpdate && payload?.diagnostics?.restored === true ? " 已自动回滚恢复原版本文件。" : "";
+        return base + restored;
+      }
+
+      function renderVersionUpdateUi() {
+        const avail = versionCheckState.available;
+        const hasUpdate = Boolean(avail && avail.latestVersion);
+        const isDismissed =
+          hasUpdate &&
+          !versionCheckState.updating &&
+          !versionCheckState.updated &&
+          versionCheckState.dismissedVersion === avail.latestVersion &&
+          !versionCheckState.manual &&
+          versionCheckState.lastUpdate?.status !== "error";
+
+        let state = "";
+        if (versionCheckState.updating) state = "updating";
+        else if (versionCheckState.updated) state = "updated";
+        else if (versionCheckState.lastUpdate?.status === "error") state = "error";
+        else if (hasUpdate && !isDismissed) state = "available";
+        else if (versionCheckState.checking && versionCheckState.manual) state = "checking";
+        else if (versionCheckState.manual && versionCheckState.lastCheck?.status === "error") state = "check-error";
+        else if (versionCheckState.manual && versionCheckState.lastCheck?.status === "current") state = "current";
+
+        if (versionCheckBtn) {
+          versionCheckBtn.disabled = versionCheckState.checking || versionCheckState.updating;
+          versionCheckBtn.classList.toggle("has-update", hasUpdate && !versionCheckState.updated);
+        }
+        setElementHidden(versionCheckDot, !(hasUpdate && !versionCheckState.updated));
+        if (versionCheckLabel) {
+          if (versionCheckState.checking) versionCheckLabel.textContent = "检查中...";
+          else if (versionCheckState.updating) versionCheckLabel.textContent = "正在更新...";
+          else if (hasUpdate && !versionCheckState.updated) {
+            versionCheckLabel.textContent = `更新 v${avail.latestVersion}`;
+          } else {
+            versionCheckLabel.textContent = "检查更新";
+          }
+        }
+
+        if (!versionBannerEl) return;
+        versionBannerEl.dataset.state = state;
+        setElementHidden(versionBannerEl, !state);
+        if (!state) return;
+
+        let titleText = "";
+        let detailText = "";
+        let showUpdateBtn = false;
+        let updateBtnText = "立即更新";
+        let releaseHref = "";
+        let releaseLabel = "查看更新说明";
+
+        if (state === "checking") {
+          titleText = "正在向 GitHub Releases 检查更新…";
+        } else if (state === "current") {
+          const ver = versionCheckState.lastCheck?.currentVersion || currentPluginVersion || "--";
+          titleText = `当前已是最新版本（v${ver}）。`;
+        } else if (state === "available") {
+          titleText = `发现新版本：v${avail.currentVersion || currentPluginVersion || "--"} → v${avail.latestVersion}`;
+          showUpdateBtn = true;
+          updateBtnText = "立即更新";
+          releaseHref = isSafeReleaseUrl(avail.releaseUrl) ? avail.releaseUrl : GITHUB_RELEASES_URL;
+        } else if (state === "updating") {
+          titleText = "正在下载并校验更新包…";
+          detailText = `v${avail?.currentVersion || currentPluginVersion || "--"} → v${avail?.latestVersion || "--"}`;
+        } else if (state === "updated") {
+          const targetVer = versionCheckState.lastUpdate?.version || avail?.latestVersion || "--";
+          titleText = `已更新至 v${targetVer}`;
+          detailText = versionCheckState.reloadPending
+            ? "正在重载面板… 重启或重载 Antigravity 后 Hooks 与规则将生效。"
+            : "插件文件已更新完成，请重新加载窗口或重启 Antigravity 生效。";
+        } else if (state === "check-error") {
+          titleText = "检查更新失败。";
+          detailText = formatVersionError(versionCheckState.lastCheck, false);
+          showUpdateBtn = true;
+          updateBtnText = "重试";
+          if (versionCheckState.lastCheck?.reason === "rateLimit") {
+            releaseHref = GITHUB_RELEASES_URL;
+            releaseLabel = "手动下载";
+          }
+        } else if (state === "error") {
+          titleText = "更新失败。";
+          detailText = formatVersionError(versionCheckState.lastUpdate, true);
+          showUpdateBtn = true;
+          updateBtnText = "重试";
+          releaseHref = isSafeReleaseUrl(avail?.releaseUrl) ? avail.releaseUrl : GITHUB_RELEASES_URL;
+          releaseLabel = "手动下载";
+        }
+
+        if (versionStatusEl) versionStatusEl.textContent = titleText;
+        if (versionDetailEl) {
+          versionDetailEl.textContent = detailText;
+          setElementHidden(versionDetailEl, !detailText);
+        }
+        if (versionUpdateBtn) {
+          versionUpdateBtn.textContent = updateBtnText;
+          versionUpdateBtn.disabled = versionCheckState.updating || versionCheckState.checking;
+          setElementHidden(versionUpdateBtn, !showUpdateBtn);
+        }
+        if (versionReleaseLink) {
+          if (releaseHref) {
+            versionReleaseLink.href = releaseHref;
+            versionReleaseLink.textContent = releaseLabel;
+          }
+          setElementHidden(versionReleaseLink, !releaseHref);
+        }
+        if (versionDismissBtn) {
+          versionDismissBtn.disabled = versionCheckState.updating;
+          setElementHidden(versionDismissBtn, versionCheckState.updating);
+        }
+      }
+
+      async function checkForUpdates(manual = false, { fresh = false } = {}) {
+        if (versionCheckState.checking || versionCheckState.updating) return null;
+        versionCheckState.checking = true;
+        versionCheckState.manual = Boolean(manual);
+        if (manual) {
+          versionCheckState.updated = false;
+          versionCheckState.lastUpdate = null;
+          versionCheckState.dismissedVersion = "";
+        }
+        renderVersionUpdateUi();
+        try {
+          const payload = { mode: manual ? "manual" : "auto" };
+          if (fresh) payload.fresh = true;
+          const res = await callVersionApi("/api/version", payload);
+          const data = res?.data;
+          if (!data || typeof data.status !== "string" || !["update", "current", "idle", "error"].includes(data.status)) {
+            if (manual) {
+              versionCheckState.lastCheck = {
+                status: "error",
+                reason: !res.ok && res.status > 0 ? "http" : "network",
+                ...(!res.ok && res.status > 0 ? { httpStatus: res.status } : {})
+              };
+            }
+            return null;
+          }
+          versionCheckState.lastCheck = data;
+          if (data.status === "update" && typeof data.latestVersion === "string" && data.latestVersion) {
+            versionCheckState.available = data;
+            versionCheckState.updated = false;
+          } else if (data.status === "current") {
+            versionCheckState.available = null;
+          }
+          return data;
+        } catch {
+          if (manual) {
+            versionCheckState.lastCheck = { status: "error", reason: "network" };
+          }
+          return null;
+        } finally {
+          versionCheckState.checking = false;
+          renderVersionUpdateUi();
+        }
+      }
+
+      function handleVersionButtonClick() {
+        const avail = versionCheckState.available;
+        if (avail && avail.latestVersion && !versionCheckState.updated) {
+          if (versionCheckState.dismissedVersion === avail.latestVersion) {
+            versionCheckState.dismissedVersion = "";
+            versionCheckState.manual = true;
+            renderVersionUpdateUi();
+          }
+          if (versionBannerEl && typeof versionBannerEl.scrollIntoView === "function") {
+            versionBannerEl.scrollIntoView({ behavior: "smooth", block: "nearest" });
+          }
+          if (
+            versionUpdateBtn &&
+            !versionUpdateBtn.hidden &&
+            !versionUpdateBtn.disabled &&
+            typeof versionUpdateBtn.focus === "function"
+          ) {
+            versionUpdateBtn.focus();
+          }
+          return null;
+        }
+        return checkForUpdates(true);
+      }
+
+      function pollForUpdatedRestart(targetVersion, attempt = 0) {
+        if (attempt >= 12) {
+          versionCheckState.reloadPending = false;
+          renderVersionUpdateUi();
+          return;
+        }
+        versionReloadTimer = setTimeout(async () => {
+          versionReloadTimer = null;
+          try {
+            const st = await callApi("/api/state", {});
+            const rawVer = typeof st?.version === "string" ? st.version.replace(/^v/, "") : "";
+            if (rawVer === targetVersion) {
+              if (typeof window?.location?.reload === "function") {
+                window.location.reload();
+                return;
+              }
+            }
+          } catch {}
+          pollForUpdatedRestart(targetVersion, attempt + 1);
+        }, 750);
+      }
+
+      async function runPluginUpdate() {
+        const targetVersion = versionCheckState.available?.latestVersion;
+        if (!targetVersion || versionCheckState.updating || versionCheckState.checking) return null;
+        versionCheckState.updating = true;
+        versionCheckState.updated = false;
+        versionCheckState.lastUpdate = null;
+        versionCheckState.manual = true;
+        renderVersionUpdateUi();
+        try {
+          const res = await callVersionApi("/api/update", { version: targetVersion });
+          const data = res?.data;
+          if (!data || (data.status !== "updated" && data.status !== "error")) {
+            versionCheckState.lastUpdate = { status: "error", reason: "install" };
+            return versionCheckState.lastUpdate;
+          }
+          versionCheckState.lastUpdate = data;
+          if (data.status === "updated") {
+            const nextVer = data.version || targetVersion;
+            versionCheckState.updated = true;
+            versionCheckState.available = null;
+            versionCheckState.reloadPending = Boolean(window?.sidecar);
+            setVersionPillText(nextVer);
+            if (versionCheckState.reloadPending) {
+              pollForUpdatedRestart(nextVer, 0);
+            }
+          }
+          return data;
+        } catch {
+          versionCheckState.lastUpdate = { status: "error", reason: "network" };
+          return versionCheckState.lastUpdate;
+        } finally {
+          versionCheckState.updating = false;
+          renderVersionUpdateUi();
+        }
+      }
+
+      function handleVersionUpdateClick() {
+        if (versionCheckState.manual && versionCheckState.lastCheck?.status === "error" && !versionCheckState.available) {
+          return checkForUpdates(true, { fresh: true });
+        }
+        return runPluginUpdate();
+      }
+
+      function dismissVersionBanner() {
+        if (versionCheckState.updating) return;
+        if (versionCheckState.available?.latestVersion) {
+          versionCheckState.dismissedVersion = versionCheckState.available.latestVersion;
+        }
+        versionCheckState.manual = false;
+        versionCheckState.updated = false;
+        versionCheckState.lastCheck = null;
+        versionCheckState.lastUpdate = null;
+        renderVersionUpdateUi();
+      }
+
+      function scheduleAutoVersionCheck() {
+        if (autoVersionCheckDone) return;
+        autoVersionCheckDone = true;
+        autoVersionCheckTimer = setTimeout(() => {
+          autoVersionCheckTimer = null;
+          return checkForUpdates(false);
+        }, 600);
       }
 
       function renderStarMilestoneBanner(sp) {
@@ -1110,6 +1659,9 @@
       function render(data) {
         if (!data?.settings) return;
         const s = data.settings;
+        if (typeof data.version === "string" && data.version) {
+          setVersionPillText(data.version);
+        }
 
         onboardCard.hidden = Boolean(s.configuredByUser);
 
@@ -1144,6 +1696,7 @@
 
         chkFreeFb.checked = Boolean(s.freeFallbackEnabled);
         chkPlanFb.checked = Boolean(s.planFallbackEnabled);
+        if (chkAutoUpdateCheck) chkAutoUpdateCheck.checked = s.autoUpdateCheck !== false;
 
         const gateOn = s.deliveryTestGateEnabled === true;
         if (chkDeliveryGate) chkDeliveryGate.checked = gateOn;
@@ -1242,6 +1795,16 @@
         return savePatch({ planFallbackEnabled: chkPlanFb.checked });
       });
 
+      if (chkAutoUpdateCheck) {
+        chkAutoUpdateCheck.addEventListener("change", () => {
+          const on = chkAutoUpdateCheck.checked;
+          return savePatch(
+            { autoUpdateCheck: on },
+            on ? "已开启打开面板自动检查更新" : "已关闭自动检查更新（仍可手动检查）"
+          );
+        });
+      }
+
       if (chkDeliveryGate) {
         chkDeliveryGate.addEventListener("change", () => {
           const on = chkDeliveryGate.checked;
@@ -1334,6 +1897,15 @@
       if (starBannerCopyCliBtn) {
         starBannerCopyCliBtn.addEventListener("click", handleStarBannerCopyCli);
       }
+      if (versionCheckBtn) {
+        versionCheckBtn.addEventListener("click", handleVersionButtonClick);
+      }
+      if (versionUpdateBtn) {
+        versionUpdateBtn.addEventListener("click", handleVersionUpdateClick);
+      }
+      if (versionDismissBtn) {
+        versionDismissBtn.addEventListener("click", dismissVersionBanner);
+      }
 
       async function refresh() {
         const mutAtStart = apiMutationSeq;
@@ -1345,6 +1917,7 @@
       }
 
       refresh();
+      scheduleAutoVersionCheck();
       setInterval(() => {
         if (!document.hidden && document.activeElement !== inpMax) {
           refresh();
