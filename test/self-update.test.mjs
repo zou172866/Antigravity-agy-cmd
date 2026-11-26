@@ -755,9 +755,12 @@ test("version-update: atomic ZIP & TAR.GZ self-update, case-insensitive FS, roll
     assert.equal(readLocalVersion(installedRoot), "2.6.0");
     assert.equal(fs.existsSync(path.join(installedRoot, UPDATE_MARKER_NAME)), false);
 
-    // 7. Git checkout protection
+    // 7. Git checkout protection (self-contained fixture so tests also pass from unpacked release ZIPs)
+    const fakeGitCheckout = path.join(tmpBase, "fake-git-checkout");
+    writeBundleToDir(fakeGitCheckout, collectRepoBundleFiles("2.6.0"));
+    fs.mkdirSync(path.join(fakeGitCheckout, ".git"), { recursive: true });
     await assert.rejects(
-      resolveInstalledRoot(path.join(REPO_ROOT, "sidecars", "panel"), { allowCustomRoot: true }),
+      resolveInstalledRoot(path.join(fakeGitCheckout, "sidecars", "panel"), { allowCustomRoot: true }),
       (e) => e instanceof UpdateError && e.reason === "gitCheckout"
     );
 
