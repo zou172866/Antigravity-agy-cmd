@@ -23,6 +23,7 @@ MIN_RETRY_MAX = 1
 MAX_RETRY_MAX = 50
 DEFAULT_RETRY_MAX = 3
 MAX_DELIVERY_CMD_LEN = 240
+SETTINGS_VERSION = 3
 
 GITHUB_REPO_URL = "https://github.com/zou172866/Antigravity-agy-cmd"
 GH_STAR_COMMAND = "gh api -X PUT /user/starred/zou172866/Antigravity-agy-cmd"
@@ -312,9 +313,17 @@ def sanitize_delivery_test_command(raw: object, *, strict: bool = False) -> str:
     return re.sub(r"[ \t]+", " ", cleaned)[:MAX_DELIVERY_CMD_LEN]
 
 
+def _is_valid_current_settings_version(raw_version: object) -> bool:
+    return (
+        isinstance(raw_version, int)
+        and not isinstance(raw_version, bool)
+        and raw_version >= SETTINGS_VERSION
+    )
+
+
 def default_settings() -> dict:
     return {
-        "version": 2,
+        "version": SETTINGS_VERSION,
         "planTier": "free",
         "boostEnabled": False,
         "boostAfterPlanApproval": False,
@@ -356,7 +365,9 @@ def load_settings(state_dir: Path) -> dict:
                 and raw.get("autoRetryScope") == "goal_only"
             ):
                 base["autoRetryScope"] = "smart"
-            base["version"] = 2
+            if not _is_valid_current_settings_version(raw.get("version")):
+                base["boostAfterPlanApproval"] = False
+            base["version"] = SETTINGS_VERSION
     except Exception:
         return default_settings()
     if base.get("autoRetryScope") not in ("smart", "all_failures", "goal_only"):
@@ -364,11 +375,32 @@ def load_settings(state_dir: Path) -> dict:
     if base.get("planTier") != "paid":
         base["planTier"] = "free"
         base["boostEnabled"] = False
+    base["boostAfterPlanApproval"] = base.get("boostAfterPlanApproval") is True
     base["freePlanReviewEnabled"] = base.get("freePlanReviewEnabled") is True
     base["deliveryTestGateEnabled"] = base.get("deliveryTestGateEnabled") is True
     base["deliveryTestCommand"] = sanitize_delivery_test_command(base.get("deliveryTestCommand"), strict=False)
     base["starPrompt"] = normalize_star_prompt_state(base.get("starPrompt"))
     return base
+
+
+def migrate_legacy_settings_if_needed(state_dir: Path) -> bool:
+    settings_path = state_dir / "settings.json"
+    if not settings_path.is_file():
+        return False
+    try:
+        with _with_settings_lock(state_dir):
+            if not settings_path.is_file():
+                return False
+            raw = json.loads(settings_path.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict):
+                return False
+            if _is_valid_current_settings_version(raw.get("version")):
+                return False
+            migrated = load_settings(state_dir)
+            save_json_atomic(settings_path, migrated)
+            return True
+    except Exception:
+        return False
 
 
 def format_settings_summary(settings: dict) -> str:
@@ -1137,6 +1169,7 @@ def main(argv: list[str] | None = None) -> int:
             plugin_rule_path.parent.mkdir(parents=True, exist_ok=True)
             plugin_rule_path.write_text(RULE_BODY, encoding="utf-8", newline="\n")
             cfg = set_plugin_enabled(config_dir, True)
+            migrate_legacy_settings_if_needed(state_dir)
             had_legacy_rule = standalone_rule_path.is_file()
             if had_legacy_rule:
                 standalone_rule_path.unlink()

@@ -6,7 +6,7 @@ export const MIN_RETRY_MAX = 1;
 export const MAX_RETRY_MAX = 50;
 export const DEFAULT_RETRY_MAX = 3;
 export const MAX_DELIVERY_CMD_LEN = 240;
-export const SETTINGS_VERSION = 2;
+export const SETTINGS_VERSION = 3;
 
 export const GITHUB_REPO_URL = "https://github.com/zou172866/Antigravity-agy-cmd";
 export const GH_STAR_COMMAND = "gh api -X PUT /user/starred/zou172866/Antigravity-agy-cmd";
@@ -301,12 +301,24 @@ export function normalizeSettings(raw = {}) {
       ? Math.floor(Number(rawStats.totalAutoRetries))
       : 0;
 
+  const hasVersionProp = Object.prototype.hasOwnProperty.call(src, "version");
+  const isCurrentVersion =
+    hasVersionProp &&
+    typeof src.version !== "boolean" &&
+    src.version !== null &&
+    src.version !== "" &&
+    Number.isFinite(Number(src.version)) &&
+    Number(src.version) >= SETTINGS_VERSION;
+  const isLegacyPlanBoost = hasVersionProp && !isCurrentVersion;
+
   return {
     version: SETTINGS_VERSION,
     planTier,
     boostEnabled,
-    boostAfterPlanApproval: typeof src.boostAfterPlanApproval === "boolean"
-      ? src.boostAfterPlanApproval : def.boostAfterPlanApproval,
+    boostAfterPlanApproval:
+      !isLegacyPlanBoost && typeof src.boostAfterPlanApproval === "boolean"
+        ? src.boostAfterPlanApproval
+        : def.boostAfterPlanApproval,
     freePlanReviewEnabled: src.freePlanReviewEnabled === true,
     autoRetryMode,
     autoRetryMax,
@@ -341,7 +353,14 @@ export function readSettings(stateDir) {
         continue;
       }
       const raw = JSON.parse(text);
-      return normalizeSettings(raw);
+      const rawWithVersion =
+        raw &&
+        typeof raw === "object" &&
+        !Array.isArray(raw) &&
+        !Object.prototype.hasOwnProperty.call(raw, "version")
+          ? { ...raw, version: 0 }
+          : raw;
+      return normalizeSettings(rawWithVersion);
     } catch (err) {
       const retryable =
         attempt < 3 &&

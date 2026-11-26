@@ -265,6 +265,23 @@ test("paid Boost hands an approved plan to the executor once through the desktop
   ]) {
     assert.deepEqual(await run(name, steps), {}, name);
   }
+
+  // Legacy v2.3.0 disk settings (version: 2, boostAfterPlanApproval: true) must NOT fire plan Boost,
+  // while preserving boostEnabled: true for hard debugging tasks
+  fs.writeFileSync(
+    path.join(dir, "settings.json"),
+    JSON.stringify({
+      version: 2,
+      planTier: "paid",
+      boostEnabled: true,
+      boostAfterPlanApproval: true,
+      configuredByUser: true
+    }) + "\n"
+  );
+  assert.deepEqual(await run("legacy-v2-plan-off", [plan, request(approval)]), {});
+  const hardResult = await run("legacy-v2-hard-boost-on", [request("请帮我排查这个并发竞态死锁问题")]);
+  assert.equal(hardResult.injectSteps?.length, 1);
+  assert.match(hardResult.injectSteps[0].systemMessage.systemMessage, /\[agy-cmd → 自动 Boost\]/);
 });
 
 test("paid Boost edge cases: null step_index, >256KB tail rollover, unflushed approval, and Stop wakeup preservation", async (t) => {

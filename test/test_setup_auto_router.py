@@ -164,6 +164,77 @@ class TestSetupAutoRouterCLI(unittest.TestCase):
             bad_long = run_cli("--delivery-test-cmd", "a" * 241, "--state-dir", tmp)
             self.assertNotEqual(bad_long.returncode, 0)
 
+    def test_legacy_v2_plan_boost_resets_to_false_on_load_and_install(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_dir = Path(tmp) / "cfg"
+            st_dir = Path(tmp) / "state"
+            p_dir = cfg_dir / "plugins" / "agy-cmd"
+            self._create_valid_plugin_skeleton(p_dir)
+
+            # 1. Fresh --install must not prematurely create settings.json
+            fresh = run_cli("--install", "--config-dir", str(cfg_dir), "--state-dir", str(st_dir), "--json")
+            self.assertEqual(fresh.returncode, 0, fresh.stderr)
+            self.assertFalse((st_dir / "settings.json").exists())
+
+            # 2. Legacy v2.3.0 settings (and versionless settings) reset boostAfterPlanApproval to False
+            #    while preserving planTier, boostEnabled, configuredByUser, and starPrompt
+            st_dir.mkdir(parents=True, exist_ok=True)
+            legacy_payload = {
+                "version": 2,
+                "planTier": "paid",
+                "boostEnabled": True,
+                "boostAfterPlanApproval": True,
+                "configuredByUser": True,
+                "onboardingShown": True,
+                "starPrompt": {
+                    "state": "clicked",
+                    "triggeredAt": "2026-11-22T00:00:00Z",
+                    "resolvedAt": "2026-11-22T00:01:00Z",
+                    "milestoneAutoRetries": 3,
+                },
+                "updatedAt": "2026-11-24T00:00:00Z",
+            }
+            for sample in (legacy_payload, {k: v for k, v in legacy_payload.items() if k != "version"}):
+                (st_dir / "settings.json").write_text(json.dumps(sample) + "\n", encoding="utf-8")
+                loaded = router.load_settings(st_dir)
+                self.assertEqual(loaded["version"], 3)
+                self.assertEqual(loaded["planTier"], "paid")
+                self.assertTrue(loaded["boostEnabled"])
+                self.assertFalse(loaded["boostAfterPlanApproval"])
+                self.assertTrue(loaded["configuredByUser"])
+                self.assertEqual(loaded["starPrompt"]["state"], "clicked")
+
+            # --status --json reports migrated v3 state
+            (st_dir / "settings.json").write_text(json.dumps(legacy_payload) + "\n", encoding="utf-8")
+            st = run_cli("--status", "--config-dir", str(cfg_dir), "--state-dir", str(st_dir), "--json")
+            self.assertEqual(st.returncode, 0, st.stderr)
+            st_settings = json.loads(st.stdout)["settings"]
+            self.assertEqual(st_settings["version"], 3)
+            self.assertTrue(st_settings["boostEnabled"])
+            self.assertFalse(st_settings["boostAfterPlanApproval"])
+
+            # 3. --install atomically migrates existing legacy v2 settings.json on disk to v3
+            upg = run_cli("--install", "--config-dir", str(cfg_dir), "--state-dir", str(st_dir), "--json")
+            self.assertEqual(upg.returncode, 0, upg.stderr)
+            on_disk = json.loads((st_dir / "settings.json").read_text(encoding="utf-8"))
+            self.assertEqual(on_disk["version"], 3)
+            self.assertEqual(on_disk["planTier"], "paid")
+            self.assertTrue(on_disk["boostEnabled"])
+            self.assertFalse(on_disk["boostAfterPlanApproval"])
+            self.assertTrue(on_disk["configuredByUser"])
+            self.assertEqual(on_disk["starPrompt"]["state"], "clicked")
+            self.assertEqual(on_disk["updatedAt"], "2026-11-24T00:00:00Z")
+
+            # 4. Explicit opt-in at v3 survives load_settings and subsequent --install
+            on_disk["boostAfterPlanApproval"] = True
+            (st_dir / "settings.json").write_text(json.dumps(on_disk) + "\n", encoding="utf-8")
+            self.assertTrue(router.load_settings(st_dir)["boostAfterPlanApproval"])
+            re_inst = run_cli("--install", "--config-dir", str(cfg_dir), "--state-dir", str(st_dir), "--json")
+            self.assertEqual(re_inst.returncode, 0, re_inst.stderr)
+            after_reinst = json.loads((st_dir / "settings.json").read_text(encoding="utf-8"))
+            self.assertEqual(after_reinst["version"], 3)
+            self.assertTrue(after_reinst["boostAfterPlanApproval"])
+
     def _create_valid_plugin_skeleton(self, p_dir: Path) -> None:
         (p_dir / "rules").mkdir(parents=True, exist_ok=True)
         (p_dir / "hooks").mkdir(parents=True, exist_ok=True)

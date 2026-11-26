@@ -37,7 +37,7 @@ test("defaults: strictly starts in Free-Tier Safe Mode (boostEnabled=false) with
   const dir = makeTmpDir();
   const s = readSettings(dir);
   assert.deepEqual(s, createDefaultSettings());
-  assert.equal(s.version, 2);
+  assert.equal(s.version, 3);
   assert.equal(s.planTier, "free");
   assert.equal(s.boostEnabled, false);
   assert.equal(s.boostAfterPlanApproval, false);
@@ -65,6 +65,39 @@ test("defaults: strictly starts in Free-Tier Safe Mode (boostEnabled=false) with
     JSON.stringify({ version: 1, planTier: "free", autoRetryScope: "goal_only", configuredByUser: true }) + "\n"
   );
   assert.equal(readSettings(dirExplicit).autoRetryScope, "goal_only");
+
+  // Legacy v2 (e.g. v2.3.0) or versionless disk settings reset boostAfterPlanApproval to false while keeping paid/boostEnabled
+  for (const legacyPayload of [
+    { version: 2, planTier: "paid", boostEnabled: true, boostAfterPlanApproval: true, configuredByUser: true },
+    { planTier: "paid", boostEnabled: true, boostAfterPlanApproval: true, configuredByUser: true }
+  ]) {
+    const dirV2 = makeTmpDir();
+    fs.writeFileSync(path.join(dirV2, "settings.json"), JSON.stringify(legacyPayload) + "\n");
+    const migrated = readSettings(dirV2);
+    assert.equal(migrated.version, 3);
+    assert.equal(migrated.planTier, "paid");
+    assert.equal(migrated.boostEnabled, true);
+    assert.equal(migrated.boostAfterPlanApproval, false);
+
+    const panelState = dispatchPanelApi("/api/state", {}, { stateDir: dirV2 });
+    assert.equal(panelState.status, 200);
+    assert.equal(panelState.body.settings.version, 3);
+    assert.equal(panelState.body.settings.boostEnabled, true);
+    assert.equal(panelState.body.settings.boostAfterPlanApproval, false);
+
+    // Updating an unrelated field writes v3 with boostAfterPlanApproval kept false
+    const afterRetryEdit = updateSettings(dirV2, { autoRetryMax: 5 });
+    assert.equal(afterRetryEdit.version, 3);
+    assert.equal(afterRetryEdit.boostEnabled, true);
+    assert.equal(afterRetryEdit.boostAfterPlanApproval, false);
+    assert.equal(readSettings(dirV2).boostAfterPlanApproval, false);
+
+    // Explicit opt-in after v3 migration persists across reads
+    const reEnabled = updateSettings(dirV2, { boostAfterPlanApproval: true });
+    assert.equal(reEnabled.version, 3);
+    assert.equal(reEnabled.boostAfterPlanApproval, true);
+    assert.equal(readSettings(dirV2).boostAfterPlanApproval, true);
+  }
 });
 
 test("parseTurnRetryOverride parses off / count (Arabic & Chinese) / infinite and ignores global config sentences", () => {
