@@ -11,10 +11,13 @@ import { deflateRawSync, gzipSync } from "node:zlib";
 
 import { readSettings, updateSettings } from "../hooks/lib/settings.mjs";
 import {
+  AUTO_UPDATE_ACK_ROUTE,
   handlePluginUpdate,
   handleVersionCheck,
+  isAutoUpdateInstallEnabled,
   isPluginUpdateBusy,
-  resetUpdateRuntimeFlags
+  resetUpdateRuntimeFlags,
+  runAutoUpdateCycle
 } from "../sidecars/panel/api-handler.mjs";
 import { createStandaloneServer, registerSidecarRoutes, renderPanelHtml } from "../sidecars/panel/server.mjs";
 import {
@@ -38,6 +41,7 @@ import {
 } from "../sidecars/panel/version-check.mjs";
 import {
   createPluginUpdater,
+  evaluateAutoInstallEligibility,
   extractStaticRelativeImports,
   hasActiveUpdateMarker,
   isValidVerifierRole,
@@ -1175,4 +1179,343 @@ test("Sidecar UI index.html: startup auto-check, retry fresh:true, update flow, 
   getEl("chk-auto-update-check").checked = false;
   await getEl("chk-auto-update-check").trigger("change");
   assert.equal(autoUpdateSetting, false);
+});
+
+test("auto-update-install: 4 guardrails (opt-in default off, SHA-256 required, same-major only, circuit breaker), notice ack & UI toggle", async () => {
+  const validSha = "c".repeat(64);
+  const baseRelease = {
+    ok: true,
+    status: "update",
+    currentVersion: "2.5.0",
+    latestVersion: "2.5.1",
+    releaseTag: "v2.5.1",
+    releaseUrl: `https://github.com/${REPO}/releases/tag/v2.5.1`,
+    assetName: "agy-cmd-v2.5.1.zip",
+    assetUrl: `https://github.com/${REPO}/releases/download/v2.5.1/agy-cmd-v2.5.1.zip`,
+    assetSha256: validSha,
+    assetFormat: "zip"
+  };
+
+  // 1. Pure 4-guardrail eligibility checks
+  assert.deepEqual(
+    evaluateAutoInstallEligibility({ release: baseRelease, currentVersion: "2.5.0" }),
+    { eligible: true, skipReason: null, targetVersion: "2.5.1" }
+  );
+  assert.equal(
+    evaluateAutoInstallEligibility({
+      release: { ...baseRelease, latestVersion: "3.0.0", releaseTag: "v3.0.0" },
+      currentVersion: "2.5.0"
+    }).skipReason,
+    "majorUpgrade"
+  );
+  assert.equal(
+    evaluateAutoInstallEligibility({
+      release: { ...baseRelease, assetUrl: "", assetSha256: "" },
+      currentVersion: "2.5.0"
+    }).skipReason,
+    "noVerifiedAsset"
+  );
+  assert.equal(
+    evaluateAutoInstallEligibility({
+      release: baseRelease,
+      currentVersion: "2.5.0",
+      failedVersion: "2.5.1"
+    }).skipReason,
+    "failedCircuitOpen"
+  );
+  assert.equal(
+    evaluateAutoInstallEligibility({
+      release: baseRelease,
+      currentVersion: "2.5.0",
+      failedVersion: "2.5.0"
+    }).eligible,
+    true
+  );
+
+  // 2. Lifecycle cycle: default OFF -> opt-in ON -> env disable -> circuit breaker -> manual clear -> auto success notice + ack
+  const stateDir = makeTmpDir("agy-cmd-autoinst-");
+  resetUpdateRuntimeFlags();
+  try {
+    assert.equal(readSettings(stateDir).autoUpdateInstall, false);
+    assert.equal(isAutoUpdateInstallEnabled(stateDir, {}), false);
+
+    let updateCalls = [];
+    const checker = async () => baseRelease;
+    let updaterMode = "locked";
+    const updater = async (ver) => {
+      updateCalls.push(ver);
+      if (updaterMode === "locked") {
+        return { ok: false, status: "error", reason: "locked", diagnostics: { step: "replace", restored: true } };
+      }
+      if (updaterMode === "git") {
+        return { ok: false, status: "error", reason: "gitCheckout", diagnostics: { step: "inspect" } };
+      }
+      return {
+        ok: true,
+        status: "updated",
+        previousVersion: "2.5.0",
+        version: ver,
+        releaseTag: `v${ver}`,
+        releaseUrl: baseRelease.releaseUrl
+      };
+    };
+
+    // Default OFF: checks but never installs
+    const offRes = await runAutoUpdateCycle({ stateDir, checker, updater, currentVersion: "2.5.0", env: {} });
+    assert.equal(offRes.action, "checked");
+    assert.equal(offRes.autoInstallSkipped, "installDisabled");
+    assert.equal(updateCalls.length, 0);
+
+    // Turning autoUpdateInstall ON while autoUpdateCheck was OFF automatically re-enables autoUpdateCheck
+    updateSettings(stateDir, { autoUpdateCheck: false });
+    const enabled = updateSettings(stateDir, { autoUpdateInstall: true });
+    assert.equal(enabled.autoUpdateInstall, true);
+    assert.equal(enabled.autoUpdateCheck, true);
+
+    // Env hard disable overrides settings.json
+    assert.equal(isAutoUpdateInstallEnabled(stateDir, { AGY_CMD_DISABLE_AUTO_UPDATE_INSTALL: "1" }), false);
+    assert.equal(isAutoUpdateInstallEnabled(stateDir, { AGY_CMD_AUTO_UPDATE_INSTALL: "0" }), false);
+    assert.equal(isAutoUpdateInstallEnabled(stateDir, { AGY_CMD_DISABLE_AUTO_UPDATE_CHECK: "1" }), false);
+
+    // gitCheckout failure does NOT trip circuit breaker
+    updaterMode = "git";
+    const gitFail = await runAutoUpdateCycle({ stateDir, checker, updater, currentVersion: "2.5.0", env: {} });
+    assert.equal(gitFail.action, "failed");
+    assert.equal(readSettings(stateDir).autoUpdateState.failedVersion, "");
+
+    // locked failure trips per-version circuit breaker; second cycle skips 2.5.1 automatically
+    updaterMode = "locked";
+    const lockFail = await runAutoUpdateCycle({
+      stateDir,
+      checker,
+      updater,
+      currentVersion: "2.5.0",
+      env: {},
+      nowIso: "2026-11-26T16:00:00.000Z"
+    });
+    assert.equal(lockFail.action, "failed");
+    assert.equal(readSettings(stateDir).autoUpdateState.failedVersion, "2.5.1");
+    assert.equal(readSettings(stateDir).autoUpdateState.failedReason, "locked");
+
+    const skippedRes = await runAutoUpdateCycle({ stateDir, checker, updater, currentVersion: "2.5.0", env: {} });
+    assert.equal(skippedRes.action, "checked");
+    assert.equal(skippedRes.autoInstallSkipped, "failedCircuitOpen");
+    assert.equal(updateCalls.length, 2);
+
+    // Manual update success clears circuit breaker
+    updaterMode = "ok";
+    const manualOk = await handlePluginUpdate({ version: "2.5.1" }, { stateDir, updater });
+    assert.equal(manualOk.body.status, "updated");
+    assert.equal(readSettings(stateDir).autoUpdateState.failedVersion, "");
+
+    // Automatic update success writes autoUpdateNotice and triggers onUpdated callback
+    let restarted = false;
+    const autoOk = await runAutoUpdateCycle({
+      stateDir,
+      checker: async () => ({
+        ...baseRelease,
+        latestVersion: readLocalVersion(REPO_ROOT) || "2.5.0",
+        releaseTag: `v${readLocalVersion(REPO_ROOT) || "2.5.0"}`
+      }),
+      updater,
+      currentVersion: "2.4.0",
+      env: {},
+      nowIso: "2026-11-26T16:05:00.000Z",
+      onUpdated: () => {
+        restarted = true;
+      }
+    });
+    assert.equal(autoOk.action, "updated");
+    assert.equal(restarted, true);
+    const localVer = readLocalVersion(REPO_ROOT);
+    assert.equal(readSettings(stateDir).autoUpdateState.lastAutoUpdatedVersion, localVer);
+
+    // HTTP /api/state exposes autoUpdateNotice; /api/auto-update-ack enforces CSRF/POST/schema and clears notice
+    resetUpdateRuntimeFlags();
+    let autoTriggerFired = false;
+    const csrf = "auto-ack-csrf-0123456789abcdef";
+    const srv = createStandaloneServer({
+      stateDir,
+      csrfToken: csrf,
+      onAutoInstallEnabled: () => {
+        autoTriggerFired = true;
+      }
+    });
+    await new Promise((resolve) => srv.listen(0, "127.0.0.1", resolve));
+    const port = srv.address().port;
+    try {
+      const stBefore = await httpRawRequest(port, "/api/state", {
+        headers: { "Content-Type": "application/json", "X-Agy-Cmd-Csrf": csrf },
+        body: "{}"
+      });
+      assert.equal(stBefore.status, 200);
+      assert.equal(stBefore.json.autoUpdateNotice?.version, localVer);
+
+      assert.equal((await httpRawRequest(port, AUTO_UPDATE_ACK_ROUTE, { method: "GET" })).status, 405);
+      assert.equal(
+        (await httpRawRequest(port, AUTO_UPDATE_ACK_ROUTE, { headers: { "Content-Type": "application/json" }, body: "{}" })).status,
+        401
+      );
+      assert.equal(
+        (
+          await httpRawRequest(port, AUTO_UPDATE_ACK_ROUTE, {
+            headers: { "Content-Type": "application/json", "X-Agy-Cmd-Csrf": csrf },
+            body: JSON.stringify({ extra: 1 })
+          })
+        ).status,
+        400
+      );
+
+      const ackOk = await httpRawRequest(port, AUTO_UPDATE_ACK_ROUTE, {
+        headers: { "Content-Type": "application/json", "X-Agy-Cmd-Csrf": csrf },
+        body: JSON.stringify({ dismissNotice: true })
+      });
+      assert.equal(ackOk.status, 200);
+      assert.equal(ackOk.json.autoUpdateNotice, null);
+
+      const stAfter = await httpRawRequest(port, "/api/state", {
+        headers: { "Content-Type": "application/json", "X-Agy-Cmd-Csrf": csrf },
+        body: "{}"
+      });
+      assert.equal(stAfter.json.autoUpdateNotice, null);
+
+      const toggleRes = await httpRawRequest(port, "/api/settings", {
+        headers: { "Content-Type": "application/json", "X-Agy-Cmd-Csrf": csrf },
+        body: JSON.stringify({ autoUpdateInstall: true })
+      });
+      assert.equal(toggleRes.status, 200);
+      assert.equal(autoTriggerFired, true);
+    } finally {
+      await new Promise((resolve) => srv.close(resolve));
+    }
+
+    // 3. Panel UI VM test: renders auto-updated notice banner and dismisses via /api/auto-update-ack + toggle switch
+    const htmlSource = renderPanelHtml("vm-auto-csrf");
+    assert.ok(htmlSource.includes('id="chk-auto-update-install"'));
+    const scriptBlocks = [...htmlSource.matchAll(/<script>([\s\S]*?)<\/script>/gi)];
+    const mainScript = scriptBlocks[scriptBlocks.length - 1][1];
+    const els = new Map();
+    const getEl = (id) => {
+      if (!els.has(id)) {
+        const listeners = new Map();
+        els.set(id, {
+          id,
+          hidden: id === "version-update-banner" || id === "onboard-card" || id === "star-milestone-banner",
+          value: id === "inp-max" ? "3" : "",
+          checked: id === "chk-auto-update-check",
+          disabled: false,
+          textContent: "",
+          href: "",
+          style: { getPropertyValue: () => "" },
+          dataset: {},
+          classList: { _s: new Set(), add(c) { this._s.add(c); }, remove(c) { this._s.delete(c); }, toggle() {}, contains() { return false; } },
+          setAttribute() {},
+          addEventListener(type, fn) {
+            if (!listeners.has(type)) listeners.set(type, []);
+            listeners.get(type).push(fn);
+          },
+          async trigger(type, ev = { preventDefault() {} }) {
+            for (const fn of listeners.get(type) || []) await fn(ev);
+          }
+        });
+      }
+      return els.get(id);
+    };
+    const uiCalls = [];
+    let uiAutoInstall = false;
+    const uiFetch = async (urlPath, opts = {}) => {
+      const body = JSON.parse(opts.body || "{}");
+      uiCalls.push({ urlPath, body });
+      const mk = (obj) => ({ ok: true, status: 200, json: async () => structuredClone(obj) });
+      if (urlPath === "/api/settings") {
+        if ("autoUpdateInstall" in body) uiAutoInstall = body.autoUpdateInstall;
+        return mk({
+          ok: true,
+          version: "2.5.1",
+          autoUpdateNotice: null,
+          settings: {
+            version: 3,
+            planTier: "free",
+            boostEnabled: false,
+            autoRetryMode: "count",
+            autoRetryMax: 3,
+            autoRetryScope: "smart",
+            freeFallbackEnabled: true,
+            planFallbackEnabled: true,
+            autoUpdateCheck: true,
+            autoUpdateInstall: uiAutoInstall,
+            configuredByUser: true,
+            onboardingShown: true,
+            stats: { totalAutoRetries: 0 },
+            starPrompt: { state: "pending", shouldShow: false }
+          }
+        });
+      }
+      if (urlPath === "/api/state") {
+        return mk({
+          ok: true,
+          version: "2.5.1",
+          autoUpdateNotice: {
+            version: "2.5.1",
+            previousVersion: "2.5.0",
+            updatedAt: "2026-11-26T16:05:00.000Z",
+            releaseUrl: baseRelease.releaseUrl
+          },
+          settings: {
+            version: 3,
+            planTier: "free",
+            boostEnabled: false,
+            autoRetryMode: "count",
+            autoRetryMax: 3,
+            autoRetryScope: "smart",
+            freeFallbackEnabled: true,
+            planFallbackEnabled: true,
+            autoUpdateCheck: true,
+            autoUpdateInstall: uiAutoInstall,
+            configuredByUser: true,
+            onboardingShown: true,
+            stats: { totalAutoRetries: 0 },
+            starPrompt: { state: "pending", shouldShow: false }
+          }
+        });
+      }
+      return mk({ ok: true, autoUpdateNotice: null });
+    };
+    const sandbox = {
+      window: { location: {}, addEventListener() {}, fetch: uiFetch, sidecar: null },
+      document: {
+        hidden: false,
+        activeElement: null,
+        documentElement: { style: { getPropertyValue: () => "" }, setAttribute() {} },
+        getElementById: getEl,
+        querySelectorAll: () => []
+      },
+      navigator: {},
+      Intl,
+      requestAnimationFrame: (fn) => fn(),
+      setInterval: () => 1,
+      clearInterval: () => {},
+      setTimeout: () => 1,
+      clearTimeout: () => {}
+    };
+    vm.createContext(sandbox);
+    vm.runInContext(mainScript, sandbox);
+    await new Promise((r) => setTimeout(r, 20));
+
+    assert.equal(getEl("chk-auto-update-install").checked, false);
+    assert.equal(getEl("version-update-banner").dataset.state, "auto-updated");
+    assert.match(getEl("version-status-text").textContent, /已自动更新至 v2\.5\.1（原 v2\.5\.0）/);
+
+    await getEl("version-dismiss-btn").trigger("click");
+    await new Promise((r) => setTimeout(r, 10));
+    assert.equal(getEl("version-update-banner").hidden, true);
+    assert.ok(uiCalls.some((c) => c.urlPath === AUTO_UPDATE_ACK_ROUTE && c.body.dismissNotice === true));
+
+    getEl("chk-auto-update-install").checked = true;
+    await getEl("chk-auto-update-install").trigger("change");
+    assert.equal(uiAutoInstall, true);
+  } finally {
+    resetUpdateRuntimeFlags();
+    fs.rmSync(stateDir, { recursive: true, force: true });
+  }
 });

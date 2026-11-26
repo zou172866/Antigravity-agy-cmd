@@ -63,6 +63,8 @@ export function createDefaultSettings() {
     freeFallbackEnabled: true,
     planFallbackEnabled: true,
     autoUpdateCheck: true,
+    autoUpdateInstall: false,
+    autoUpdateState: normalizeAutoUpdateState(null),
     configuredByUser: false,
     onboardingShown: false,
     stats: {
@@ -77,6 +79,32 @@ export function createDefaultSettings() {
       milestoneAutoRetries: 0
     },
     updatedAt: ""
+  };
+}
+
+export function normalizeAutoUpdateState(raw) {
+  const defaults = {
+    lastAutoUpdatedVersion: "",
+    lastAutoUpdatedFrom: "",
+    lastAutoUpdatedAt: "",
+    lastAutoUpdatedUrl: "",
+    failedVersion: "",
+    failedReason: "",
+    failedAt: ""
+  };
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return { ...defaults };
+  }
+  const normStr = (v, maxLen = 64) => (typeof v === "string" ? v.trim().slice(0, maxLen) : "");
+  const rawUrl = normStr(raw.lastAutoUpdatedUrl, 256);
+  return {
+    lastAutoUpdatedVersion: normStr(raw.lastAutoUpdatedVersion, 32),
+    lastAutoUpdatedFrom: normStr(raw.lastAutoUpdatedFrom, 32),
+    lastAutoUpdatedAt: normStr(raw.lastAutoUpdatedAt, 64),
+    lastAutoUpdatedUrl: rawUrl.startsWith(`${GITHUB_REPO_URL}/releases/`) ? rawUrl : "",
+    failedVersion: normStr(raw.failedVersion, 32),
+    failedReason: normStr(raw.failedReason, 64),
+    failedAt: normStr(raw.failedAt, 64)
   };
 }
 
@@ -293,6 +321,7 @@ export function normalizeSettings(raw = {}) {
     typeof src.planFallbackEnabled === "boolean" ? src.planFallbackEnabled : def.planFallbackEnabled;
   const autoUpdateCheck =
     typeof src.autoUpdateCheck === "boolean" ? src.autoUpdateCheck : def.autoUpdateCheck;
+  const autoUpdateInstall = src.autoUpdateInstall === true;
   const configuredByUser =
     typeof src.configuredByUser === "boolean" ? src.configuredByUser : def.configuredByUser;
   const onboardingShown =
@@ -331,6 +360,8 @@ export function normalizeSettings(raw = {}) {
     freeFallbackEnabled,
     planFallbackEnabled,
     autoUpdateCheck,
+    autoUpdateInstall,
+    autoUpdateState: normalizeAutoUpdateState(src.autoUpdateState),
     configuredByUser,
     onboardingShown,
     stats: {
@@ -402,7 +433,8 @@ export function updateSettings(stateDir, patch = {}, options = {}) {
     const next = {
       ...current,
       stats: { ...current.stats },
-      starPrompt: normalizeStarPromptState(current.starPrompt)
+      starPrompt: normalizeStarPromptState(current.starPrompt),
+      autoUpdateState: normalizeAutoUpdateState(current.autoUpdateState)
     };
 
     if ("planTier" in patch) {
@@ -534,6 +566,18 @@ export function updateSettings(stateDir, patch = {}, options = {}) {
       next.autoUpdateCheck = patch.autoUpdateCheck;
     }
 
+    if ("autoUpdateInstall" in patch) {
+      if (typeof patch.autoUpdateInstall !== "boolean") {
+        const err = new Error("autoUpdateInstall must be a boolean");
+        err.statusCode = 400;
+        throw err;
+      }
+      next.autoUpdateInstall = patch.autoUpdateInstall;
+      if (patch.autoUpdateInstall === true && !("autoUpdateCheck" in patch) && next.autoUpdateCheck === false) {
+        next.autoUpdateCheck = true;
+      }
+    }
+
     if ("configuredByUser" in patch && typeof patch.configuredByUser === "boolean") {
       next.configuredByUser = patch.configuredByUser;
     } else if (options.markConfigured !== false) {
@@ -556,6 +600,26 @@ export function updateSettings(stateDir, patch = {}, options = {}) {
     next.updatedAt = options.nowIso || new Date().toISOString();
     return writeSettings(stateDir, next);
   });
+}
+
+export function updateAutoUpdateState(stateDir, patch = {}) {
+  if (!stateDir || !patch || typeof patch !== "object" || Array.isArray(patch)) return null;
+  try {
+    return withSettingsLock(stateDir, () => {
+      const current = readSettings(stateDir);
+      const mergedState = normalizeAutoUpdateState({
+        ...normalizeAutoUpdateState(current.autoUpdateState),
+        ...patch
+      });
+      const saved = writeSettings(stateDir, {
+        ...current,
+        autoUpdateState: mergedState
+      });
+      return saved.autoUpdateState;
+    });
+  } catch {
+    return null;
+  }
 }
 
 export function recordAutoRetryStat(stateDir, convId, nowIso = new Date().toISOString()) {

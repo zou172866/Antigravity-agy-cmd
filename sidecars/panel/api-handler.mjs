@@ -10,11 +10,12 @@ import {
   readSettings,
   setStarPromptState,
   STAR_PROMPT_TERMINAL_STATES,
+  updateAutoUpdateState,
   updateSettings
 } from "../../hooks/lib/settings.mjs";
 import { readState } from "../../hooks/lib/state.mjs";
 import { createVersionChecker, parseVersion, readLocalVersion } from "./version-check.mjs";
-import { createPluginUpdater } from "./version-update.mjs";
+import { createPluginUpdater, evaluateAutoInstallEligibility } from "./version-update.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -26,15 +27,20 @@ export const NO_STORE_HEADERS = Object.freeze({
 const LOCAL_HOST_RE = /^(?:127\.0\.0\.1|localhost|\[::1\])(?::\d{1,5})?$/i;
 const LOCAL_HTTP_ORIGIN_RE = /^http:\/\/(?:127\.0\.0\.1|localhost|\[::1\])(?::\d{1,5})?$/i;
 const VSCODE_WEBVIEW_RE = /^vscode-webview:\/\/[a-z0-9._-]+(?:\/.*)?$/i;
+export const AUTO_UPDATE_ACK_ROUTE = "/api/auto-update-ack";
+
 const STAR_PROMPT_ALLOWED_KEYS = new Set(["state"]);
 const STAR_PROMPT_ALLOWED_STATES = new Set(STAR_PROMPT_TERMINAL_STATES);
 const VERSION_CHECK_ALLOWED_KEYS = new Set(["mode", "fresh"]);
 const PLUGIN_UPDATE_ALLOWED_KEYS = new Set(["version"]);
+const AUTO_UPDATE_ACK_ALLOWED_KEYS = new Set(["dismissNotice"]);
+const NON_CIRCUIT_AUTO_FAIL_REASONS = new Set(["gitCheckout", "notInstalled", "busy", "releaseChanged"]);
 
 let _defaultVersionChecker = null;
 let _defaultPluginUpdater = null;
 let _updateInFlight = false;
 let _updateRestartScheduled = false;
+let _autoCycleInFlight = null;
 
 export function isPluginUpdateBusy() {
   return _updateInFlight || _updateRestartScheduled;
@@ -43,17 +49,43 @@ export function isPluginUpdateBusy() {
 export function resetUpdateRuntimeFlags() {
   _updateInFlight = false;
   _updateRestartScheduled = false;
+  _autoCycleInFlight = null;
+}
+
+function parseOptionalEnvBool(raw) {
+  if (raw === undefined || raw === null) return undefined;
+  const s = String(raw).trim().toLowerCase();
+  if (!s) return undefined;
+  if (s === "1" || s === "true" || s === "yes" || s === "on") return true;
+  if (s === "0" || s === "false" || s === "no" || s === "off") return false;
+  return undefined;
 }
 
 export function isAutoUpdateCheckEnabled(stateDir, env = process.env) {
-  const disableFlag = String(env?.AGY_CMD_DISABLE_AUTO_UPDATE_CHECK || "").trim().toLowerCase();
-  if (disableFlag === "1" || disableFlag === "true" || disableFlag === "yes") {
+  if (parseOptionalEnvBool(env?.AGY_CMD_DISABLE_AUTO_UPDATE_CHECK) === true) {
     return false;
   }
+  const envVal = parseOptionalEnvBool(env?.AGY_CMD_AUTO_UPDATE_CHECK);
+  if (envVal !== undefined) return envVal;
   try {
     return readSettings(stateDir).autoUpdateCheck !== false;
   } catch {
     return true;
+  }
+}
+
+export function isAutoUpdateInstallEnabled(stateDir, env = process.env) {
+  if (!isAutoUpdateCheckEnabled(stateDir, env)) return false;
+  if (parseOptionalEnvBool(env?.AGY_CMD_DISABLE_AUTO_UPDATE_INSTALL) === true) {
+    return false;
+  }
+  const envVal = parseOptionalEnvBool(env?.AGY_CMD_AUTO_UPDATE_INSTALL);
+  if (envVal !== undefined) return envVal;
+  try {
+    const s = readSettings(stateDir);
+    return s.autoUpdateCheck !== false && s.autoUpdateInstall === true;
+  } catch {
+    return false;
   }
 }
 
@@ -169,9 +201,23 @@ export function buildPanelStatePayload(stateDir, rawConvId = "", { markStarTrigg
     }
   }
 
+  const localVersion = readLocalVersion();
+  const autoState = settings.autoUpdateState || {};
+  const autoUpdateNotice =
+    autoState.lastAutoUpdatedVersion && (!localVersion || autoState.lastAutoUpdatedVersion === localVersion)
+      ? {
+          version: autoState.lastAutoUpdatedVersion,
+          previousVersion: autoState.lastAutoUpdatedFrom || "",
+          updatedAt: autoState.lastAutoUpdatedAt || "",
+          releaseUrl: autoState.lastAutoUpdatedUrl || ""
+        }
+      : null;
+
   return {
     ok: true,
-    version: readLocalVersion(),
+    version: localVersion,
+    autoUpdateInstallEffective: isAutoUpdateInstallEnabled(stateDir),
+    autoUpdateNotice,
     settings,
     starPrompt,
     summaryZh: formatRetrySummaryZh(settings),
@@ -290,7 +336,7 @@ export async function handleVersionCheck(
 
 export async function handlePluginUpdate(
   rawData,
-  { updater = null, onUpdated = null } = {}
+  { stateDir = "", updater = null, onUpdated = null, automatic = false, nowIso = null } = {}
 ) {
   if (!isPlainJsonObject(rawData)) {
     return {
@@ -321,18 +367,143 @@ export async function handlePluginUpdate(
   } finally {
     _updateInFlight = false;
   }
-  if (result?.status === "updated" && typeof onUpdated === "function") {
-    _updateRestartScheduled = true;
-    try {
-      onUpdated(result);
-    } catch {
-      _updateRestartScheduled = false;
+  if (result?.status === "updated") {
+    if (stateDir) {
+      const ts = typeof nowIso === "string" && nowIso.trim() ? nowIso.trim() : new Date().toISOString();
+      if (automatic) {
+        updateAutoUpdateState(stateDir, {
+          lastAutoUpdatedVersion: result.version || parsed.version,
+          lastAutoUpdatedFrom: result.previousVersion || "",
+          lastAutoUpdatedAt: ts,
+          lastAutoUpdatedUrl: result.releaseUrl || "",
+          failedVersion: "",
+          failedReason: "",
+          failedAt: ""
+        });
+      } else {
+        updateAutoUpdateState(stateDir, {
+          lastAutoUpdatedVersion: "",
+          lastAutoUpdatedFrom: "",
+          lastAutoUpdatedAt: "",
+          lastAutoUpdatedUrl: "",
+          failedVersion: "",
+          failedReason: "",
+          failedAt: ""
+        });
+      }
+    }
+    if (typeof onUpdated === "function") {
+      _updateRestartScheduled = true;
+      try {
+        onUpdated(result);
+      } catch {
+        _updateRestartScheduled = false;
+      }
     }
   }
   return {
     status: 200,
     body: result
   };
+}
+
+export function handleAutoUpdateAck(stateDir, rawData) {
+  const data = rawData === undefined ? {} : rawData;
+  if (!isPlainJsonObject(data)) {
+    return {
+      status: 400,
+      body: { ok: false, error: "Request body must be a JSON object" }
+    };
+  }
+  for (const key of Object.keys(data)) {
+    if (!AUTO_UPDATE_ACK_ALLOWED_KEYS.has(key)) {
+      return {
+        status: 400,
+        body: { ok: false, error: `Unexpected field '${key}' in request body` }
+      };
+    }
+  }
+  if (data.dismissNotice !== undefined && data.dismissNotice !== true) {
+    return {
+      status: 400,
+      body: { ok: false, error: "Field 'dismissNotice' must be true" }
+    };
+  }
+  if (stateDir) {
+    updateAutoUpdateState(stateDir, {
+      lastAutoUpdatedVersion: "",
+      lastAutoUpdatedFrom: "",
+      lastAutoUpdatedAt: "",
+      lastAutoUpdatedUrl: ""
+    });
+  }
+  return {
+    status: 200,
+    body: { ok: true, autoUpdateNotice: null }
+  };
+}
+
+export async function runAutoUpdateCycle({
+  stateDir = "",
+  checker = null,
+  updater = null,
+  onUpdated = null,
+  env = process.env,
+  nowIso = null,
+  currentVersion = null
+} = {}) {
+  if (_autoCycleInFlight) return _autoCycleInFlight;
+
+  const task = (async () => {
+    if (!isAutoUpdateCheckEnabled(stateDir, env)) {
+      return { ok: true, action: "skipped", reason: "checkDisabled" };
+    }
+    const resolvedChecker = checker || getDefaultVersionChecker();
+    const release = await resolvedChecker("auto");
+    if (!isAutoUpdateInstallEnabled(stateDir, env)) {
+      return { ok: true, action: "checked", release, autoInstallSkipped: "installDisabled" };
+    }
+    if (isPluginUpdateBusy()) {
+      return { ok: true, action: "skipped", reason: "busy", release };
+    }
+    const settings = stateDir ? readSettings(stateDir) : null;
+    const curVer =
+      typeof currentVersion === "string" && currentVersion.trim()
+        ? currentVersion.trim()
+        : release?.currentVersion || readLocalVersion();
+    const eligibility = evaluateAutoInstallEligibility({
+      release,
+      currentVersion: curVer,
+      failedVersion: settings?.autoUpdateState?.failedVersion || ""
+    });
+    if (!eligibility.eligible) {
+      return { ok: true, action: "checked", release, autoInstallSkipped: eligibility.skipReason };
+    }
+
+    const updOut = await handlePluginUpdate(
+      { version: eligibility.targetVersion },
+      { stateDir, updater, onUpdated, automatic: true, nowIso }
+    );
+    const updBody = updOut?.body;
+    if (updBody?.status === "updated") {
+      return { ok: true, action: "updated", result: updBody };
+    }
+    const failReason = updBody?.reason || "install";
+    if (stateDir && !NON_CIRCUIT_AUTO_FAIL_REASONS.has(failReason)) {
+      const ts = typeof nowIso === "string" && nowIso.trim() ? nowIso.trim() : new Date().toISOString();
+      updateAutoUpdateState(stateDir, {
+        failedVersion: eligibility.targetVersion,
+        failedReason: failReason,
+        failedAt: ts
+      });
+    }
+    return { ok: false, action: "failed", result: updBody };
+  })().finally(() => {
+    _autoCycleInFlight = null;
+  });
+
+  _autoCycleInFlight = task;
+  return task;
 }
 
 export function dispatchPanelApi(pathname, rawData, { stateDir, defaultConvId = "" } = {}) {

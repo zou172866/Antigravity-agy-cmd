@@ -321,6 +321,34 @@ def _is_valid_current_settings_version(raw_version: object) -> bool:
     )
 
 
+def normalize_auto_update_state(raw: object) -> dict:
+    defaults = {
+        "lastAutoUpdatedVersion": "",
+        "lastAutoUpdatedFrom": "",
+        "lastAutoUpdatedAt": "",
+        "lastAutoUpdatedUrl": "",
+        "failedVersion": "",
+        "failedReason": "",
+        "failedAt": "",
+    }
+    if not isinstance(raw, dict):
+        return dict(defaults)
+
+    def _norm(val: object, limit: int = 64) -> str:
+        return val.strip()[:limit] if isinstance(val, str) else ""
+
+    raw_url = _norm(raw.get("lastAutoUpdatedUrl"), 256)
+    return {
+        "lastAutoUpdatedVersion": _norm(raw.get("lastAutoUpdatedVersion"), 32),
+        "lastAutoUpdatedFrom": _norm(raw.get("lastAutoUpdatedFrom"), 32),
+        "lastAutoUpdatedAt": _norm(raw.get("lastAutoUpdatedAt"), 64),
+        "lastAutoUpdatedUrl": raw_url if raw_url.startswith(f"{GITHUB_REPO_URL}/releases/") else "",
+        "failedVersion": _norm(raw.get("failedVersion"), 32),
+        "failedReason": _norm(raw.get("failedReason"), 64),
+        "failedAt": _norm(raw.get("failedAt"), 64),
+    }
+
+
 def default_settings() -> dict:
     return {
         "version": SETTINGS_VERSION,
@@ -336,6 +364,8 @@ def default_settings() -> dict:
         "freeFallbackEnabled": True,
         "planFallbackEnabled": True,
         "autoUpdateCheck": True,
+        "autoUpdateInstall": False,
+        "autoUpdateState": normalize_auto_update_state(None),
         "configuredByUser": False,
         "onboardingShown": False,
         "stats": {
@@ -356,10 +386,11 @@ def load_settings(state_dir: Path) -> dict:
     try:
         raw = json.loads(settings_path.read_text(encoding="utf-8"))
         if isinstance(raw, dict):
-            base.update({k: v for k, v in raw.items() if k not in ("stats", "starPrompt")})
+            base.update({k: v for k, v in raw.items() if k not in ("stats", "starPrompt", "autoUpdateState")})
             if isinstance(raw.get("stats"), dict):
                 base["stats"].update(raw["stats"])
             base["starPrompt"] = normalize_star_prompt_state(raw.get("starPrompt"))
+            base["autoUpdateState"] = normalize_auto_update_state(raw.get("autoUpdateState"))
             if (
                 raw.get("version") == 1
                 and raw.get("configuredByUser") is False
@@ -382,6 +413,8 @@ def load_settings(state_dir: Path) -> dict:
     base["deliveryTestCommand"] = sanitize_delivery_test_command(base.get("deliveryTestCommand"), strict=False)
     raw_auto_update = base.get("autoUpdateCheck")
     base["autoUpdateCheck"] = raw_auto_update if isinstance(raw_auto_update, bool) else True
+    base["autoUpdateInstall"] = base.get("autoUpdateInstall") is True
+    base["autoUpdateState"] = normalize_auto_update_state(base.get("autoUpdateState"))
     base["starPrompt"] = normalize_star_prompt_state(base.get("starPrompt"))
     return base
 
@@ -468,6 +501,7 @@ def apply_settings_cli(
     delivery_test_gate: str | None = None,
     delivery_test_cmd: str | None = None,
     auto_update_check: str | None = None,
+    auto_update_install: str | None = None,
 ) -> dict:
     with _with_settings_lock(state_dir):
         current = load_settings(state_dir)
@@ -501,6 +535,11 @@ def apply_settings_cli(
             current["deliveryTestCommand"] = sanitize_delivery_test_command(delivery_test_cmd, strict=True)
         if auto_update_check is not None:
             current["autoUpdateCheck"] = auto_update_check == "on"
+        if auto_update_install is not None:
+            want_install = auto_update_install == "on"
+            current["autoUpdateInstall"] = want_install
+            if want_install and auto_update_check is None and not current.get("autoUpdateCheck", True):
+                current["autoUpdateCheck"] = True
 
         current["configuredByUser"] = True
         current["onboardingShown"] = True
@@ -865,6 +904,12 @@ def main(argv: list[str] | None = None) -> int:
         help="开启或关闭右侧边栏启动时自动检查 GitHub Releases 新版本（默认开启）",
     )
     parser.add_argument(
+        "--auto-update-install",
+        choices=["on", "off"],
+        default=None,
+        help="开启或关闭发现同主版本且通过 SHA-256 校验的新版本时静默自动更新（默认关闭）",
+    )
+    parser.add_argument(
         "--standalone",
         action="store_true",
         help="强制使用独立规则模式（~/.gemini/config/rules/agy-auto-router.md）",
@@ -897,6 +942,7 @@ def main(argv: list[str] | None = None) -> int:
             args.delivery_test_gate,
             args.delivery_test_cmd,
             args.auto_update_check,
+            args.auto_update_install,
         )
     )
     has_lifecycle_action = any((args.install, args.remove, args.status, args.sync_check))
@@ -924,6 +970,7 @@ def main(argv: list[str] | None = None) -> int:
             delivery_test_gate=args.delivery_test_gate,
             delivery_test_cmd=args.delivery_test_cmd,
             auto_update_check=args.auto_update_check,
+            auto_update_install=args.auto_update_install,
         )
         if not args.json:
             print(f"已更新 agy-cmd 运行设置（{state_dir / 'settings.json'}）：")

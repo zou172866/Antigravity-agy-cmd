@@ -164,14 +164,19 @@ class TestSetupAutoRouterCLI(unittest.TestCase):
             bad_long = run_cli("--delivery-test-cmd", "a" * 241, "--state-dir", tmp)
             self.assertNotEqual(bad_long.returncode, 0)
 
-            # Auto-update-check toggle defaults True and persists cleanly via CLI
+            # Auto-update-check & auto-update-install toggles persist cleanly via CLI
             self.assertTrue(router.load_settings(state)["autoUpdateCheck"])
+            self.assertFalse(router.load_settings(state)["autoUpdateInstall"])
             upd_off = set_option("--auto-update-check", "off")
             self.assertFalse(upd_off["autoUpdateCheck"])
             self.assertFalse(router.load_settings(state)["autoUpdateCheck"])
-            upd_on = set_option("--auto-update-check", "on")
-            self.assertTrue(upd_on["autoUpdateCheck"])
-            self.assertTrue(router.load_settings(state)["autoUpdateCheck"])
+            # Enabling --auto-update-install automatically turns autoUpdateCheck back on
+            inst_on = set_option("--auto-update-install", "on")
+            self.assertTrue(inst_on["autoUpdateInstall"])
+            self.assertTrue(inst_on["autoUpdateCheck"])
+            inst_off = set_option("--auto-update-install", "off")
+            self.assertFalse(inst_off["autoUpdateInstall"])
+            self.assertTrue(inst_off["autoUpdateCheck"])
 
     def test_legacy_v2_plan_boost_resets_to_false_on_load_and_install(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

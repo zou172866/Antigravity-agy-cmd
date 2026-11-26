@@ -556,6 +556,50 @@ async function replaceInstalledFiles(
 }
 
 /**
+ * Evaluate whether a discovered release qualifies for opt-in silent auto-install:
+ * requires same major version, a verified SHA-256 release asset, and no open failure
+ * circuit breaker for the same target version.
+ */
+export function evaluateAutoInstallEligibility({ release, currentVersion, failedVersion = "" } = {}) {
+  const cur = parseVersion(currentVersion);
+  if (!cur) return { eligible: false, skipReason: "invalidVersion" };
+  if (!release || release.status !== "update") {
+    return { eligible: false, skipReason: "notUpdate" };
+  }
+  const latest = parseVersion(release.latestVersion);
+  const tagParsed = parseVersion(release.releaseTag);
+  if (
+    !latest ||
+    !tagParsed ||
+    latest.pre.length > 0 ||
+    tagParsed.pre.length > 0 ||
+    latest.version !== tagParsed.version
+  ) {
+    return { eligible: false, skipReason: "invalidVersion" };
+  }
+  if (compareVersions(latest.version, cur.version) !== 1) {
+    return { eligible: false, skipReason: "notUpdate" };
+  }
+  if (cur.core[0] !== latest.core[0]) {
+    return { eligible: false, skipReason: "majorUpgrade", targetVersion: latest.version };
+  }
+  const hasVerifiedAsset = Boolean(
+    typeof release.assetUrl === "string" &&
+      release.assetUrl.trim() &&
+      typeof release.assetSha256 === "string" &&
+      /^[0-9a-f]{64}$/i.test(release.assetSha256.trim())
+  );
+  if (!hasVerifiedAsset) {
+    return { eligible: false, skipReason: "noVerifiedAsset", targetVersion: latest.version };
+  }
+  const failedParsed = parseVersion(failedVersion);
+  if (failedParsed && failedParsed.version === latest.version) {
+    return { eligible: false, skipReason: "failedCircuitOpen", targetVersion: latest.version };
+  }
+  return { eligible: true, skipReason: null, targetVersion: latest.version };
+}
+
+/**
  * Create an atomic, rollback-safe self-updater for an installed agy-cmd plugin directory.
  */
 export function createPluginUpdater({

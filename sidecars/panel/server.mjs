@@ -13,14 +13,15 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { isDirectRun, resolveStateDir } from "../../hooks/lib/common.mjs";
 import {
+  AUTO_UPDATE_ACK_ROUTE,
   dispatchPanelApi,
-  getDefaultVersionChecker,
+  handleAutoUpdateAck,
   handlePluginUpdate,
   handleVersionCheck,
   isAllowedLocalRequest,
-  isAutoUpdateCheckEnabled,
   isPluginUpdateBusy,
   NO_STORE_HEADERS,
+  runAutoUpdateCycle,
   timingSafeEqualStr
 } from "./api-handler.mjs";
 import { readLocalVersion, VERSION_ROUTE } from "./version-check.mjs";
@@ -140,7 +141,8 @@ export function createStandaloneServer({
   versionChecker = null,
   pluginUpdater = null,
   autoUpdateCheckEnabled = null,
-  onUpdated = null
+  onUpdated = null,
+  onAutoInstallEnabled = null
 } = {}) {
   const sendJson = (res, status, payload, extraHeaders = {}) => {
     res.writeHead(status, {
@@ -228,13 +230,27 @@ export function createStandaloneServer({
         }
         if (url.pathname === UPDATE_ROUTE) {
           const out = await handlePluginUpdate(parsed.data, {
+            stateDir,
             updater: pluginUpdater,
             onUpdated
           });
           sendJson(res, out.status, out.body);
           return;
         }
+        if (url.pathname === AUTO_UPDATE_ACK_ROUTE) {
+          const out = handleAutoUpdateAck(stateDir, parsed.data);
+          sendJson(res, out.status, out.body);
+          return;
+        }
         const out = dispatchPanelApi(url.pathname, parsed.data, { stateDir });
+        if (
+          url.pathname === "/api/settings" &&
+          out.status === 200 &&
+          parsed.data?.autoUpdateInstall === true &&
+          typeof onAutoInstallEnabled === "function"
+        ) {
+          void Promise.resolve(onAutoInstallEnabled()).catch(() => {});
+        }
         sendJson(res, out.status, out.body);
         return;
       }
@@ -260,7 +276,8 @@ export function registerSidecarRoutes(
     versionChecker = null,
     pluginUpdater = null,
     autoUpdateCheckEnabled = null,
-    onUpdated = null
+    onUpdated = null,
+    onAutoInstallEnabled = null
   } = {}
 ) {
   const wrapJson = (out) => {
@@ -295,13 +312,21 @@ export function registerSidecarRoutes(
   for (const route of ["/api/state", "/api/settings", "/api/dismiss-onboarding", "/api/star-prompt"]) {
     app.api(
       route,
-      (rawData) =>
-        wrapJson(
-          dispatchPanelApi(route, rawData, {
-            stateDir,
-            defaultConvId: app.config?.conversationId || ""
-          })
-        ),
+      (rawData) => {
+        const out = dispatchPanelApi(route, rawData, {
+          stateDir,
+          defaultConvId: app.config?.conversationId || ""
+        });
+        if (
+          route === "/api/settings" &&
+          out.status === 200 &&
+          rawData?.autoUpdateInstall === true &&
+          typeof onAutoInstallEnabled === "function"
+        ) {
+          void Promise.resolve(onAutoInstallEnabled()).catch(() => {});
+        }
+        return wrapJson(out);
+      },
       "POST"
     );
   }
@@ -324,10 +349,17 @@ export function registerSidecarRoutes(
     async (rawData) =>
       wrapJson(
         await handlePluginUpdate(rawData, {
+          stateDir,
           updater: pluginUpdater,
           onUpdated
         })
       ),
+    "POST"
+  );
+
+  app.api(
+    AUTO_UPDATE_ACK_ROUTE,
+    (rawData) => wrapJson(handleAutoUpdateAck(stateDir, rawData)),
     "POST"
   );
 }
@@ -381,26 +413,34 @@ async function start() {
     }, 2500);
     reloadTimer.unref?.();
 
+    const scheduleSidecarRestart = () => {
+      const restartTimer = setTimeout(() => {
+        process.exit(0);
+      }, 450);
+      restartTimer.unref?.();
+    };
+    const triggerBackgroundAutoUpdate = () =>
+      runAutoUpdateCycle({ stateDir, onUpdated: scheduleSidecarRestart }).catch(() => {});
+
     const app = new SidecarApp();
     registerSidecarRoutes(app, {
       stateDir,
       csrfToken,
       SidecarResponse,
-      onUpdated: () => {
-        const restartTimer = setTimeout(() => {
-          process.exit(0);
-        }, 450);
-        restartTimer.unref?.();
-      }
+      onUpdated: scheduleSidecarRestart,
+      onAutoInstallEnabled: triggerBackgroundAutoUpdate
     });
     await app.run();
 
-    if (isAutoUpdateCheckEnabled(stateDir)) {
-      const startupCheckTimer = setTimeout(() => {
-        void getDefaultVersionChecker()("auto").catch(() => {});
-      }, 1500);
-      startupCheckTimer.unref?.();
-    }
+    const startupCheckTimer = setTimeout(() => {
+      void triggerBackgroundAutoUpdate();
+    }, 1500);
+    startupCheckTimer.unref?.();
+
+    const periodicAutoCheckTimer = setInterval(() => {
+      void triggerBackgroundAutoUpdate();
+    }, 6 * 60 * 60_000);
+    periodicAutoCheckTimer.unref?.();
     return;
   }
 

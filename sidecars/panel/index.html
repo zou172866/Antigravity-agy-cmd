@@ -228,7 +228,8 @@
       background: var(--accent-soft);
     }
     .update-banner[data-state="current"],
-    .update-banner[data-state="updated"] {
+    .update-banner[data-state="updated"],
+    .update-banner[data-state="auto-updated"] {
       border-color: var(--ok-border);
       background: var(--ok-soft);
     }
@@ -747,7 +748,7 @@
           <span id="version-check-dot" class="ver-dot hidden" aria-hidden="true" hidden></span>
           <span id="version-check-label">检查更新</span>
         </button>
-        <span class="ver-pill">v2.5.0</span>
+        <span class="ver-pill">v2.5.1</span>
       </div>
     </div>
 
@@ -996,6 +997,13 @@
         </div>
         <input id="chk-auto-update-check" type="checkbox" role="switch" checked aria-labelledby="auto-update-check-label" aria-describedby="auto-update-check-help">
       </label>
+      <label class="toggle-row" id="row-auto-update-install">
+        <div class="row-text">
+          <b id="auto-update-install-label">发现新版本自动静默更新</b>
+          <small id="auto-update-install-help">默认关闭。开启后仅对同主版本且通过 SHA-256 校验的 Release 自动升级，单版本失败自动熔断，跨大版本仍需手动确认。</small>
+        </div>
+        <input id="chk-auto-update-install" type="checkbox" role="switch" aria-labelledby="auto-update-install-label" aria-describedby="auto-update-install-help">
+      </label>
       <div class="hint-foot">
         💡 单轮临时口令：在任意提问里顺带说 <code>这次最多重试 5 次</code>、<code>这次一直重试</code>、<code>这次不用重试</code> 或 <code>这次跳过测试</code> 即可仅对当轮生效。
       </div>
@@ -1034,6 +1042,8 @@
         reloadPending: false,
         manual: false,
         dismissedVersion: "",
+        dismissedAutoNoticeVersion: "",
+        autoUpdatedNotice: null,
         available: null,
         lastCheck: null,
         lastUpdate: null
@@ -1109,6 +1119,7 @@
       const chkFreeFb = $("chk-free-fb");
       const chkPlanFb = $("chk-plan-fb");
       const chkAutoUpdateCheck = $("chk-auto-update-check");
+      const chkAutoUpdateInstall = $("chk-auto-update-install");
       const chkDeliveryGate = $("chk-delivery-gate");
       const deliveryGateBox = $("delivery-gate-box");
       const inpDeliveryCmd = $("inp-delivery-cmd");
@@ -1274,6 +1285,13 @@
           !versionCheckState.manual &&
           versionCheckState.lastUpdate?.status !== "error";
 
+        const autoNotice =
+          versionCheckState.autoUpdatedNotice &&
+          versionCheckState.autoUpdatedNotice.version &&
+          versionCheckState.dismissedAutoNoticeVersion !== versionCheckState.autoUpdatedNotice.version
+            ? versionCheckState.autoUpdatedNotice
+            : null;
+
         let state = "";
         if (versionCheckState.updating) state = "updating";
         else if (versionCheckState.updated) state = "updated";
@@ -1282,6 +1300,7 @@
         else if (versionCheckState.checking && versionCheckState.manual) state = "checking";
         else if (versionCheckState.manual && versionCheckState.lastCheck?.status === "error") state = "check-error";
         else if (versionCheckState.manual && versionCheckState.lastCheck?.status === "current") state = "current";
+        else if (autoNotice) state = "auto-updated";
 
         if (versionCheckBtn) {
           versionCheckBtn.disabled = versionCheckState.checking || versionCheckState.updating;
@@ -1329,6 +1348,11 @@
           detailText = versionCheckState.reloadPending
             ? "正在重载面板… 重启或重载 Antigravity 后 Hooks 与规则将生效。"
             : "插件文件已更新完成，请重新加载窗口或重启 Antigravity 生效。";
+        } else if (state === "auto-updated") {
+          const prevPart = autoNotice.previousVersion ? `（原 v${autoNotice.previousVersion}）` : "";
+          titleText = `已自动更新至 v${autoNotice.version}${prevPart}`;
+          detailText = "面板已自动重载；重载窗口或重启 Antigravity 后规则与配置将完整生效。";
+          releaseHref = isSafeReleaseUrl(autoNotice.releaseUrl) ? autoNotice.releaseUrl : GITHUB_RELEASES_URL;
         } else if (state === "check-error") {
           titleText = "检查更新失败。";
           detailText = formatVersionError(versionCheckState.lastCheck, false);
@@ -1366,6 +1390,7 @@
         }
         if (versionDismissBtn) {
           versionDismissBtn.disabled = versionCheckState.updating;
+          versionDismissBtn.textContent = state === "auto-updated" ? "知道了" : "关闭";
           setElementHidden(versionDismissBtn, versionCheckState.updating);
         }
       }
@@ -1505,8 +1530,14 @@
 
       function dismissVersionBanner() {
         if (versionCheckState.updating) return;
+        const activeNoticeVer = versionCheckState.autoUpdatedNotice?.version || "";
         if (versionCheckState.available?.latestVersion) {
           versionCheckState.dismissedVersion = versionCheckState.available.latestVersion;
+        }
+        if (activeNoticeVer) {
+          versionCheckState.dismissedAutoNoticeVersion = activeNoticeVer;
+          versionCheckState.autoUpdatedNotice = null;
+          void callVersionApi("/api/auto-update-ack", { dismissNotice: true }).catch(() => {});
         }
         versionCheckState.manual = false;
         versionCheckState.updated = false;
@@ -1697,6 +1728,16 @@
         chkFreeFb.checked = Boolean(s.freeFallbackEnabled);
         chkPlanFb.checked = Boolean(s.planFallbackEnabled);
         if (chkAutoUpdateCheck) chkAutoUpdateCheck.checked = s.autoUpdateCheck !== false;
+        if (chkAutoUpdateInstall) chkAutoUpdateInstall.checked = s.autoUpdateInstall === true;
+        if (data.autoUpdateNotice && data.autoUpdateNotice.version) {
+          if (versionCheckState.dismissedAutoNoticeVersion !== data.autoUpdateNotice.version) {
+            versionCheckState.autoUpdatedNotice = data.autoUpdateNotice;
+            renderVersionUpdateUi();
+          }
+        } else if (versionCheckState.autoUpdatedNotice) {
+          versionCheckState.autoUpdatedNotice = null;
+          renderVersionUpdateUi();
+        }
 
         const gateOn = s.deliveryTestGateEnabled === true;
         if (chkDeliveryGate) chkDeliveryGate.checked = gateOn;
@@ -1801,6 +1842,16 @@
           return savePatch(
             { autoUpdateCheck: on },
             on ? "已开启打开面板自动检查更新" : "已关闭自动检查更新（仍可手动检查）"
+          );
+        });
+      }
+
+      if (chkAutoUpdateInstall) {
+        chkAutoUpdateInstall.addEventListener("change", () => {
+          const on = chkAutoUpdateInstall.checked;
+          return savePatch(
+            { autoUpdateInstall: on },
+            on ? "已开启自动静默更新（仅同主版本 + SHA-256）" : "已关闭自动静默更新（改回手动点击更新）"
           );
         });
       }
