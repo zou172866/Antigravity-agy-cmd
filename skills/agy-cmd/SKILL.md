@@ -3,7 +3,7 @@ name: agy-cmd
 description: Antigravity 桌面端/IDE 高阶能力自动路由与内置斜杠指令参谋。用于开关路由、调自动重试/交付门禁/会员 Boost，或查询对比 /grill-me、/plan、/goal、/boost、/swarm、/run-workflow 等内置指令（禁混 CLI 专属命令）。
 ---
 
-# agy-cmd：高阶能力自动路由与指令参谋（v2.7.2）
+# agy-cmd：高阶能力自动路由与指令参谋（v2.7.3）
 
 四项能力：**常驻精简规则**（`rules/AGENTS.md`）、**零稳态开销钩子**（`hooks.json`：`SessionStart` / `PreToolUse` / `PostToolUse` / `PreInvocation` / `Stop`）、**右侧 Sidecar 面板**（`sidecar://agy-cmd/panel/`）与**按需指令参谋**。
 
@@ -48,13 +48,13 @@ python3 scripts/setup_auto_router.py --remove
 ### 模式 B：日常开发自动调度
 
 **重型路由（Swarm / Workflow）准入三步**：
-1. 仅候选任务判断；用户点名运行某项按单次执行，已有原生命令直接跟随。
+1. 仅候选任务判断；用户点名运行某项按单次执行（查用法不算点名运行），已有原生命令直接跟随。
 2. 确认当前为 Antigravity App 且公开工具/命令含目标能力（如 `run_workflow`）；IDE、未知宿主或未开放时留主会话（勿以磁盘存在内置技能作证）。
 3. 主动路由取 `settings.planTier`；未知时仅调一次 `python3 scripts/setup_auto_router.py --status --json`（只读）。仅 `paid` 进主动重型路由，`free`/未知走顺序分批且不亮重型徽标。
 
 | 任务特征 | 调度徽标 / 轨道 | 执行动作 |
 | --- | --- | --- |
-| 需求模糊、边界未定 | `[agy-cmd → /grill-me 追问]` | `ask_question` 单题追问，推荐项置顶 `(Recommended)` |
+| 需求模糊、边界未定 | `[agy-cmd → /grill-me 追问]` | `ask_question` 只问阻碍下一步的问题，独立问题可合问，推荐项置顶 `(Recommended)` |
 | 改 ≥3 文件、改公共接口或高风险 | `[agy-cmd → /plan 审批]` | 只读定范围（`apply_edits` 按文件计），交 `RequestFeedback: true` 计划；只读拒写时正文交方案等待。多模块获批计划在 App 可接 `/swarm execute our plan`；开「计划获批自动 Boost」按钩子单次派工 |
 | 单项独立旁支调查 | Subagents | 主线程有余量时 `invoke_subagent` 派 1 个可用角色，写清范围与证据，主线程核对 |
 | ≥5 同质对象同规则检查 | 默认顺序分批；准入后 `[agy-cmd → /run-workflow]` | 纯匹配用本地命令；进 Workflow 先读 `run-workflow`，Prompt 含目标/规则/验收与 JSON Schema 并逐项捕异常。编码优先选可用的 `dart-coder`，否则选 `self`；高精度用 `model="inherit"`（接口靠省略继承则省略） |

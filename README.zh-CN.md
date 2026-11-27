@@ -81,7 +81,7 @@ python ~/.agents/skills/agy-cmd/scripts/setup_auto_router.py --install --standal
 ### 1. 小事直出，大事先审
 
 - **1～2 文件小改、问代码、本地查找**：直接给答案，零弹窗、零徽标。
-- **需求没说清**：先出单题选择题对齐方向，少做无用功。
+- **需求没说清**：先出精简选择题对齐关键边界（独立问题可合并追问），少做无用功。
 - **3 个及以上文件或高风险改动**：先写方案等你批。只读模式建不了方案文件，正文照样写出方案等你拍板，绝不偷偷绕过。多模块获批计划在 App 可直接接 `/swarm execute our plan`；已开启获批自动 Boost 的会员会自动单次派工，同时保住后台唤醒后的 `Stop` 续跑状态。
 - **单点旁支与批量作业**：查一条复杂调用链或验一个页面，可派单名子智能体分担。5 个以上同类对象按默认顺序分批；面板设为付费档且 App 开放能力时，可选用 `/run-workflow` 汇总结构化结果。
 - **独立车道与长程工程**：互不撞文件的多模块写码、多视角评审或 Best-of-N 择优，在 App 可走 `/swarm`（内置 6 套模板、Gemini 4 三层选模与启动前自检）。紧耦合改动留在主会话 / Orchestrator，单点死磕走 `/boost`，跨天里程碑工程走 `/teamwork`。活跃 `/swarm` 会话及 Worker（含 `fork`）由钩子自动放行，不打断留言板与前缀缓存。[指令速查矩阵](skills/agy-cmd/references/desktop-commands-matrix.md) · [多智能体与 Swarm 模板](skills/agy-cmd/references/multi-agent-playbooks.md)

@@ -39,20 +39,19 @@ description: "Auto-route Antigravity native tools and tier-safe lifecycle guards
 
 RULE_BODY = """# Antigravity 自动路由 (agy-cmd)
 
-仅桌面端 App/IDE；工作区 `AGENTS.md` 优先。**子智能体、Swarm 成员或 Workflow Worker 跳过本文件路由，按任务书/留言板执行。**
+仅桌面 App/IDE，工作区 `AGENTS.md` 优先。子智能体、Swarm 成员、Workflow Worker 跳过路由，按任务书或留言板执行。技能缺失时依本规则。
 
-- **轻量直出**：解释/查找或 1～2 文件明确低风险修改 → 直接做，**不加徽标、不建计划、不推指令**。
-- **徽标**：仅命中下方调度/兜底时首行输出 1 个徽标（如 `[agy-cmd → /plan 审批]`、`[agy-cmd → 自动换视角排查]`）。
-- **原生调度**：
-  1. 需求/边界未定 → `[agy-cmd → /grill-me 追问]`，调 `ask_question` 单题追问，推荐项置顶 `(Recommended)`。
-  2. 写项目文件前判范围（不明先只读扫描；`apply_edits` 按文件计）：≥3 文件、改公共接口或高风险 → `[agy-cmd → /plan 审批]`，提 `RequestFeedback: true` 计划获批再写；**只读 Plan Mode 拒写方案时正文给方案并等待，严禁调 `exit_plan_mode` 绕过**。
-  3. 批处理/多模块默认顺序分批（纯正则用本地命令）；主动重型路由须同时确认 `planTier=paid`、Antigravity App 且宿主开放该能力（见 `agy-cmd` 技能），免费、未知或 IDE 走默认不亮徽标；用户点名运行 App 已开放项可单次执行。
-  4. 准入后：≥5 同质独立项 → `[agy-cmd → /run-workflow]`（读 `run-workflow`）；无冲突独立 Lane → 先 Pre-flight（接口/所有权/验证）再给 `[agy-cmd → 建议 /swarm]` 与可复制提示词（多模块获批计划可接 `/swarm execute our plan`），未点名不私调 `swarm`。**前后强依赖或紧耦合改动禁止强行并行**（留主会话/Orchestrator 或 `/boost`）。
-  5. 独立旁支且主会话有余量 → 派 1 个 `research` 并核对；动态网页 → `[agy-cmd → /browser]`；App 交互图表 → `[agy-cmd → /generative_ui]`（读 `generative_ui`）。
-- **套餐兜底与自动续跑**（禁推 CLI 专属 `/undo`、`/branch`、`/effort`；已用对应 `/` 不重复提示）：
-  1. **疑难/卡壳**：收 `[agy-cmd → 自动 Boost]` 派 `DeepInvestigator`（只读/待审）或 `DeepCoder`（已授权）；收 `[agy-cmd → 自动换视角排查]` 派只读 `dart-reviewer`/`research`；主会话验证，失败接手。
-  2. **Stop 监工**：改码/修错后实跑现成测试/构建供 `Stop` 核验续跑；仅收钩子提示时输出 `[agy-cmd → 自动续跑已启用]` 或 `[agy-cmd → 建议 /goal]`。
-  3. **设置/选型**：调参或查指令对比读 `agy-cmd` `SKILL.md`；仅引导或明确开面板/调参时附 `[agy-cmd 自动路由](sidecar://agy-cmd/panel/)`，纯查指令勿附。
+- 仅触发带徽标的动作时首行给 1 个对应徽标。勿复推已用命令，禁推 CLI `/undo`、`/branch`、`/effort`。
+- 需求或边界未定 → `[agy-cmd → /grill-me 追问]`。用 `ask_question` 只问阻碍下一步的问题，独立问题可合问，推荐项置顶 `(Recommended)`。
+- 写项目文件前定范围，不明先只读扫描，`apply_edits` 按文件计。改 ≥3 个文件、改公共接口或高风险 → `[agy-cmd → /plan 审批]`，交 `RequestFeedback: true` 计划，获批再写。只读 Plan Mode 拒写计划文件时，正文交方案等审批，严禁用 `exit_plan_mode` 绕过。
+- 批处理、多模块默认顺序分批，纯正则直接在本地完成。主动推荐或调用重型命令须同时满足 `planTier=paid`、Antigravity App、宿主开放该项。免费、未知或 IDE 走默认，不亮重型徽标。
+- 准入后，≥5 个同质独立项 → `[agy-cmd → /run-workflow]`，先读 `run-workflow`。独立分工先核对接口、文件归属、验证方式，无冲突再给 `[agy-cmd → 建议 /swarm]` 和可复制提示词。未点名运行不调 `swarm`。前后强依赖或紧耦合改动禁止强行并行，留主会话。
+- App 内点名运行可单次执行对当前账号开放的该项。`/boost`、`/teamwork` 仅限付费。查用法不算点名运行。
+- 主会话有余量才派 1 个 `research` 查独立旁支。动态网页 → `[agy-cmd → /browser]`。App 交互图表 → `[agy-cmd → /generative_ui]`，先读 `generative_ui`。
+- 卡壳按钩子指定角色派工，无钩子由主会话排查。待审或只读时只调查。`[agy-cmd → 自动换视角排查]` 始终只读。所有派工由主会话验收，失败接手。
+- 改码或修错后实跑现成测试或构建供 `Stop` 核验。续跑和建议 `/goal` 仅用当轮钩子指定的徽标。
+- 重型准入、调参或查指令读 `agy-cmd` 技能。纯查或对比指令勿输出面板地址。仅安装引导、明确要求开面板或调参时附 Markdown 链接，文字为 `agy-cmd 自动路由`，地址为 `sidecar://agy-cmd/panel/`。
+- 其余解释、查找或明确的 1～2 文件低风险修改直接做，不建计划、不推命令。
 """
 
 RULE_CONTENT = RULE_FRONTMATTER + RULE_BODY
