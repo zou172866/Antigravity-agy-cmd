@@ -2791,3 +2791,232 @@ test("P1-6: requestedProjectCheck recognizes static checks & && chains, and no_p
   assert.equal(c2.decision, "allow");
   assert.equal(c2.reasonCode, "no_progress_guard");
 });
+
+test("zero-edit env probes (run_checks & read-only run_command) and confirm-before-edit prompts never false-trigger Stop auto-retry", async (t) => {
+  const dir = makeTmpDir("agy-cmd-env-probe-");
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const env = makeEnv(dir);
+  updateSettings(dir, { planTier: "paid", boostEnabled: true, autoRetryMode: "count", autoRetryMax: 3, autoRetryScope: "smart" });
+
+  // 1. Exact real-world repro: handoff prompt ("改动代码前请先复述计划、确认范围... 再改代码")
+  //    + run_checks([python git snapshot PASS, git rev-parse FAIL exit 128]) reconciled via transcript.jsonl
+  const handoffPrompt =
+    "请接手 e:/work/agy-cmd 后续任务；改动代码前请先用 2–3 句复述计划、确认范围。\n先核对工作区，再改代码。";
+  const tx1 = writeTranscript(dir, "handoff.jsonl", [
+    { step_index: 0, type: "USER_INPUT", content: `<USER_REQUEST>\n${handoffPrompt}\n</USER_REQUEST>` }
+  ]);
+  await runPreInvocation(
+    { conversationId: "probe-handoff", transcriptPath: tx1, invocationNum: 0, initialNumSteps: 1, lastUserInput: handoffPrompt },
+    env,
+    30000
+  );
+  await runPostToolUse(
+    {
+      conversationId: "probe-handoff",
+      transcriptPath: tx1,
+      stepIdx: 4,
+      toolCall: {
+        name: "mcp_agy-dart_fast_run_checks",
+        args: {
+          commands: [
+            { name: "agy-cmd-git-snapshot", command: 'python -c "print(123)"' },
+            { name: "work-root-git-check", command: "git rev-parse --is-inside-work-tree" }
+          ]
+        }
+      }
+    },
+    env,
+    30010
+  );
+  appendTranscript(tx1, [
+    {
+      step_index: 4,
+      type: "GENERIC",
+      status: "DONE",
+      content:
+        "Checks: 1/2 passed, 1 failed (wall: 110ms)\n\n" +
+        "## [PASS] agy-cmd-git-snapshot (110ms)\n123\n\n" +
+        "## [FAIL (exit 128)] work-root-git-check (28ms)\nfatal: not a git repository"
+    }
+  ]);
+  assert.deepEqual(
+    await runStop(
+      { conversationId: "probe-handoff", transcriptPath: tx1, terminationReason: "model_stop", executionNum: 1, fullyIdle: true, lastUserInput: handoffPrompt },
+      env,
+      30020
+    ),
+    { decision: "allow" }
+  );
+
+  // 2. Non-verify run_checks failing on zero-edit turn (even with explicit fix prompt) must NOT set isVerify=true or trigger smart Stop
+  const nonVerifyEvs = classifyToolEvents({
+    toolCall: {
+      name: "mcp_agy-dart_fast_run_checks",
+      args: { commands: [{ name: "env-check", command: 'python -c "import sys; sys.exit(1)"' }] }
+    },
+    toolResponse: "Checks: 0/1 passed, 1 failed (wall: 20ms)\n\n## [FAIL (exit 1)] env-check (20ms)"
+  });
+  assert.equal(nonVerifyEvs.length, 1);
+  assert.equal(nonVerifyEvs[0].isVerify, false);
+  assert.equal(nonVerifyEvs[0].failed, true);
+  assert.equal(
+    evaluateStop(
+      { terminationReason: "model_stop", executionNum: 1, fullyIdle: true, lastUserInput: "帮我修一下登录 bug" },
+      nonVerifyEvs,
+      null,
+      { settings: { autoRetryMode: "count", autoRetryMax: 3, autoRetryScope: "smart" } }
+    ).decision,
+    "allow"
+  );
+
+  // 3. All-read-only run_checks marks isReadOnlyCmd=true (ignored on failure AND by no_progress_guard)
+  const roBatchEvs = classifyToolEvents({
+    toolCall: {
+      name: "mcp_agy-dart_fast_run_checks",
+      args: {
+        commands: [
+          { name: "st", command: "git status" },
+          { name: "root", command: "git rev-parse --is-inside-work-tree" }
+        ]
+      }
+    },
+    toolResponse: "Checks: 1/2 passed, 1 failed (wall: 25ms)\n\n- [PASS] st\n- [FAIL] root"
+  });
+  assert.equal(roBatchEvs.length, 1);
+  assert.equal(roBatchEvs[0].isVerify, false);
+  assert.equal(roBatchEvs[0].isReadOnlyCmd, true);
+  assert.equal(
+    evaluateStop(
+      { terminationReason: "model_stop", executionNum: 1, fullyIdle: true, lastUserInput: "修好测试" },
+      [
+        { ts: 1000, kind: "edit", files: ["src/a.js"], applied: true },
+        { ts: 1010, kind: "cmd", cmd: "npm test", failed: false, isVerify: true, terminal: true },
+        { ...roBatchEvs[0], ts: 1020 }
+      ],
+      null,
+      { settings: { autoRetryMode: "count", autoRetryMax: 3, autoRetryScope: "smart" } }
+    ).decision,
+    "allow"
+  );
+
+  // 4. Mixed run_checks: [npm test PASS (even printing `- [FAIL] fake` in stdout), git rev-parse FAIL] -> allow;
+  //    [npm test FAIL, git rev-parse PASS] -> continue!
+  const mixedRoFail = classifyToolEvents({
+    toolCall: {
+      name: "mcp_agy-dart_fast_run_checks",
+      args: {
+        commands: [
+          { name: "unit", command: "npm test" },
+          { name: "root-git", command: "git rev-parse --is-inside-work-tree" }
+        ]
+      }
+    },
+    toolResponse:
+      "Checks: 1/2 passed, 1 failed (wall: 50ms)\n\n" +
+      "## [PASS] unit (30ms)\n- [FAIL] fake stdout line\n\n" +
+      "## [FAIL (exit 128)] root-git (20ms)\nfatal: not a git repository"
+  });
+  assert.equal(mixedRoFail[0].failed, false);
+
+  const mixedVerifyFail = classifyToolEvents({
+    toolCall: {
+      name: "mcp_agy-dart_fast_run_checks",
+      args: {
+        commands: [
+          { name: "unit", command: "npm test" },
+          { name: "root-git", command: "git rev-parse --is-inside-work-tree" }
+        ]
+      }
+    },
+    toolResponse:
+      "Checks: 1/2 passed, 1 failed (wall: 50ms)\n\n" +
+      "## [FAIL (exit 1)] unit (30ms)\nAssertionError\n\n" +
+      "## [PASS] root-git (20ms)\ntrue"
+  });
+  assert.equal(mixedVerifyFail[0].failed, true);
+  assert.equal(mixedVerifyFail[0].isVerify, true);
+  assert.equal(
+    evaluateStop(
+      { terminationReason: "model_stop", executionNum: 1, fullyIdle: true, lastUserInput: "修好测试" },
+      mixedVerifyFail,
+      null,
+      { settings: { autoRetryMode: "count", autoRetryMax: 3, autoRetryScope: "smart" } }
+    ).decision,
+    "continue"
+  );
+
+  // 5. Mixed run_checks with compact mode: [npm test PASS, docker info FAIL] -> failed=true, isVerify=false (zero-edit smart allows)
+  const mixedNonRoNonVerifyFail = classifyToolEvents({
+    toolCall: {
+      name: "mcp_agy-dart_fast_run_checks",
+      args: {
+        commands: [
+          { name: "unit", command: "npm test" },
+          { name: "docker", command: "docker info" }
+        ]
+      }
+    },
+    toolResponse: "Checks: 1/2 passed, 1 failed (wall: 40ms)\n\n- [PASS] unit\n- [FAIL] docker"
+  });
+  assert.equal(mixedNonRoNonVerifyFail[0].failed, true);
+  assert.equal(mixedNonRoNonVerifyFail[0].isVerify, false);
+
+  // 6. Standalone read-only run_command failures (git rev-parse / which) never trigger Stop or edit<->fail oscillations
+  const roCmdEvs = classifyToolEvents({
+    toolCall: { name: "run_command", args: { CommandLine: "git rev-parse --is-inside-work-tree" } },
+    toolResponse: "Command exited with code 128.\nfatal: not a git repository"
+  });
+  assert.equal(roCmdEvs[0].isReadOnlyCmd, true);
+  const whichEvs = classifyToolEvents({
+    toolCall: { name: "run_command", args: { CommandLine: "which nonexistent_tool" } },
+    toolResponse: "Command exited with code 1."
+  });
+  assert.equal(whichEvs[0].isReadOnlyCmd, true);
+  const postEditGreenThenProbe = evaluateStop(
+    { terminationReason: "model_stop", executionNum: 1, fullyIdle: true, lastUserInput: "修好逻辑" },
+    [
+      { ts: 1000, kind: "edit", files: ["src/a.js"], applied: true },
+      { ts: 1010, kind: "cmd", cmd: "npm test", failed: false, isVerify: true, terminal: true },
+      { ...roCmdEvs[0], ts: 1020 },
+      { ...whichEvs[0], ts: 1030 }
+    ],
+    null,
+    { settings: { autoRetryMode: "count", autoRetryMax: 3, autoRetryScope: "smart" } }
+  );
+  assert.equal(postEditGreenThenProbe.decision, "allow");
+  assert.equal(postEditGreenThenProbe.metrics.editFailOscillations, 0);
+
+  // 7. Confirm-before-edit prompt allows stopping on zero-edit failing verify, while "先排查原因再修复" and post-edit turns still retry
+  const verifyFailOnly = [{ ts: 1000, kind: "cmd", cmd: "npm test", failed: true, isVerify: true, terminal: true }];
+  for (const deferredPrompt of [
+    "改动代码前请先用 2–3 句复述计划、确认范围，确认后再改代码",
+    "Please confirm scope before editing any files"
+  ]) {
+    const res = evaluateStop(
+      { terminationReason: "model_stop", executionNum: 1, fullyIdle: true, lastUserInput: deferredPrompt },
+      verifyFailOnly,
+      null,
+      { settings: { autoRetryMode: "count", autoRetryMax: 3, autoRetryScope: "smart" } }
+    );
+    assert.equal(res.decision, "allow", deferredPrompt);
+  }
+  assert.equal(
+    evaluateStop(
+      { terminationReason: "model_stop", executionNum: 1, fullyIdle: true, lastUserInput: "先排查原因再修复" },
+      verifyFailOnly,
+      null,
+      { settings: { autoRetryMode: "count", autoRetryMax: 3, autoRetryScope: "smart" } }
+    ).decision,
+    "continue"
+  );
+  // Once the agent has actually edited code, Stop still enforces green tests even if original prompt had a confirm clause
+  assert.equal(
+    evaluateStop(
+      { terminationReason: "model_stop", executionNum: 1, fullyIdle: true, lastUserInput: "改动代码前先确认范围，再改代码" },
+      [{ ts: 990, kind: "edit", files: ["src/a.js"], applied: true }, ...verifyFailOnly],
+      null,
+      { settings: { autoRetryMode: "count", autoRetryMax: 3, autoRetryScope: "smart" } }
+    ).decision,
+    "continue"
+  );
+});

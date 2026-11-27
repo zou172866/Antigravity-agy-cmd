@@ -57,7 +57,7 @@ const NON_FAILURE_EXIT1_CMD_RE =
   /^\s*(?:rg|ripgrep|grep|egrep|fgrep|findstr|select-string|git\s+diff\b[^\n]*--quiet|git\s+grep\b|diff\b|fc\b|test\b|\[)\b/i;
 
 const READ_ONLY_INSPECT_CMD_RE =
-  /^\s*(?:git\s+(?:status|diff|log|show|branch|rev-parse|ls-files|grep)\b|ls\b|dir\b|pwd\b|echo\b|rg\b|ripgrep\b|grep\b|egrep\b|fgrep\b|findstr\b|select-string\b|which\b|where(?:\.exe)?\b|Get-ChildItem\b|Get-Location\b|Test-Path\b|cat\b|head\b|tail\b|wc\b|stat\b|file\b|node\s+(?:-v|--version)\b|python3?\s+--version\b|npm\s+--version\b)/i;
+  /^\s*(?:git\s+(?:(?:status|diff|log|show|branch|rev-parse|ls-files|grep)\b|remote(?:\s+-v)?$|tag\s+(?:-l|--list|--points-at)\b|config\s+(?:--get|--list|-l)\b)|ls\b|dir\b|pwd\b|echo\b|rg\b|ripgrep\b|grep\b|egrep\b|fgrep\b|findstr\b|select-string\b|which\b|where(?:\.exe)?\b|command\s+-v\b|Get-ChildItem\b|Get-Location\b|Test-Path\b|cat\b|head\b|tail\b|wc\b|stat\b|file\b|(?:node|python3?|py|npm|pnpm|yarn|bun|git|go|cargo|rustc|java|dotnet|gh|agy|uv|docker)(?:\.exe|\.cmd)?\s+(?:-v|-V|--version)\b)/i;
 
 const SHELL_CHAIN_RE = /(?:&&|\|\||[;|`])/;
 
@@ -93,6 +93,9 @@ const UNATTENDED_GOAL_RE =
 
 const NEGATED_EDIT_INTENT_RE =
   /(?:(?:先)?(?:别|不要|不用|不必|勿|禁止)(?:修改|改动|改代码|动代码|写代码|改(?!动|代码)|动(?!代码)|写(?!代码)|修(?!改))(?!\s*(?:别的|其他|其它|无关|其余))|只(?:看|查|分析|解释|排查|定位|跑|运行|看看)|仅(?:分析|排查|查看|解释|定位)|\b(?:do\s+not|don'?t)\s+(?:edit|modify|change|fix)(?!\s+(?:other|unrelated|any\s+other))|\bonly\s+(?:analyze|explain|check|inspect|diagnose|run)\b)/i;
+
+const DEFERRED_EDIT_INTENT_RE =
+  /(?:(?:改动|修改|编辑|写)(?:代码|文件)?之?前(?:请)?(?:先|务必先)?[^\n。；！？.;!?]{0,24}(?:复述|确认|对齐|告知|说明|汇报|出方案|给方案|提方案|讨论|沟通|审批|批准)|先[^\n。；！？.;!?]{0,24}(?:复述(?:计划|方案)|确认(?:范围|方案|计划)|对齐(?:范围|方案|需求)|出(?:方案|计划)|等(?:我|用户)(?:确认|批准|同意|点头))[^\n。；！？.;!?]{0,16}(?:再|后)(?:改|修|写|动|执行|实施)|(?:确认|批准|同意|点头|对齐)(?:范围|方案|计划)?之?后(?:再|才)(?:改|修改|改动|写|动)(?:代码|文件)?|\b(?:before\s+(?:editing|modifying|changing|writing)(?:\s+(?:any\s+)?(?:code|files?))?[^\n.!?;]{0,40}\b(?:confirm|restate|align|review|ask|approve|plan)\b|(?:confirm|restate|align|review|approve)\b[^\n.!?;]{0,40}\bbefore\s+(?:editing|modifying|changing|writing)\b))/i;
 
 const DIAGNOSTIC_OR_CHECK_INQUIRY_RE =
   /(?:为什么|为何|怎么回事|什么原因|啥原因|什么问题|哪里(?:有|出了)?(?:问题|错|bug)|哪儿(?:有|出了)?(?:问题|错|bug)|问题出在哪|错在哪|怎么会|什么意思|(?:帮我|先|只)?(?:分析|解释|诊断|评估|定位|查一下|看看)(?:一下)?|(?:跑|运行|执行|测)一下|\b(?:why\s+(?:is|does|did|are|do)|what(?:'s|\s+is)\s+(?:wrong|causing|the\s+(?:cause|error|issue|reason))|how\s+come|explain|analyze|diagnose|investigate)\b)/i;
@@ -293,6 +296,43 @@ function extractCommandString(bareTool, args = {}) {
   return "";
 }
 
+function extractRunChecksItems(args = {}, deliveryTestCommand = "") {
+  const parsedCmds = Array.isArray(args.commands) ? args.commands : parseMaybeJson(args.commands);
+  const cmds = Array.isArray(parsedCmds) ? parsedCmds : [];
+  const out = [];
+  for (const c of cmds.slice(0, 12)) {
+    const rawCmd = unwrapCliFilterCommand(typeof c === "string" ? c : String(c?.command || "").trim());
+    const rawName = typeof c === "object" && c ? nonEmptyString(c.name) : "";
+    const label = sanitizeSnippet(rawName || rawCmd, 64);
+    if (!label && !rawCmd) continue;
+    const matchesCustom = Boolean(
+      rawCmd && deliveryTestCommand && matchesCustomCheckCommand(rawCmd, deliveryTestCommand)
+    );
+    const isVerify = Boolean(rawCmd && (VERIFY_CMD_RE.test(rawCmd) || matchesCustom));
+    const isReadOnly = Boolean(rawCmd && isReadOnlyInspectCommand(rawCmd));
+    out.push({ label, isVerify, isReadOnly });
+  }
+  return out;
+}
+
+function normalizeCheckLabel(label) {
+  return sanitizeSnippet(String(label || "").replace(/\s+\(\d+(?:\.\d+)?m?s\)\s*$/i, "").trim(), 64).toLowerCase();
+}
+
+function parseRunChecksFailedLabels(body) {
+  if (typeof body !== "string" || !body) return [];
+  const hasFullSections = /^## \[(?:PASS|FAIL|ERROR|TIMEOUT)[^\]]*\]\s+/im.test(body);
+  const re = hasFullSections
+    ? /^## \[(?:FAIL|ERROR|TIMEOUT)[^\]]*\]\s+(.+?)\s*$/gim
+    : /^-\s*\[(?:FAIL|ERROR|TIMEOUT)[^\]]*\]\s+(.+?)\s*$/gim;
+  const labels = [];
+  for (const m of body.matchAll(re)) {
+    const clean = normalizeCheckLabel(m[1]);
+    if (clean) labels.push(clean);
+  }
+  return labels;
+}
+
 function extractErrorSignature(errorText, bodyText) {
   const src = errorText || bodyText;
   if (!src) return "";
@@ -304,7 +344,7 @@ function extractErrorSignature(errorText, bodyText) {
   return sanitizeSnippet(prioritized, 64);
 }
 
-function classifyCommandOutcome(bareTool, isBenignCmd, errorText, rawResponseText, explicitError) {
+function classifyCommandOutcome(bareTool, isBenignCmd, errorText, rawResponseText, explicitError, checkMeta = null) {
   const body = stripTranscriptStepHeaders(rawResponseText);
 
   if (BG_RUNNING_RE.test(body) && !explicitError) {
@@ -313,16 +353,35 @@ function classifyCommandOutcome(bareTool, isBenignCmd, errorText, rawResponseTex
 
   let failed = false;
   let terminal = false;
+  let failedIsVerify;
   if (bareTool === "run_checks") {
+    let failedCnt = null;
     const m = body.match(/^Checks:\s*(\d+)\/(\d+)\s+passed(?:,\s*(\d+)\s+failed)?/m);
     if (m) {
       const passedCnt = Number(m[1]);
       const totalCnt = Number(m[2]);
-      const failedCnt = m[3] ? Number(m[3]) : Math.max(0, totalCnt - passedCnt);
+      failedCnt = m[3] ? Number(m[3]) : Math.max(0, totalCnt - passedCnt);
       failed = failedCnt > 0 || totalCnt === 0;
       terminal = m.index === 0 && totalCnt > 0 && (failedCnt > 0 || (passedCnt === totalCnt && !explicitError));
     } else {
       failed = explicitError || /## \[(?:FAIL|ERROR|TIMEOUT)/i.test(body);
+    }
+
+    if (failed && !explicitError && Array.isArray(checkMeta) && checkMeta.length > 0) {
+      const failedLabels = parseRunChecksFailedLabels(body);
+      const countMatches = failedLabels.length > 0 && (failedCnt === null || failedLabels.length === failedCnt);
+      if (countMatches) {
+        const matchedGroups = failedLabels.map((lbl) =>
+          checkMeta.filter((item) => normalizeCheckLabel(item?.l) === lbl)
+        );
+        if (matchedGroups.every((grp) => grp.length > 0)) {
+          if (matchedGroups.every((grp) => grp.every((item) => item.ro === 1))) {
+            failed = false;
+          } else {
+            failedIsVerify = matchedGroups.some((grp) => grp.some((item) => item.v === 1));
+          }
+        }
+      }
     }
   } else {
     // Check Antigravity's leading exit-code banner FIRST so stdout content cannot spoof pass/fail
@@ -352,6 +411,7 @@ function classifyCommandOutcome(bareTool, isBenignCmd, errorText, rawResponseTex
     backgroundRunning: false,
     terminal,
     failed,
+    ...(failedIsVerify !== undefined ? { failedIsVerify } : {}),
     errSig: failed ? extractErrorSignature(errorText, body) : ""
   };
 }
@@ -532,12 +592,26 @@ export function classifyToolEvents(payload, nowMs = Date.now(), options = {}) {
   // 2. Command / verification tools
   if (CMD_TOOL_NAMES.has(bareTool)) {
     const cmdStr = extractedCmd;
+    const isRunChecks = bareTool === "run_checks";
+    const checkItems = isRunChecks ? extractRunChecksItems(effectiveArgs, options.deliveryTestCommand || "") : [];
     const matchesCustom = Boolean(
-      options.deliveryTestCommand && matchesCustomCheckCommand(cmdStr, options.deliveryTestCommand)
+      !isRunChecks && options.deliveryTestCommand && matchesCustomCheckCommand(cmdStr, options.deliveryTestCommand)
     );
-    const isVerify = bareTool === "run_checks" || VERIFY_CMD_RE.test(cmdStr) || matchesCustom;
+    const baseIsVerify = isRunChecks
+      ? checkItems.some((item) => item.isVerify)
+      : VERIFY_CMD_RE.test(cmdStr) || matchesCustom;
     const isBenignCmd = bareTool === "run_command" && isBenignSearchCommand(cmdStr);
-    const isReadOnlyCmd = bareTool === "run_command" && isReadOnlyInspectCommand(cmdStr);
+    const isReadOnlyCmd = isRunChecks
+      ? checkItems.length > 0 && checkItems.every((item) => item.isReadOnly)
+      : bareTool === "run_command" && isReadOnlyInspectCommand(cmdStr);
+    const checkMeta =
+      isRunChecks && checkItems.length > 1 && !isReadOnlyCmd
+        ? checkItems.map((item) => ({
+            l: item.label,
+            ...(item.isVerify ? { v: 1 } : {}),
+            ...(item.isReadOnly ? { ro: 1 } : {})
+          }))
+        : null;
 
     if ((stepIsRunning || (hasVerificationEvidence && BG_RUNNING_RE.test(stripTranscriptStepHeaders(responseText)))) && !payloadExplicitError) {
       // Background task not finished yet; record as pending so PreInvocation resolves from completion SYSTEM_MESSAGE
@@ -548,9 +622,10 @@ export function classifyToolEvents(payload, nowMs = Date.now(), options = {}) {
           kind: "cmd",
           tool: bareTool,
           failed: false,
-          isVerify,
+          isVerify: baseIsVerify,
           isBenignSearchCmd: isBenignCmd,
           isReadOnlyCmd,
+          ...(checkMeta ? { checkMeta } : {}),
           pending: true,
           backgroundRunning: true,
           ...planFields,
@@ -560,10 +635,18 @@ export function classifyToolEvents(payload, nowMs = Date.now(), options = {}) {
       ];
     }
 
-    const cmdOutcome = classifyCommandOutcome(bareTool, isBenignCmd, errorText, responseText, explicitError);
+    const cmdOutcome = classifyCommandOutcome(
+      bareTool,
+      isBenignCmd,
+      errorText,
+      responseText,
+      explicitError,
+      checkMeta
+    );
     if (cmdOutcome.backgroundRunning) {
       return [];
     }
+    const isVerify = cmdOutcome.failedIsVerify !== undefined ? cmdOutcome.failedIsVerify : baseIsVerify;
 
     return [
       {
@@ -577,6 +660,7 @@ export function classifyToolEvents(payload, nowMs = Date.now(), options = {}) {
         isVerify,
         ...(isBenignCmd ? { isBenignSearchCmd: true } : {}),
         ...(isReadOnlyCmd ? { isReadOnlyCmd: true } : {}),
+        ...(checkMeta ? { checkMeta } : {}),
         ...(needsPreInvocationResolve ? { pending: true } : {}),
         cmd: sanitizeSnippet(cmdStr, 64),
         errSig: cmdOutcome.errSig
@@ -626,12 +710,21 @@ export function reconcileEventsWithTranscript(events, transcriptTail = null, pre
           Boolean(ev.isBenignSearchCmd),
           "",
           bgTask.text,
-          false
+          false,
+          ev.checkMeta
         );
-        nextCache[key] = { kind: "cmd", failed: outcome.failed, errSig: outcome.errSig, ...(hasEv ? { terminal: Boolean(outcome.terminal) } : {}) };
+        const isVerify = outcome.failedIsVerify !== undefined ? outcome.failedIsVerify : Boolean(ev.isVerify);
+        nextCache[key] = {
+          kind: "cmd",
+          failed: outcome.failed,
+          errSig: outcome.errSig,
+          ...(outcome.failedIsVerify !== undefined ? { isVerify } : {}),
+          ...(hasEv ? { terminal: Boolean(outcome.terminal) } : {})
+        };
         resolvedEvents.push({
           ...ev,
           failed: outcome.failed,
+          isVerify,
           ...(hasEv ? { terminal: Boolean(outcome.terminal) } : {}),
           errSig: outcome.errSig,
           pending: false,
@@ -654,15 +747,24 @@ export function reconcileEventsWithTranscript(events, transcriptTail = null, pre
           Boolean(ev.isBenignSearchCmd),
           txErr,
           txStep.content || "",
-          txExplicitErr
+          txExplicitErr,
+          ev.checkMeta
         );
         const receipt = outcome.terminal ? outcome : !txExplicitErr && (ev.terminal ? ev : cached?.terminal ? cached : null);
         const terminal = Boolean(receipt);
         const failed = (hasEv && terminal) ? receipt.failed : outcome.failed;
-        nextCache[key] = { kind: "cmd", failed, errSig: outcome.errSig, ...(hasEv ? { terminal } : {}) };
+        const isVerify = outcome.failedIsVerify !== undefined ? outcome.failedIsVerify : Boolean(ev.isVerify);
+        nextCache[key] = {
+          kind: "cmd",
+          failed,
+          errSig: outcome.errSig,
+          ...(outcome.failedIsVerify !== undefined ? { isVerify } : {}),
+          ...(hasEv ? { terminal } : {})
+        };
         resolvedEvents.push({
           ...ev,
           failed,
+          isVerify,
           ...(hasEv ? { terminal } : {}),
           errSig: outcome.errSig,
           pending: false,
@@ -676,6 +778,7 @@ export function reconcileEventsWithTranscript(events, transcriptTail = null, pre
         resolvedEvents.push({
           ...ev,
           failed: Boolean(cached.failed),
+          ...(cached.isVerify !== undefined ? { isVerify: Boolean(cached.isVerify) } : {}),
           ...(hasEv ? { terminal: Boolean(cached.terminal) } : {}),
           errSig: cached.errSig || "",
           pending: false,
@@ -868,6 +971,12 @@ function analyzeEventMetrics(events, turnFloorTs = 0) {
     }
 
     if (ev.kind === "cmd") {
+      // Pure read-only inspection commands (git status/diff/log/rev-parse, ls, rg, grep, which)
+      // are environmental probes, never build/test verifications: neither passing nor failing them
+      // should trigger Stop auto-retry, bump failure/oscillation streaks, or reset real test failures.
+      if (ev.isReadOnlyCmd) {
+        continue;
+      }
       const cmdKey = normalizeCmdKey(ev.cmd);
       if (ev.failed) {
         consecutiveCmdFailures += 1;
@@ -885,11 +994,6 @@ function analyzeEventMetrics(events, turnFloorTs = 0) {
           pendingEditedFiles.clear();
         }
       } else {
-        // Pure read-only inspection commands (git status/diff/log, ls, rg, grep) must NOT reset
-        // failure streaks, wipe pending edited files, or clear edit<->fail oscillations.
-        if (ev.isReadOnlyCmd) {
-          continue;
-        }
         consecutiveCmdFailures = 0;
         lastFailureIsVerify = false;
         const matchesPriorFailedCmd = Boolean(cmdKey && failedCmds.has(cmdKey));
@@ -926,7 +1030,7 @@ function analyzeEventMetrics(events, turnFloorTs = 0) {
 
 function hasDirectFixOrChangeIntent(intentProse) {
   if (!intentProse) return false;
-  if (NEGATED_EDIT_INTENT_RE.test(intentProse)) {
+  if (NEGATED_EDIT_INTENT_RE.test(intentProse) || DEFERRED_EDIT_INTENT_RE.test(intentProse)) {
     return false;
   }
   if (IMPERATIVE_FIX_INTENT_RE.test(intentProse)) {
@@ -1888,7 +1992,10 @@ export function evaluateStop(payload, events = [], prevStateInput = null, option
     (metrics.consecutiveCmdFailures >= 1 && metrics.latestFailureTs >= turnFloorTs &&
      !stalePlanFailure && !staleGateFailure &&
      !((skipPlanChecks || (effSettings.deliveryTestGateEnabled && userSkipTests)) && metrics.lastFailureIsVerify));
-  const explicitNoEdit = !turnGoal && !metrics.hasTurnEdit && NEGATED_EDIT_INTENT_RE.test(intentProse);
+  const explicitNoEdit =
+    !turnGoal &&
+    !metrics.hasTurnEdit &&
+    (NEGATED_EDIT_INTENT_RE.test(intentProse) || DEFERRED_EDIT_INTENT_RE.test(intentProse));
   const smartTriggered =
     !explicitNoEdit &&
     (metrics.hasTurnEdit || plan?.wroteSource || deliveryGate?.wroteSource ||
