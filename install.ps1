@@ -29,7 +29,7 @@ try {
     New-Item -ItemType Directory -Force -Path $TempWorkDir | Out-Null
     $RepoDir = Join-Path $TempWorkDir "repo"
     if (Get-Command git -ErrorAction SilentlyContinue) {
-      Write-Host "[agy-cmd] Fetching latest release from GitHub..."
+      Write-Host "[agy-cmd] Fetching latest version from GitHub (main branch)..."
       & git clone --depth 1 --quiet "https://github.com/zou172866/Antigravity-agy-cmd.git" $RepoDir
       if ($LASTEXITCODE -ne 0) { throw "git clone failed with exit code $LASTEXITCODE" }
     } else {

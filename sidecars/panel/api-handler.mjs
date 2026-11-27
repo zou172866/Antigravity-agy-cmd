@@ -34,7 +34,7 @@ const STAR_PROMPT_ALLOWED_STATES = new Set(STAR_PROMPT_TERMINAL_STATES);
 const VERSION_CHECK_ALLOWED_KEYS = new Set(["mode", "fresh"]);
 const PLUGIN_UPDATE_ALLOWED_KEYS = new Set(["version"]);
 const AUTO_UPDATE_ACK_ALLOWED_KEYS = new Set(["dismissNotice"]);
-const NON_CIRCUIT_AUTO_FAIL_REASONS = new Set(["gitCheckout", "notInstalled", "busy", "releaseChanged"]);
+const NON_CIRCUIT_AUTO_FAIL_REASONS = new Set(["gitCheckout", "notInstalled", "managedByHost", "busy", "releaseChanged"]);
 
 let _defaultVersionChecker = null;
 let _defaultPluginUpdater = null;

@@ -37,7 +37,7 @@ trap cleanup EXIT INT TERM
 
 REPO_DIR="$TMP_DIR/repo"
 if command -v git >/dev/null 2>&1; then
-  echo "[agy-cmd] Fetching latest release from GitHub..."
+  echo "[agy-cmd] Fetching latest version from GitHub (main branch)..."
   git clone --depth 1 --quiet "https://github.com/zou172866/Antigravity-agy-cmd.git" "$REPO_DIR"
 elif command -v curl >/dev/null 2>&1; then
   echo "[agy-cmd] Downloading archive from GitHub..."

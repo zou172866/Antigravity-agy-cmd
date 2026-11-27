@@ -69,6 +69,8 @@ class TestPluginManifestsAndSync(unittest.TestCase):
         hooks = json.loads(HOOKS_JSON_PATH.read_text(encoding="utf-8"))
         self.assertIn("agy-cmd-router", hooks)
         spec = hooks["agy-cmd-router"]
+        self.assertIsInstance(spec["PreToolUse"], list)
+        self.assertEqual(spec["PreToolUse"][0]["matcher"], "exit_plan_mode")
         self.assertIsInstance(spec["PostToolUse"], list)
         self.assertIn("matcher", spec["PostToolUse"][0])
         for flat_ev in ("SessionStart", "PreInvocation", "Stop"):
@@ -263,7 +265,7 @@ class TestSetupAutoRouterCLI(unittest.TestCase):
         (p_dir / "skills" / "agy-cmd").mkdir(parents=True, exist_ok=True)
         (p_dir / "plugin.json").write_text('{"name":"agy-cmd"}\n', encoding="utf-8")
         (p_dir / "skills" / "agy-cmd" / "SKILL.md").write_text("# agy-cmd\n", encoding="utf-8")
-        for script_name in ("session-start.mjs", "post-tool-use.mjs", "pre-invocation.mjs", "stop.mjs"):
+        for script_name in ("session-start.mjs", "pre-tool-use.mjs", "post-tool-use.mjs", "pre-invocation.mjs", "stop.mjs"):
             (p_dir / "hooks" / script_name).write_text("// stub\n", encoding="utf-8")
         for sc_name in ("sidecar.json", "server.mjs", "index.html"):
             (p_dir / "sidecars" / "panel" / sc_name).write_text("{}\n", encoding="utf-8")
@@ -625,6 +627,64 @@ class TestStarFollowupCliAndState(unittest.TestCase):
             (p_dir / "hooks" / "stop.mjs").unlink()
             issues = router.validate_hooks_json(p_dir, p_dir / "hooks.json")
             self.assertTrue(any("stop.mjs" in item for item in issues), f"Expected missing stop.mjs issue, got {issues}")
+
+    def test_v270_pretooluse_assets_sync_verifier_invariants_and_gemini_home(self) -> None:
+        import os
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_dir = Path(tmp) / "cfg"
+            st_dir = Path(tmp) / "state"
+            p_dir = cfg_dir / "plugins" / "agy-cmd"
+            self.assertEqual(run_cli("--install", "--config-dir", str(cfg_dir), "--state-dir", str(st_dir), "--json").returncode, 0)
+
+            # 1. validate_hooks_json detects missing pre-tool-use.mjs
+            pre_tool_script = p_dir / "hooks" / "pre-tool-use.mjs"
+            pre_tool_script.unlink()
+            hook_issues = router.validate_hooks_json(p_dir, p_dir / "hooks.json")
+            self.assertTrue(any("pre-tool-use.mjs" in item for item in hook_issues), f"Expected pre-tool-use.mjs issue, got {hook_issues}")
+            self.assertEqual(run_cli("--install", "--config-dir", str(cfg_dir), "--state-dir", str(st_dir), "--json").returncode, 0)
+
+            # 2. validate_bundle_sync detects drift in assets/logo.svg
+            logo_path = p_dir / "assets" / "logo.svg"
+            logo_path.write_text("<svg>drifted</svg>\n", encoding="utf-8")
+            sync_issues = router.validate_bundle_sync(p_dir)
+            self.assertTrue(any("logo.svg" in item for item in sync_issues), f"Expected logo.svg drift issue, got {sync_issues}")
+
+            # 3. validate_verifier allows safe read-only extensions and blocks unsafe policies
+            verifier_path = p_dir / "agents" / "cmd-verifier.md"
+            original = (PLUGIN_ROOT / "agents" / "cmd-verifier.md").read_text(encoding="utf-8")
+            safe_ext = (
+                original.replace('tools: ["read_file"]', 'tools: ["read_file", "view_file", "grep_search"]')
+                .replace("model: inherit", "model: inherit\ncommandExecutionPolicy: off")
+            )
+            verifier_path.write_text(safe_ext, encoding="utf-8")
+            self.assertEqual(router.validate_verifier(p_dir), [])
+            unsafe_policy = original.replace("model: inherit", "model: inherit\ncommandExecutionPolicy: auto")
+            verifier_path.write_text(unsafe_policy, encoding="utf-8")
+            self.assertTrue(router.validate_verifier(p_dir))
+
+            # 4. resolve_state_dir honors GEMINI_HOME (both parent and .gemini forms)
+            old_env = {k: os.environ.get(k) for k in ("AGY_CMD_STATE_DIR", "PLUGIN_DATA", "GEMINI_HOME")}
+            try:
+                os.environ.pop("AGY_CMD_STATE_DIR", None)
+                os.environ.pop("PLUGIN_DATA", None)
+                custom_home = Path(tmp) / "custom-home"
+                os.environ["GEMINI_HOME"] = str(custom_home)
+                self.assertEqual(
+                    router.resolve_state_dir(),
+                    custom_home.resolve() / ".gemini" / "antigravity" / "plugin_data" / "agy-cmd",
+                )
+                os.environ["GEMINI_HOME"] = str(custom_home / ".gemini")
+                self.assertEqual(
+                    router.resolve_state_dir(),
+                    custom_home.resolve() / ".gemini" / "antigravity" / "plugin_data" / "agy-cmd",
+                )
+            finally:
+                for k, v in old_env.items():
+                    if v is None:
+                        os.environ.pop(k, None)
+                    else:
+                        os.environ[k] = v
 
 
 if __name__ == "__main__":

@@ -50,12 +50,14 @@ irm https://raw.githubusercontent.com/zou172866/Antigravity-agy-cmd/main/install
 curl -fsSL https://raw.githubusercontent.com/zou172866/Antigravity-agy-cmd/main/install.sh | sh
 ```
 
-**Manual clone install:**
+**Manual clone install** (note: cloning a `.git` checkout directly into `plugins/agy-cmd` disables Sidecar one-click self-update to protect your Git working tree; upgrade via `git pull` or use the one-line installer above):
 
 ```powershell
 git clone https://github.com/zou172866/Antigravity-agy-cmd "$HOME\.gemini\config\plugins\agy-cmd"
 python "$HOME\.gemini\config\plugins\agy-cmd\skills\agy-cmd\scripts\setup_auto_router.py" --install
 ```
+
+On Linux / macOS / SSH remote hosts where `python` is not symlinked, use `python3` instead. If installed via `agy plugin install` or Marketplace (`installedFrom`), update through Antigravity's plugin manager rather than in-place Sidecar self-update.
 
 **Standalone rules only** (text routing rules without Stop auto-retry or the Sidecar panel):
 
@@ -169,9 +171,10 @@ python skills/agy-cmd/scripts/setup_auto_router.py --sync-check
 python skills/agy-cmd/scripts/setup_auto_router.py --remove
 ```
 
-Run the test suite:
+Run the test suite and official plugin manifest validation:
 
 ```bash
 npm test
-python -m unittest discover -s test -p "test_*.py" -v
+python3 -m unittest discover -s test -p "test_*.py" -v
+agy plugin validate --strict .
 ```

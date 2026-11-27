@@ -1,9 +1,12 @@
 #!/usr/bin/env node
 /**
  * agy-cmd Right-Hand Auxiliary Sidecar Server:
- * Runs natively inside Antigravity via `sidecar_sdk` (`SidecarApp` with POST-only
+ * Runs natively inside Antigravity App via `sidecar_sdk` (`SidecarApp` with POST-only
  * token-authenticated `/api/*` endpoints), and supports standalone loopback HTTP
  * mode (`127.0.0.1`) for local browser preview and automated integration tests.
+ * Note (P2-5 architecture note): `sidecar.json`'s `has_web_ui` / `ui_config`
+ * (`SIDECAR_UI_ENTRYPOINT_AUX_PANE`) targets Antigravity App's auxiliary pane;
+ * IDE/CLI surfaces fall back to `skills/agy-cmd/scripts/setup_auto_router.py`.
  */
 import crypto from "node:crypto";
 import fs from "node:fs";

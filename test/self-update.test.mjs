@@ -45,7 +45,9 @@ import {
   extractStaticRelativeImports,
   hasActiveUpdateMarker,
   isValidVerifierRole,
+  preservePinnedNodeCommand,
   resolveInstalledRoot,
+  shouldPreserveExecutableMode,
   UPDATE_MARKER_NAME,
   UPDATE_ROUTE
 } from "../sidecars/panel/version-update.mjs";
@@ -1516,6 +1518,107 @@ test("auto-update-install: 4 guardrails (opt-in default off, SHA-256 required, s
     assert.equal(getEl("auto-update-install-btn").textContent, "自动更新：开");
   } finally {
     resetUpdateRuntimeFlags();
+    fs.rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("v2.7.0 hardening: plugin.json schema contract, managedByHost guard, POSIX node/0755 preservation & forward-compatible verifier invariants", async () => {
+  // 1. plugin.json satisfies official Antigravity JSON Schema contract
+  const manifest = JSON.parse(fs.readFileSync(path.join(REPO_ROOT, "plugin.json"), "utf8"));
+  const pkg = JSON.parse(fs.readFileSync(path.join(REPO_ROOT, "package.json"), "utf8"));
+  assert.equal(manifest.$schema, "https://antigravity.google/schemas/v1/plugin.json");
+  assert.equal(typeof manifest.repository, "string");
+  assert.match(manifest.repository, /^https:\/\/github\.com\//);
+  assert.equal(manifest.version, pkg.version);
+  assert.ok(Array.isArray(manifest.keywords) && manifest.keywords.length > 0);
+  assert.equal(typeof manifest.author?.name, "string");
+
+  // 2. POSIX executable mode detection & pinned node path preservation
+  assert.equal(shouldPreserveExecutableMode("install.sh", Buffer.from("echo hi\n")), true);
+  assert.equal(shouldPreserveExecutableMode("hooks/stop.mjs", Buffer.from("#!/usr/bin/env node\n")), true);
+  assert.equal(shouldPreserveExecutableMode("plugin.json", Buffer.from("{}\n")), false);
+
+  const baseSidecarBuf = Buffer.from(JSON.stringify({ command: "node", args: ["server.mjs"], restart_policy: "always" }) + "\n");
+  const posixPreserved = JSON.parse(
+    preservePinnedNodeCommand(baseSidecarBuf, { command: "/home/alice/.nvm/versions/node/v22.1.0/bin/node" }).toString("utf8")
+  );
+  assert.equal(posixPreserved.command, "/home/alice/.nvm/versions/node/v22.1.0/bin/node");
+  const rejectedShell = JSON.parse(
+    preservePinnedNodeCommand(baseSidecarBuf, { command: "/bin/sh" }).toString("utf8")
+  );
+  assert.equal(rejectedShell.command, "node");
+
+  // 3. Forward-compatible security-invariant verifier validation
+  const realVerifier = fs.readFileSync(path.join(REPO_ROOT, "agents/cmd-verifier.md"), "utf8");
+  assert.equal(isValidVerifierRole(realVerifier), true);
+  assert.equal(
+    isValidVerifierRole(
+      realVerifier
+        .replace('tools: ["read_file"]', 'tools: ["read_file", "view_file", "grep_search"]')
+        .replace("model: inherit", "model: inherit\ncommandExecutionPolicy: off")
+    ),
+    true
+  );
+  assert.equal(
+    isValidVerifierRole(realVerifier.replace("model: inherit", "model: inherit\ncommandExecutionPolicy: auto")),
+    false
+  );
+  assert.equal(
+    isValidVerifierRole(realVerifier.replace('tools: ["read_file"]', 'tools: ["read_file", "edit_file"]')),
+    false
+  );
+  assert.equal(
+    isValidVerifierRole(realVerifier.replace("tools:", "unknownKey: true\ntools:")),
+    false
+  );
+
+  // 4. Host-managed installation (`config.json` -> `plugins["agy-cmd"].installedFrom`) blocks self-update without tripping circuit breaker
+  const tmpBase = makeTmpDir("agy-cmd-managed-");
+  const stateDir = makeTmpDir("agy-cmd-managed-st-");
+  resetUpdateRuntimeFlags();
+  try {
+    const cfgDir = path.join(tmpBase, "cfg");
+    const installedRoot = path.join(cfgDir, "plugins", "agy-cmd");
+    writeBundleToDir(installedRoot, collectRepoBundleFiles("2.7.0"));
+    fs.writeFileSync(
+      path.join(cfgDir, "config.json"),
+      JSON.stringify({
+        plugins: {
+          "agy-cmd": {
+            enabled: true,
+            installedFrom: { id: "antigravity-plugins-partners/plugin/agy-cmd", version: "2.7.0" }
+          }
+        }
+      })
+    );
+    await assert.rejects(
+      resolveInstalledRoot(path.join(installedRoot, "sidecars", "panel")),
+      (e) => e instanceof UpdateError && e.reason === "managedByHost"
+    );
+
+    updateSettings(stateDir, { autoUpdateInstall: true });
+    const release = {
+      ok: true,
+      status: "update",
+      currentVersion: "2.7.0",
+      latestVersion: "2.7.1",
+      releaseTag: "v2.7.1",
+      releaseUrl: `https://github.com/${REPO}/releases/tag/v2.7.1`,
+      assetUrl: `https://github.com/${REPO}/releases/download/v2.7.1/agy-cmd-v2.7.1.zip`,
+      assetSha256: "a".repeat(64)
+    };
+    const cycleRes = await runAutoUpdateCycle({
+      stateDir,
+      checker: async () => release,
+      updater: async () => ({ ok: false, status: "error", reason: "managedByHost", diagnostics: { step: "inspect" } }),
+      currentVersion: "2.7.0",
+      env: {}
+    });
+    assert.equal(cycleRes.action, "failed");
+    assert.equal(readSettings(stateDir).autoUpdateState.failedVersion, "");
+  } finally {
+    resetUpdateRuntimeFlags();
+    fs.rmSync(tmpBase, { recursive: true, force: true });
     fs.rmSync(stateDir, { recursive: true, force: true });
   }
 });

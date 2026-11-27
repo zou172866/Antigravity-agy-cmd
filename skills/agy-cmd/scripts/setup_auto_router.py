@@ -52,7 +52,7 @@ RULE_BODY = """# Antigravity 自动路由 (agy-cmd)
 - **防报错套餐感知与自动续跑**（禁推 CLI 专属 `/undo`、`/branch`、`/effort`；本轮已用对应 `/` 指令则不重复提示）：
   1. **疑难任务与卡壳排错**：收到钩子的 `[agy-cmd → 自动 Boost]` 时，直接用 `invoke_subagent` 派一个角色。只读排查或待审批时用 `DeepInvestigator`，已授权的修复可用 `DeepCoder`。主会话验证结果，角色调用失败则接手。收到 `[agy-cmd → 自动换视角排查]` 时，给可用的 `dart-reviewer` 派只读排查任务，备选 `research`；都不可用时由主会话逐一验证假设。
   2. **防停机自动续跑（Stop 监工）**：改代码或修错后若存在现成测试/构建命令，结束前优先实跑验证以便 `agy-cmd` `Stop` 钩子无感核验并在未通过时按面板设定次数自动续跑；仅当收到钩子明确提示时输出 `[agy-cmd → 自动续跑已启用]` 或 `[agy-cmd → 建议 /goal]`。
-  3. **调节面板设置与指令选型**：当用户调节自动重试次数、开关交付前测试门禁/自定义验证命令、切换会员/Boost 开关，或查询对比指令时，读 `agy-cmd` `SKILL.md`（可附 `[agy-cmd 自动路由](sidecar://agy-cmd/panel/)` 面板入口）。
+  3. **调节面板设置与指令选型**：当用户调节自动重试次数、开关交付前测试门禁/自定义验证命令、切换会员/Boost 开关，或查询对比指令时，读 `agy-cmd` `SKILL.md`；仅首次引导或用户明确调节/打开面板时附 `[agy-cmd 自动路由](sidecar://agy-cmd/panel/)`（App v2.35.1+ 会自动弹开侧栏），纯查指令对比勿附该链接。
 """
 
 RULE_CONTENT = RULE_FRONTMATTER + RULE_BODY
@@ -99,6 +99,11 @@ def resolve_state_dir(custom_state_dir: str | None = None) -> Path:
         if resolved.parent.name.lower() == "plugin_data" and resolved.name.lower() != PLUGIN_NAME:
             return resolved.parent / PLUGIN_NAME
         return resolved
+    gemini_home = os.environ.get("GEMINI_HOME", "").strip()
+    if gemini_home:
+        resolved_home = Path(gemini_home).expanduser().resolve()
+        gemini_root = resolved_home if resolved_home.name.lower() == ".gemini" else resolved_home / ".gemini"
+        return gemini_root / "antigravity" / "plugin_data" / PLUGIN_NAME
     return Path.home() / ".gemini" / "antigravity" / "plugin_data" / PLUGIN_NAME
 
 
@@ -594,6 +599,17 @@ def validate_hooks_json(plugin_dir: Path, hooks_path: Path) -> list[str]:
     for hook_name, spec in data.items():
         if not isinstance(spec, dict) or spec.get("enabled") is False:
             continue
+        pre_tool_groups = spec.get("PreToolUse")
+        if pre_tool_groups is not None:
+            if not isinstance(pre_tool_groups, list) or not pre_tool_groups:
+                issues.append(f"PreToolUse 配置格式无效（{hook_name}）")
+            else:
+                for grp in pre_tool_groups:
+                    if isinstance(grp, dict) and isinstance(grp.get("hooks"), list):
+                        for handler in grp["hooks"]:
+                            cmd = handler.get("command", "") if isinstance(handler, dict) else ""
+                            if cmd:
+                                _check_hook_script_exists(plugin_dir, cmd, hook_name, issues)
         post_groups = spec.get("PostToolUse")
         if isinstance(post_groups, list):
             for grp in post_groups:
@@ -678,7 +694,7 @@ def validate_bundle_sync(plugin_dir: Path) -> list[str]:
         ):
             issues.append(f"插件运行文件与源码仓库存在漂移：{dst_fp}")
 
-    for dir_name in ("agents", "hooks", "sidecars", "skills"):
+    for dir_name in ("assets", "agents", "hooks", "sidecars", "skills"):
         src_dir = source_root / dir_name
         if not src_dir.is_dir():
             continue
@@ -706,32 +722,61 @@ def validate_bundle_sync(plugin_dir: Path) -> list[str]:
 def validate_verifier(plugin_dir: Path) -> list[str]:
     role = plugin_dir / "agents" / "cmd-verifier.md"
     try:
-        contents = role.read_text(encoding="utf-8")
+        contents = normalize_lf(role.read_text(encoding="utf-8"))
     except (OSError, UnicodeError):
         return [f"无法读取独立复核角色：{role}"]
 
-    # The bundled role uses one field per line and a JSON-style YAML tools list.
-    # Reject extensions and duplicate keys that could grant shell, MCP or writes.
+    # Security-invariant validation (mirrors version-update.mjs):
+    # Allows safe read-only tool subsets and optional `commandExecutionPolicy: off`,
+    # while rejecting duplicates, unknown keys, write/shell tools, or MCP access.
+    if not contents.startswith("---\n"):
+        return [f"独立复核角色的只读工具或权限配置无效：{role}"]
     header, divider, _ = contents.removeprefix("---\n").partition("\n---\n")
-    lines = header.splitlines()
-    fields = dict(line.split(": ", 1) for line in lines if ": " in line)
-    description = fields.pop("description", "")
-    required = {
-        "name": "cmd-verifier",
-        "mainAgent": "false",
-        "subagent": "true",
-        "model": "inherit",
-        "inheritMcp": "false",
-        "inheritCustomizations": "true",
-        "tools": '["read_file"]',
+    if not divider:
+        return [f"独立复核角色的只读工具或权限配置无效：{role}"]
+
+    allowed_keys = {
+        "name",
+        "description",
+        "mainAgent",
+        "subagent",
+        "model",
+        "inheritMcp",
+        "inheritCustomizations",
+        "tools",
+        "commandExecutionPolicy",
     }
+    allowed_models = {"inherit", "flash", "flash_lite", "pro"}
+    allowed_tools = {"read_file", "view_file", "grep_search", "find_by_name", "list_dir", "send_message"}
+
+    fields: dict[str, str] = {}
+    for line in header.splitlines():
+        if ": " not in line:
+            return [f"独立复核角色的只读工具或权限配置无效：{role}"]
+        key, val = line.split(": ", 1)
+        if key not in allowed_keys or key in fields:
+            return [f"独立复核角色的只读工具或权限配置无效：{role}"]
+        fields[key] = val.strip()
+
     if (
-        not contents.startswith("---\n")
-        or not divider
-        or not description
-        or len(lines) != len(required) + 1
-        or fields != required
+        not fields.get("description")
+        or fields.get("name") != "cmd-verifier"
+        or fields.get("mainAgent") != "false"
+        or fields.get("subagent") != "true"
+        or fields.get("inheritMcp") != "false"
+        or fields.get("inheritCustomizations") not in ("true", "false")
+        or fields.get("model") not in allowed_models
     ):
+        return [f"独立复核角色的只读工具或权限配置无效：{role}"]
+
+    if "commandExecutionPolicy" in fields and fields["commandExecutionPolicy"] != "off":
+        return [f"独立复核角色的只读工具或权限配置无效：{role}"]
+
+    try:
+        tools = json.loads(fields.get("tools", ""))
+    except Exception:
+        return [f"独立复核角色的只读工具或权限配置无效：{role}"]
+    if not isinstance(tools, list) or not tools or not all(isinstance(t, str) and t in allowed_tools for t in tools):
         return [f"独立复核角色的只读工具或权限配置无效：{role}"]
     return []
 
@@ -813,7 +858,7 @@ def sync_plugin_bundle_if_needed(target_plugin_dir: Path) -> bool:
 
     ignore_fn = shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo")
     target_plugin_dir.mkdir(parents=True, exist_ok=True)
-    for item_name in ("plugin.json", "hooks.json", "package.json", "README.md", "README.zh-CN.md", "install.ps1", "install.sh"):
+    for item_name in ("plugin.json", "hooks.json", "package.json", "README.md", "README.zh-CN.md", "install.ps1", "install.sh", "LICENSE", "SECURITY.md"):
         src_file = source_root / item_name
         if src_file.is_file():
             shutil.copy2(src_file, target_plugin_dir / item_name)

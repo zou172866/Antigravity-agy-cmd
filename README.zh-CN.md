@@ -50,12 +50,14 @@ irm https://raw.githubusercontent.com/zou172866/Antigravity-agy-cmd/main/install
 curl -fsSL https://raw.githubusercontent.com/zou172866/Antigravity-agy-cmd/main/install.sh | sh
 ```
 
-也可以手动克隆仓库安装：
+也可以手动克隆仓库安装（注意：直接把含 `.git` 的仓库克隆进 `plugins/agy-cmd` 时，为防止覆盖源码，面板内一键在线自更新会被自动禁用，升级请用 `git pull` 或改跑上方一键安装脚本）：
 
 ```powershell
 git clone https://github.com/zou172866/Antigravity-agy-cmd "$HOME\.gemini\config\plugins\agy-cmd"
 python "$HOME\.gemini\config\plugins\agy-cmd\skills\agy-cmd\scripts\setup_auto_router.py" --install
 ```
+
+Linux / macOS / SSH 远程宿主机如无 `python` 软链，请将命令中的 `python` 替换为 `python3`。若通过官方 `agy plugin install` 安装或未来上架 Marketplace 托管，请直接使用 Antigravity 插件管理器更新。
 
 如果只安装基础文字规则（不含自动重试和右侧面板），可以运行：
 
@@ -169,9 +171,10 @@ python skills/agy-cmd/scripts/setup_auto_router.py --sync-check
 python skills/agy-cmd/scripts/setup_auto_router.py --remove
 ```
 
-运行自带测试：
+运行自带测试与官方插件严格校验：
 
 ```bash
 npm test
-python -m unittest discover -s test -p "test_*.py" -v
+python3 -m unittest discover -s test -p "test_*.py" -v
+agy plugin validate --strict .
 ```

@@ -36,6 +36,7 @@ export function createDefaultState() {
     turnUnattendedGoal: false,
     turnRetryOverride: null,
     turnAutoRetries: 0,
+    turnBaseExecutionNum: null,
     lastContinueEventSig: "",
     resolvedSteps: {}
   };

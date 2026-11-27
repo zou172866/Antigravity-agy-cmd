@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import {
+  detectHostSurface,
   extractActiveSlashCommands,
   isSubagentPayload,
   nonEmptyString,
@@ -1097,19 +1098,13 @@ export function evaluatePreInvocation(payload, events = [], prevStateInput = nul
     !rawPayloadInput ||
     (!isFreshPlanApprovalClick &&
       rawLastUserInput === nextState.lastUserInput &&
-      ((sameTxTurnKey &&
-        (Boolean(transcriptTail?.hasBgTaskCompletionSinceUserInput) ||
-          Boolean(transcriptTail?.hasPlannerResponseSinceUserInput))) ||
-        Boolean(transcriptTail?.tailRolledOverWithoutUserInput)));
+      (sameTxTurnKey || Boolean(transcriptTail?.tailRolledOverWithoutUserInput)));
   const isBgTaskWakeup =
     !isMidTurn &&
     invocationNum === 0 &&
     isWakeupWithNoNewInput &&
     (nextState.userTurnCount || 0) > 0 &&
-    (sameTxTurnKey || Boolean(transcriptTail?.tailRolledOverWithoutUserInput)) &&
-    (Boolean(transcriptTail?.hasBgTaskCompletionSinceUserInput) ||
-      Boolean(transcriptTail?.hasPlannerResponseSinceUserInput) ||
-      Boolean(transcriptTail?.tailRolledOverWithoutUserInput));
+    (sameTxTurnKey || Boolean(transcriptTail?.tailRolledOverWithoutUserInput));
 
   const isNewUserTurn =
     !isMidTurn &&
@@ -1130,6 +1125,7 @@ export function evaluatePreInvocation(payload, events = [], prevStateInput = nul
     nextState.lastTurnInitialSteps = initialNumSteps;
     nextState.lastTurnStartTs = nowMs;
     nextState.turnAutoRetries = 0;
+    nextState.turnBaseExecutionNum = null;
     nextState.lastContinueEventSig = "";
     nextState.turnRetryOverride = parseTurnRetryOverride(intentProse);
     nextState.turnUnattendedGoal = Boolean(
@@ -1150,6 +1146,7 @@ export function evaluatePreInvocation(payload, events = [], prevStateInput = nul
       nextState.turnUnattendedGoal = false;
       nextState.turnRetryOverride = null;
       nextState.turnAutoRetries = 0;
+      nextState.turnBaseExecutionNum = null;
       nextState.lastContinueEventSig = "";
       nextState.lastPlanBoostKey = "";
       nextState.lastPlanBoostNoticeHash = "";
@@ -1484,6 +1481,11 @@ export function evaluatePreInvocation(payload, events = [], prevStateInput = nul
     );
 
     if (retryPolicy.active) {
+      const surface = detectHostSurface(payload);
+      const adjustHintZh =
+        surface === "ide" || surface === "cli"
+          ? "可通过 `python3 scripts/setup_auto_router.py --auto-retry ...` 随时调节"
+          : "可在右侧 `agy-cmd` 面板随时调节";
       const policyZh =
         retryPolicy.mode === "infinite"
           ? "一直自动重试直至全绿"
@@ -1492,7 +1494,7 @@ export function evaluatePreInvocation(payload, events = [], prevStateInput = nul
         nextState,
         injectStep: buildInjectStep({
           uiOnly,
-          userMarkdown: `> **[agy-cmd → 自动续跑已启用]** 已挂载防停机监工（本轮策略：${policyZh}；可在右侧 \`agy-cmd\` 面板随时调节）。`,
+          userMarkdown: `> **[agy-cmd → 自动续跑已启用]** 已挂载防停机监工（本轮策略：${policyZh}；${adjustHintZh}）。`,
           systemMessage: `[agy-cmd] Auto-retry Stop guard is armed for this turn (${retryPolicy.mode === "infinite" ? "infinite retries until green" : `up to ${retryPolicy.max} automatic continuations`}). Start line 1 of your reply with "[agy-cmd → 自动续跑已启用]", and always run actual verification/test commands before finishing so the Stop hook can verify pass/fail.`
         }),
         shouldResetEvents,
@@ -1610,6 +1612,7 @@ export function evaluatePreInvocation(payload, events = [], prevStateInput = nul
 const STOP_ALLOW_REASONS = new Set([
   "USER_CANCELED",
   "ERROR",
+  "MAX_STEPS_EXCEEDED",
   "MAX_INVOCATIONS",
   "MAX_FORCED_INVOCATIONS",
   "MAX_TOKEN_BUDGET_EXCEEDED",
@@ -1617,6 +1620,67 @@ const STOP_ALLOW_REASONS = new Set([
   "TERMINAL_CUSTOM_HOOK",
   "INJECTED_RESPONSE"
 ]);
+
+const NORMAL_STOP_REASONS = new Set(["NO_TOOL_CALL", "MODEL_STOP"]);
+
+/**
+ * Pure PreToolUse decision engine for deterministic guardrails.
+ * Currently targets `exit_plan_mode` when read-only Plan Mode blocked artifact
+ * writes and the user has not yet approved the inline plan.
+ */
+export function evaluatePreToolUse(payload, events = [], prevStateInput = null, options = {}) {
+  const env = options.env ?? process.env;
+  const transcriptTail = options.transcriptTail || null;
+  const effSettings = normalizeSettings(options.settings || {});
+  const prevState = { ...createDefaultState(), ...(prevStateInput || {}) };
+
+  if (!payload || typeof payload !== "object" || isSubagentPayload(payload, env)) {
+    return { decision: "allow", reason: "", reasonCode: "subagent_or_empty" };
+  }
+
+  const toolCall = payload.toolCall && typeof payload.toolCall === "object" ? payload.toolCall : {};
+  const toolName = nonEmptyString(toolCall.name);
+  if (toolName !== "exit_plan_mode") {
+    return { decision: "allow", reason: "", reasonCode: "non_target_tool" };
+  }
+
+  if (!effSettings.planFallbackEnabled) {
+    return { decision: "allow", reason: "", reasonCode: "plan_fallback_disabled" };
+  }
+
+  if (prevState.swarmActive || transcriptTail?.hasSwarmActivity) {
+    return { decision: "allow", reason: "", reasonCode: "swarm_active_skip" };
+  }
+
+  const latestTranscriptInput = nonEmptyString(transcriptTail?.latestUserInput);
+  const rawPayloadInput = nonEmptyString(payload.lastUserInput ?? payload.last_user_input);
+  const inputEnvelope = rawPayloadInput || latestTranscriptInput;
+  const rawLastUserInput = unwrapUserRequestText(inputEnvelope);
+
+  const approvedNotice =
+    isPlanApprovalNotice(inputEnvelope) && (!rawLastUserInput || confirmsPlan(rawLastUserInput));
+  const confirmedInChat = Boolean(transcriptTail?.latestInputFollowsPlan) && confirmsPlan(rawLastUserInput);
+  if (approvedNotice || confirmedInChat) {
+    return { decision: "allow", reason: "", reasonCode: "plan_already_approved" };
+  }
+
+  const safeEvents = Array.isArray(events) ? events : [];
+  const turnFloorTs = prevState.lastTurnStartTs > 0 ? prevState.lastTurnStartTs - 5000 : 0;
+  const hasEventPlanBlock = safeEvents.some(
+    (ev) => ev && ev.planModeWriteBlocked && (turnFloorTs === 0 || (Number(ev.ts) || 0) >= turnFloorTs)
+  );
+  const hasActivePlanDenial = Boolean(transcriptTail?.latestPlanModeDenial || hasEventPlanBlock);
+  if (!hasActivePlanDenial) {
+    return { decision: "allow", reason: "", reasonCode: "no_plan_denial" };
+  }
+
+  return {
+    decision: "force_ask",
+    reason:
+      "[agy-cmd → /plan 审批] 检测到当前只读 Plan Mode 拒绝了方案产物写入且尚未收到用户明确批准。请确认已审阅正文方案后再允许调用 exit_plan_mode。",
+    reasonCode: "plan_mode_exit_guard"
+  };
+}
 
 /**
  * Pure Stop hook decision engine.
@@ -1642,11 +1706,7 @@ export function evaluateStop(payload, events = [], prevStateInput = null, option
   // Safety Brake 1: Always honor user cancellation, errors, and host invocation/token ceilings
   const rawTerm = nonEmptyString(payload.terminationReason ?? payload.termination_reason) || "NO_TOOL_CALL";
   const termReason = rawTerm.toUpperCase();
-  const freeModelStop = termReason === "MODEL_STOP" && effSettings.planTier === "free" &&
-    Boolean(prevState.freePlan) && (payload.fullyIdle ?? payload.fully_idle) === true;
-  const gateModelStop = termReason === "MODEL_STOP" && effSettings.deliveryTestGateEnabled === true &&
-    (payload.fullyIdle ?? payload.fully_idle) === true;
-  if ((!freeModelStop && !gateModelStop && termReason !== "NO_TOOL_CALL") || STOP_ALLOW_REASONS.has(termReason)) {
+  if (!NORMAL_STOP_REASONS.has(termReason) || STOP_ALLOW_REASONS.has(termReason)) {
     return {
       decision: "allow",
       reason: "",
@@ -1842,16 +1902,6 @@ export function evaluateStop(payload, events = [], prevStateInput = null, option
   const deliveryGateActive = Boolean(
     deliveryGate && !skipDeliveryGate && (gateFailedCheck || gatePendingChecks.length > 0)
   );
-  if (termReason === "MODEL_STOP" && !freeModelStop && !deliveryGateActive) {
-    return {
-      decision: "allow",
-      reason: "",
-      reasonCode: "term_model_stop",
-      nextState,
-      stateChanged,
-      metrics
-    };
-  }
   // When the user explicitly opted into the Delivery Test Gate:
   // - If autoRetryMode is count/infinite, enforce gate even when autoRetryScope is goal_only.
   // - If autoRetryMode is off (and not explicitly overridden per-turn), still allow 1 missing-test
@@ -1896,7 +1946,7 @@ export function evaluateStop(payload, events = [], prevStateInput = null, option
   const missingCheck = !effSettings.deliveryTestGateEnabled &&
     !hasUnresolvedTurnFailure && !plan?.reminded && checks.length > 0 &&
     (payload.fullyIdle ?? payload.fully_idle) === true &&
-    (freeModelStop || nonEmptyString(payload.terminationReason ?? payload.termination_reason).toUpperCase() === "NO_TOOL_CALL");
+    NORMAL_STOP_REASONS.has(termReason);
   if (!hasUnresolvedTurnFailure && !missingCheck && !gateMissingCheck) {
     if ((!plan && !deliveryGate && nextState.turnAutoRetries !== 0) || nextState.lastContinueEventSig !== "") {
       if (!plan && !deliveryGate) nextState.turnAutoRetries = 0;
@@ -1913,9 +1963,22 @@ export function evaluateStop(payload, events = [], prevStateInput = null, option
     };
   }
 
-  // Safety Brake 4: No-progress stall guard (if last continuation ran zero new edits/commands,
-  // the agent is asking a clarifying question or reporting an external blocker -> let it stop!)
-  const currentEventSig = `${effectiveEvents.length}:${metrics.latestEventTs}`;
+  // Safety Brake 4: No-progress stall guard (if last continuation ran zero new substantive
+  // edits or non-read-only commands, the agent is asking a clarifying question or reporting
+  // an external blocker -> let it stop!)
+  let progressEventCount = 0;
+  let latestProgressTs = 0;
+  for (let i = 0; i < effectiveEvents.length; i++) {
+    const ev = effectiveEvents[i];
+    if (!ev || typeof ev !== "object") continue;
+    if (ev.kind === "cmd" && ev.isReadOnlyCmd) continue;
+    progressEventCount += 1;
+    const evTs = Number(ev.ts) || i + 1;
+    if (evTs > latestProgressTs) latestProgressTs = evTs;
+  }
+  const progressEventSig = `${progressEventCount}:${latestProgressTs}`;
+  const rawEventSig = `${effectiveEvents.length}:${metrics.latestEventTs}`;
+  const currentEventSig = gateMissingCheck ? rawEventSig : progressEventSig;
   if ((nextState.turnAutoRetries || 0) > 0 && nextState.lastContinueEventSig === currentEventSig) {
     nextState.lastContinueEventSig = "";
     stateChanged = true;
@@ -1930,8 +1993,19 @@ export function evaluateStop(payload, events = [], prevStateInput = null, option
   }
 
   const execNum = parseNonNegInt(payload.executionNum ?? payload.execution_num);
-  const hostRetries =
-    execNum !== null && (payload.continuationActive === true || execNum > 0) ? execNum : 0;
+  let hostRetries = 0;
+  if (execNum !== null) {
+    const baseExec = parseNonNegInt(nextState.turnBaseExecutionNum);
+    if (baseExec !== null) {
+      hostRetries = Math.max(0, execNum - baseExec);
+    } else if (payload.continuationActive === true) {
+      hostRetries = execNum;
+    } else {
+      nextState.turnBaseExecutionNum = execNum;
+      stateChanged = true;
+      hostRetries = 0;
+    }
+  }
   const completedRetries = Math.max(nextState.turnAutoRetries || 0, hostRetries);
 
   if (retryPolicy.mode === "count" && completedRetries >= retryPolicy.max) {

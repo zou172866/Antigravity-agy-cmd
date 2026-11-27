@@ -1,11 +1,13 @@
 import fs from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { redactBasicSecrets } from "./common.mjs";
 
 // Only project-wide commands with unambiguous scope are recognized. Shell chains,
 // file filters, --prefix, workspaces and free-form command output are not evidence.
 const NODE_TEST = /^(?:npm(?:\.cmd|\.exe)? (?:t|test|run test)|(?:pnpm|yarn|bun)(?:\.cmd|\.exe)? (?:run )?test)$/i;
 const PROJECT_CHECK = /^(?:go test \.\/\.\.\.|cargo test|(?:python3?|py) -m (?:pytest|unittest discover)|pytest|node --test)$/i;
+const STATIC_PROJECT_CHECK = /^(?:(?:npx(?:\.cmd|\.exe)?\s+)?tsc(?:\.cmd|\.exe)?\s+--noEmit|go(?:\.exe)?\s+vet\s+\.\/\.\.\.|cargo(?:\.exe)?\s+(?:check|clippy)|(?:npm|pnpm|yarn|bun)(?:\.cmd|\.exe)?\s+run\s+(?:typecheck|lint|build|check|verify)|(?:pnpm|yarn|bun)(?:\.cmd|\.exe)?\s+(?:typecheck|lint|build|check|verify))$/i;
 const PYTHON_FULL_TEST = /^(?:(?:(?:python3?|py)(?:\.exe)?\s+(?:-B\s+)?-m\s+(?:pytest|unittest(?:\s+discover)?))|(?:uv\s+run\s+pytest)|pytest(?:\.exe)?)(?:\s+(?:-q|--quiet|-v|-vv|--verbose|--tb=(?:short|line|no)|-r[a-zA-Z]+))*$/i;
 const GO_FULL_TEST = /^go(?:\.exe)?\s+test(?:\s+(?:-v|-race|-count=1|-short))*\s+\.\/\.\.\.(?:\s+(?:-v|-race|-count=1|-short))*$/i;
 const RUST_FULL_TEST = /^cargo(?:\.exe)?\s+test(?:\s+(?:--workspace|--all-targets|--all-features|--quiet|-q|--verbose|-v))*$/i;
@@ -62,7 +64,14 @@ function inside(root, target) {
 function location(raw, cwd) {
   raw = decoded(raw);
   if (typeof raw !== "string" || !raw.trim() || /[\x00-\x1f]/.test(raw)) return "";
-  const value = raw.trim().replace(/^(['"])([\s\S]+)\1$/, "$2");
+  let value = raw.trim().replace(/^(['"])([\s\S]+)\1$/, "$2");
+  if (/^file:\/\//i.test(value)) {
+    try {
+      value = fileURLToPath(value);
+    } catch {
+      return "";
+    }
+  }
   if (path.isAbsolute(value)) return path.resolve(value);
   return cwd && path.isAbsolute(cwd) ? path.resolve(cwd, value) : "";
 }
@@ -162,12 +171,37 @@ function projectFor(dir, root, cache) {
   return found;
 }
 
+function normalizeSingleCheckCommand(cmd) {
+  const normalized = String(cmd || "").trim().replace(/[ \t]+/g, " ");
+  if (!normalized) return "";
+  if (NODE_TEST.test(normalized)) return "npm test";
+  if (PROJECT_CHECK.test(normalized)) return normalized;
+  if (!STATIC_PROJECT_CHECK.test(normalized)) return "";
+  if (/^(?:npx(?:\.cmd|\.exe)?\s+)?tsc(?:\.cmd|\.exe)?\s+--noEmit$/i.test(normalized)) return "tsc --noEmit";
+  if (/^go(?:\.exe)?\s+vet\s+\.\/\.\.\.$/i.test(normalized)) return "go vet ./...";
+  const cargoMatch = /^cargo(?:\.exe)?\s+(check|clippy)$/i.exec(normalized);
+  if (cargoMatch) return `cargo ${cargoMatch[1].toLowerCase()}`;
+  const scriptMatch = /^(?:npm|pnpm|yarn|bun)(?:\.cmd|\.exe)?\s+(?:run\s+)?(typecheck|lint|build|check|verify)$/i.exec(normalized);
+  if (scriptMatch) return `npm run ${scriptMatch[1].toLowerCase()}`;
+  return "";
+}
+
 function checkCommand(cmd) {
   cmd = decoded(cmd);
   if (typeof cmd !== "string") return "";
   const normalized = cmd.trim().replace(/[ \t]+/g, " ");
-  if (NODE_TEST.test(normalized)) return "npm test";
-  return PROJECT_CHECK.test(normalized) ? normalized : "";
+  const single = normalizeSingleCheckCommand(normalized);
+  if (single) return single;
+  const parts = splitStrictAndChain(normalized);
+  if (!parts || parts.length < 2 || parts.length > 4) return "";
+  const normParts = [];
+  for (const part of parts) {
+    if (parseCdTarget(part) !== null) return "";
+    const norm = normalizeSingleCheckCommand(stripTrailingStderrRedirect(part));
+    if (!norm) return "";
+    normParts.push(norm);
+  }
+  return normParts.join(" && ");
 }
 
 // An explicitly named project-wide check in the user's request or the host's
@@ -188,7 +222,8 @@ export function planToolEvidence(plan, tool, args, payload, command) {
   const workspace = roots.map(r => location(r)).filter(Boolean);
   if (!workspace.length) return null;
   const hostCwd = location(payload.cwd);
-  const cwd = location(args.Cwd ?? args.cwd ?? hostCwd, hostCwd);
+  const fallbackCwd = hostCwd || workspace[0] || "";
+  const cwd = location(args.Cwd ?? args.cwd ?? fallbackCwd, fallbackCwd);
   const findRoot = f => workspace.filter(r => inside(r, f)).sort((a,b) => b.length-a.length)[0];
   const packages = new Map();
   let wroteSource = false;
@@ -491,6 +526,8 @@ export function autoCheckCanonicalKey(cmd) {
   if (GO_FULL_TEST.test(cleaned)) return "go:test";
   if (RUST_FULL_TEST.test(cleaned)) return "rust:test";
   if (/^node(?:\.exe)? --test$/i.test(cleaned)) return "node:--test";
+  const staticNorm = STATIC_PROJECT_CHECK.test(cleaned) ? normalizeSingleCheckCommand(cleaned) : "";
+  if (staticNorm) return `static:${staticNorm}`;
   return "";
 }
 
@@ -603,10 +640,13 @@ export function deliveryGateToolEvidence(gate, tool, args, payload, command, cus
   if (!Array.isArray(roots) || !gate?.key) return null;
   const workspace = roots.map(r => location(r)).filter(Boolean);
   if (!workspace.length) return null;
-  const cwd = location(args.Cwd ?? args.cwd ?? hostCwd, hostCwd);
+  const fallbackCwd = hostCwd || workspace[0] || "";
+  const cwd = location(args.Cwd ?? args.cwd ?? fallbackCwd, fallbackCwd);
   const findRoot = f => workspace.filter(r => inside(r, f)).sort((a, b) => b.length - a.length)[0];
   const packages = new Map();
   const hasCustom = Boolean(parseCustomCheckSpec(customCommand));
+  const hasChainedRequest = Boolean(!hasCustom && gate.requested?.command?.includes("&&"));
+  const trackCustomSegments = hasCustom || hasChainedRequest;
 
   let wroteSource = false;
   const edited = new Map();
@@ -670,7 +710,7 @@ export function deliveryGateToolEvidence(gate, tool, args, payload, command, cus
       if (pathKey(pkg.scope) === pathKey(group.runDir) && resolvedSegs.length === 1) {
         autoKey = autoCheckCanonicalKey(group.rawSegs[0]);
       }
-      const segments = hasCustom
+      const segments = trackCustomSegments
         ? group.rawSegs.map(normalizeCustomSegment).filter(Boolean)
         : [];
       if (!autoKey && !segments.length) continue;
@@ -694,7 +734,13 @@ export function deliveryGateToolEvidence(gate, tool, args, payload, command, cus
 
 export function advanceDeliveryGate(gate, events, customCommand = "") {
   if (!gate) return gate;
-  const customSpec = parseCustomCheckSpec(customCommand);
+  const effectiveCustomCmd =
+    parseCustomCheckSpec(customCommand)
+      ? customCommand
+      : gate.requested?.command?.includes("&&")
+        ? gate.requested.command
+        : "";
+  const customSpec = parseCustomCheckSpec(effectiveCustomCmd);
   const customKeySet = customSpec ? new Set(customSpec.segments.map(s => s.key)) : null;
 
   const next = {
@@ -850,6 +896,45 @@ export function evaluateDeliveryGateStatus(gate, customCommand = "") {
     if (!expectedCmd) {
       untestedScopes.push({ dir, family: scope.family || "" });
       continue;
+    }
+
+    if (requestedForDir && requestedForDir.includes("&&")) {
+      const reqSpec = parseCustomCheckSpec(requestedForDir);
+      if (reqSpec) {
+        const missingSegs = [];
+        const failedSegs = [];
+        for (const seg of reqSpec.segments) {
+          let best = null;
+          for (const r of receipts) {
+            if (!r || r.segKey !== seg.key) continue;
+            const rDirKey = pathKey(r.runDir);
+            if (rDirKey !== scopeDirKey && !(rDirKey === scopeRootKey && inside(r.runDir, dir))) continue;
+            if (!best || r.step >= best.step) best = r;
+          }
+          if (best && best.step >= scope.editStep) {
+            if (!best.passed) failedSegs.push(seg.raw);
+          } else {
+            missingSegs.push(seg.raw);
+          }
+        }
+        if (failedSegs.length > 0) {
+          failedChecks.push({
+            dir,
+            command: failedSegs.length === reqSpec.segments.length ? reqSpec.raw : failedSegs.join(" && "),
+            failed: true,
+            isCustom: false
+          });
+        }
+        if (missingSegs.length > 0) {
+          pendingChecks.push({
+            dir,
+            command: missingSegs.length === reqSpec.segments.length ? reqSpec.raw : missingSegs.join(" && "),
+            failed: false,
+            isCustom: false
+          });
+        }
+        continue;
+      }
     }
 
     const expectedKey = autoCheckCanonicalKey(expectedCmd);

@@ -1,14 +1,24 @@
 {
+  "$schema": "https://antigravity.google/schemas/v1/plugin.json",
   "name": "agy-cmd",
   "displayName": "agy-cmd (自动路由与防停机面板)",
-  "version": "2.6.0",
-  "description": "Antigravity 桌面端/IDE 高阶能力自动路由插件（v2.6.0）：按任务调度多智能体，支持 Swarm 成员与活跃会话自动隔离、Orchestrator 友好型 Boost 阈值、Swarm 提示词包与三层选模、右侧边栏一键检查更新与可选 SHA-256 静默更新、可选交付前强制测试门禁、Stop 防停机自动续跑与免费版保护。",
+  "version": "2.7.0",
+  "description": "Antigravity 桌面端/IDE 高阶能力自动路由插件（v2.7.0）：多智能体与 Swarm 隔离调度、Plan Mode 硬拦截、交付测试门禁、Stop 防停机自动续跑、右侧边栏面板与 SHA-256 在线自更新。",
   "logo": "assets/logo.svg",
-  "homepage": "https://github.com/zou172866/Antigravity-agy-cmd",
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/zou172866/Antigravity-agy-cmd.git"
+  "author": {
+    "name": "zou172866",
+    "url": "https://github.com/zou172866"
   },
+  "homepage": "https://github.com/zou172866/Antigravity-agy-cmd",
+  "repository": "https://github.com/zou172866/Antigravity-agy-cmd",
+  "keywords": [
+    "antigravity",
+    "auto-router",
+    "hooks",
+    "swarm",
+    "verification",
+    "sidecar"
+  ],
   "suggestedPrompts": [
     "检查 agy-cmd 当前自动重试次数和 Boost 接入状态",
     "把 agy-cmd 自动重试改成 5 次",

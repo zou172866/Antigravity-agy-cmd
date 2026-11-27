@@ -132,6 +132,13 @@ export function resolveStateDir(env = process.env) {
     }
     return resolved;
   }
+  const geminiHome = nonEmptyString(e.GEMINI_HOME);
+  if (geminiHome) {
+    const resolved = path.resolve(geminiHome);
+    const geminiRoot =
+      path.basename(resolved).toLowerCase() === ".gemini" ? resolved : path.join(resolved, ".gemini");
+    return path.join(geminiRoot, "antigravity", "plugin_data", "agy-cmd");
+  }
   try {
     const home = os.homedir();
     if (home) {
@@ -139,6 +146,26 @@ export function resolveStateDir(env = process.env) {
     }
   } catch {}
   return path.join(os.tmpdir(), "agy-cmd-state");
+}
+
+export function detectHostSurface(payload = {}) {
+  const p = parseHookPayload(payload);
+  if (!p) return "unknown";
+  const candidates = [
+    p.transcriptPath,
+    p.transcript_path,
+    p.artifactDirectoryPath,
+    p.artifact_directory_path
+  ];
+  for (const raw of candidates) {
+    const s = nonEmptyString(raw);
+    if (!s) continue;
+    const norm = s.replace(/\\/g, "/").toLowerCase();
+    if (/\/\.gemini\/antigravity-ide(?:\/|$)/.test(norm)) return "ide";
+    if (/\/\.gemini\/antigravity-cli(?:\/|$)/.test(norm)) return "cli";
+    if (/\/\.gemini\/antigravity(?:\/|$)/.test(norm)) return "app";
+  }
+  return "unknown";
 }
 
 export function isUiOnlyMode(env = process.env) {

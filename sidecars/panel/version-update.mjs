@@ -24,6 +24,7 @@ const REQUIRED_FILES = [
   `${SIDECAR_REL_DIR}/api-handler.mjs`,
   `${SIDECAR_REL_DIR}/index.html`,
   "hooks/session-start.mjs",
+  "hooks/pre-tool-use.mjs",
   "hooks/post-tool-use.mjs",
   "hooks/pre-invocation.mjs",
   "hooks/stop.mjs",
@@ -221,6 +222,23 @@ export async function resolveInstalledRoot(
     throw new UpdateError("notInstalled");
   }
 
+  // Never overwrite a Marketplace / `agy plugin install` host-managed plugin directory.
+  if (isStandardPluginSlot) {
+    const configPath = join(dirname(dirname(canonical)), "config.json");
+    const cfgSt = await safeLstat(configPath);
+    if (cfgSt?.isFile() && !cfgSt.isSymbolicLink()) {
+      try {
+        const cfg = JSON.parse((await readFile(configPath, "utf8")).replace(/^\uFEFF/, ""));
+        const entry = cfg?.plugins?.[PLUGIN_NAME];
+        if (entry && typeof entry === "object" && entry.installedFrom) {
+          throw new UpdateError("managedByHost");
+        }
+      } catch (err) {
+        if (err instanceof UpdateError) throw err;
+      }
+    }
+  }
+
   // For custom/non-standard roots, walk ancestors below $HOME/fsRoot to protect monorepo checkouts,
   // while avoiding false positives when a user keeps a $HOME/.git dotfiles repository.
   if (!isStandardPluginSlot) {
@@ -240,26 +258,63 @@ export async function resolveInstalledRoot(
   return canonical;
 }
 
-function preserveWindowsSidecarCommand(sidecarBuf, installedSidecar) {
+export function shouldPreserveExecutableMode(relPath, bytes) {
+  if (typeof relPath === "string" && relPath.endsWith(".sh")) return true;
+  if (bytes && bytes.length >= 2 && bytes[0] === 0x23 && bytes[1] === 0x21) return true;
+  return false;
+}
+
+export function preservePinnedNodeCommand(sidecarBuf, installedSidecar) {
   const { command } = installedSidecar || {};
-  if (typeof command === "string" && win32.isAbsolute(command)) {
-    const executable = win32.basename(command).toLowerCase();
-    const parsedRoot = win32.parse(command).root;
-    if (executable === "node.exe" && parsedRoot.length > 1 && !command.startsWith("\\\\")) {
-      try {
-        const sidecar = JSON.parse(sidecarBuf.toString("utf8"));
-        sidecar.command = command;
-        return Buffer.from(JSON.stringify(sidecar, null, 2) + "\n", "utf8");
-      } catch {
-        // Keep archive sidecar.json as-is
-      }
+  if (typeof command !== "string" || !command || /[\x00-\x1f\r\n]/.test(command)) {
+    return sidecarBuf;
+  }
+  const isWindowsNode =
+    win32.isAbsolute(command) &&
+    win32.basename(command).toLowerCase() === "node.exe" &&
+    win32.parse(command).root.length > 1 &&
+    !command.startsWith("\\\\");
+  const isPosixNode =
+    posix.isAbsolute(command) &&
+    !command.startsWith("//") &&
+    posix.basename(command) === "node";
+  if (isWindowsNode || isPosixNode) {
+    try {
+      const sidecar = JSON.parse(sidecarBuf.toString("utf8"));
+      sidecar.command = command;
+      return Buffer.from(JSON.stringify(sidecar, null, 2) + "\n", "utf8");
+    } catch {
+      // Keep archive sidecar.json as-is
     }
   }
   return sidecarBuf;
 }
 
+const ALLOWED_VERIFIER_KEYS = new Set([
+  "name",
+  "description",
+  "mainAgent",
+  "subagent",
+  "model",
+  "inheritMcp",
+  "inheritCustomizations",
+  "tools",
+  "commandExecutionPolicy"
+]);
+const ALLOWED_VERIFIER_MODELS = new Set(["inherit", "flash", "flash_lite", "pro"]);
+const ALLOWED_VERIFIER_READONLY_TOOLS = new Set([
+  "read_file",
+  "view_file",
+  "grep_search",
+  "find_by_name",
+  "list_dir",
+  "send_message"
+]);
+
 /**
- * Validate bundled `agents/cmd-verifier.md` read-only role frontmatter (mirrors setup_auto_router.py).
+ * Validate bundled `agents/cmd-verifier.md` read-only security invariants (mirrors setup_auto_router.py).
+ * Allows safe read-only tool subsets and optional `commandExecutionPolicy: off` while blocking
+ * write, shell, MCP, or unknown frontmatter fields.
  */
 export function isValidVerifierRole(raw) {
   const text = String(raw || "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
@@ -274,24 +329,36 @@ export function isValidVerifierRole(raw) {
     const idx = line.indexOf(": ");
     if (idx <= 0) return false;
     const key = line.slice(0, idx);
-    if (Object.prototype.hasOwnProperty.call(fields, key)) return false;
-    fields[key] = line.slice(idx + 2);
+    if (!ALLOWED_VERIFIER_KEYS.has(key) || Object.prototype.hasOwnProperty.call(fields, key)) {
+      return false;
+    }
+    fields[key] = line.slice(idx + 2).trim();
   }
-  const description = fields.description || "";
-  delete fields.description;
-  const required = {
-    name: "cmd-verifier",
-    mainAgent: "false",
-    subagent: "true",
-    model: "inherit",
-    inheritMcp: "false",
-    inheritCustomizations: "true",
-    tools: '["read_file"]'
-  };
-  if (!description || lines.length !== Object.keys(required).length + 1) return false;
-  if (Object.keys(fields).length !== Object.keys(required).length) return false;
-  for (const [k, v] of Object.entries(required)) {
-    if (fields[k] !== v) return false;
+  if (!fields.description) return false;
+  if (fields.name !== "cmd-verifier") return false;
+  if (fields.mainAgent !== "false") return false;
+  if (fields.subagent !== "true") return false;
+  if (fields.inheritMcp !== "false") return false;
+  if (fields.inheritCustomizations !== "true" && fields.inheritCustomizations !== "false") return false;
+  if (!ALLOWED_VERIFIER_MODELS.has(fields.model)) return false;
+  if (
+    Object.prototype.hasOwnProperty.call(fields, "commandExecutionPolicy") &&
+    fields.commandExecutionPolicy !== "off"
+  ) {
+    return false;
+  }
+  let tools;
+  try {
+    tools = JSON.parse(fields.tools || "");
+  } catch {
+    return false;
+  }
+  if (
+    !Array.isArray(tools) ||
+    tools.length === 0 ||
+    !tools.every((t) => typeof t === "string" && ALLOWED_VERIFIER_READONLY_TOOLS.has(t))
+  ) {
+    return false;
   }
   return true;
 }
@@ -302,6 +369,9 @@ function isValidHooksManifest(hooks) {
   if (!spec || typeof spec !== "object" || Array.isArray(spec)) return false;
   for (const ev of ["SessionStart", "PostToolUse", "PreInvocation", "Stop"]) {
     if (!Array.isArray(spec[ev]) || spec[ev].length === 0) return false;
+  }
+  if (spec.PreToolUse !== undefined && (!Array.isArray(spec.PreToolUse) || spec.PreToolUse.length === 0)) {
+    return false;
   }
   return true;
 }
@@ -405,7 +475,7 @@ function prepareReleaseFiles(archiveFiles, expectedVersion, context = {}) {
 
   selectedFiles.set(
     SIDECAR_MANIFEST,
-    preserveWindowsSidecarCommand(selectedFiles.get(SIDECAR_MANIFEST), context.installedSidecar)
+    preservePinnedNodeCommand(selectedFiles.get(SIDECAR_MANIFEST), context.installedSidecar)
   );
   return selectedFiles;
 }
@@ -691,7 +761,11 @@ export function createPluginUpdater({
         stagedFile = relPath;
         const destination = join(stageDir, relPath);
         await mkdir(dirname(destination), { recursive: true });
-        await writeFile(destination, bytes, { flag: "wx" });
+        const writeOpts =
+          process.platform !== "win32" && shouldPreserveExecutableMode(relPath, bytes)
+            ? { flag: "wx", mode: 0o755 }
+            : { flag: "wx" };
+        await writeFile(destination, bytes, writeOpts);
       }
 
       step = "replace";

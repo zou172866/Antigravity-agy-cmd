@@ -7,6 +7,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 import {
+  detectHostSurface,
   extractActiveSlashCommands,
   isSubagentPayload,
   resolveStateDir,
@@ -17,17 +18,19 @@ import {
 import {
   classifyToolEvents,
   evaluatePreInvocation,
+  evaluatePreToolUse,
   evaluateStop,
   unwrapCliFilterCommand
 } from "../hooks/lib/detector.mjs";
 import { maybeGcStaleSessions, readEvents, readState } from "../hooks/lib/state.mjs";
 import { inspectTranscriptTail, isSubagentTranscript } from "../hooks/lib/transcript.mjs";
 import { runSessionStart } from "../hooks/session-start.mjs";
+import { runPreToolUse } from "../hooks/pre-tool-use.mjs";
 import { runPostToolUse } from "../hooks/post-tool-use.mjs";
 import { runPreInvocation } from "../hooks/pre-invocation.mjs";
 import { runStop } from "../hooks/stop.mjs";
 import { readSettings, updateSettings } from "../hooks/lib/settings.mjs";
-import { planPreferences } from "../hooks/lib/plan-verification.mjs";
+import { planPreferences, requestedProjectCheck } from "../hooks/lib/plan-verification.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PLUGIN_ROOT = path.resolve(__dirname, "..");
@@ -83,7 +86,8 @@ test("approved free plan prompts once after a real native edit and shares the re
   await f.edit(3);
   assert.deepEqual(await f.pre(), {});
   for (const extra of [{ terminationReason: "USER_CANCELED" }, { fullyIdle: false }, { terminationReason: "UNKNOWN" },
-    { terminationReason: "MAX_INVOCATIONS" }, { lastUserInput: "/goal" }, { executionNum: 1 }]) {
+    { terminationReason: "MAX_INVOCATIONS" }, { terminationReason: "MAX_STEPS_EXCEEDED" },
+    { lastUserInput: "/goal" }, { executionNum: 1, continuationActive: true }]) {
     assert.deepEqual(await f.stop(extra), { decision: "allow" });
   }
   const verdict = await f.stop({ terminationReason: "model_stop" });
@@ -1705,6 +1709,12 @@ test("hooks.json cross-workspace bootstrapper executes all 4 hooks cleanly from 
   for (const [evName, cmdStr, payload, checkFn] of [
     ["SessionStart", spec.SessionStart[0].command, { conversationId: "xcwd-1" }, (o) => typeof o === "object"],
     [
+      "PreToolUse",
+      spec.PreToolUse[0].hooks[0].command,
+      { conversationId: "xcwd-1", toolCall: { name: "exit_plan_mode", args: {} } },
+      (o) => o.decision === "allow"
+    ],
+    [
       "PostToolUse",
       spec.PostToolUse[0].hooks[0].command,
       { conversationId: "xcwd-1", toolCall: { name: "run_command", args: { CommandLine: "pytest" } }, error: "exit 1" },
@@ -2446,4 +2456,338 @@ test("Paid Boost requires 3 edit<->fail oscillations (leaving Orchestrator 2-fai
   );
   assert.equal(paidAt3.reasonCode, "auto_boost");
   assert.match(paidAt3.injectStep.systemMessage.systemMessage, /TypeName='DeepCoder'/);
+});
+
+test("P0-1: delivery test gate and free plan attribute run_command without payload.cwd or args.Cwd (and decode file:// URIs)", async (t) => {
+  const dir = makeTmpDir("agy-cmd-nocwd-");
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const workspace = path.join(dir, "repo");
+  const subpkg = path.join(workspace, "subpkg");
+  fs.mkdirSync(subpkg, { recursive: true });
+  fs.writeFileSync(path.join(workspace, "package.json"), JSON.stringify({ name: "root", scripts: { test: "node --test" } }));
+  fs.writeFileSync(path.join(subpkg, "package.json"), JSON.stringify({ name: "sub", scripts: { test: "node --test" } }));
+  const stateDir = path.join(dir, "state");
+  const env = makeEnv(stateDir);
+  updateSettings(stateDir, { deliveryTestGateEnabled: true, autoRetryMode: "count", autoRetryMax: 3 });
+
+  const txPath = path.join(dir, "transcript.jsonl");
+  fs.writeFileSync(txPath, JSON.stringify({ step_index: 0, type: "USER_INPUT", content: "修一下逻辑" }) + "\n");
+  // Real Antigravity App payload: NO `cwd` field, and `run_command` has NO `Cwd` arg
+  const baseNoCwd = { conversationId: "nocwd-1", workspacePaths: [workspace], transcriptPath: txPath };
+  await runPreInvocation({ ...baseNoCwd, invocationNum: 0, initialNumSteps: 1, lastUserInput: "修一下逻辑" }, env);
+  await runPostToolUse(
+    {
+      ...baseNoCwd,
+      stepIdx: 1,
+      toolCall: {
+        name: "edit_file",
+        args: { Path: path.join(workspace, "index.js"), Target: "return 1;", Replacement: "return 2;" }
+      },
+      toolResponse: "Made 1 replacement in index.js at line 1."
+    },
+    env
+  );
+  // Running `npm test` without args.Cwd or payload.cwd must clear root scope cleanly
+  await runPostToolUse(
+    {
+      ...baseNoCwd,
+      stepIdx: 2,
+      toolCall: { name: "run_command", args: { CommandLine: "npm test" } },
+      toolResponse: "Command exited with code 0."
+    },
+    env
+  );
+  assert.deepEqual(
+    await runStop({ ...baseNoCwd, terminationReason: "model_stop", fullyIdle: true }, env),
+    { decision: "allow" }
+  );
+
+  // Relative `cd subpkg && npm test` without cwd/Cwd must also attribute to subpkg
+  await runPostToolUse(
+    {
+      ...baseNoCwd,
+      stepIdx: 3,
+      toolCall: {
+        name: "edit_file",
+        args: { Path: new URL(`file:///${path.join(subpkg, "a.js").replace(/\\/g, "/").replace(/^\/+/, "")}`).href, Target: "const a = 1;", Replacement: "const a = 2;" }
+      },
+      toolResponse: "Made 1 replacement in a.js at line 1."
+    },
+    env
+  );
+  const blocked = await runStop({ ...baseNoCwd, terminationReason: "model_stop", fullyIdle: true }, env);
+  assert.equal(blocked.decision, "continue");
+  assert.match(blocked.reason, /交付测试门禁.*subpkg/);
+
+  await runPostToolUse(
+    {
+      ...baseNoCwd,
+      stepIdx: 4,
+      toolCall: { name: "run_command", args: { CommandLine: "cd subpkg && npm test" } },
+      toolResponse: "Command exited with code 0."
+    },
+    env
+  );
+  assert.deepEqual(
+    await runStop({ ...baseNoCwd, terminationReason: "model_stop", fullyIdle: true }, env),
+    { decision: "allow" }
+  );
+});
+
+test("P0-2 & P0-3: Stop auto-retry works on official model_stop, blocks max_steps_exceeded, and handles 1-based executionNum accurately", () => {
+  const settings3 = { autoRetryMode: "count", autoRetryMax: 3, deliveryTestGateEnabled: false };
+  const settings1 = { autoRetryMode: "count", autoRetryMax: 1, deliveryTestGateEnabled: false };
+  const failEvs = (ts) => [
+    { ts: ts - 10, kind: "edit", files: ["src/a.js"], applied: true },
+    { ts, kind: "cmd", cmd: "npm test", failed: true, isVerify: true, terminal: true }
+  ];
+
+  // Official `model_stop` triggers `auto_continue` under default settings (gate OFF)
+  const r1 = evaluateStop(
+    { terminationReason: "model_stop", executionNum: 1, fullyIdle: true, lastUserInput: "修好测试" },
+    failEvs(1000),
+    null,
+    { settings: settings3 }
+  );
+  assert.equal(r1.decision, "continue");
+  assert.equal(r1.reasonCode, "auto_continue");
+  assert.match(r1.reason, /1\/3/);
+
+  // 1-based executionNum continues for 2/3, 3/3, and stops on 4th attempt
+  const r2 = evaluateStop(
+    { terminationReason: "model_stop", executionNum: 2, fullyIdle: true, lastUserInput: "修好测试" },
+    [...failEvs(1000), ...failEvs(2000)],
+    r1.nextState,
+    { settings: settings3 }
+  );
+  assert.equal(r2.decision, "continue");
+  assert.match(r2.reason, /2\/3/);
+
+  const r3 = evaluateStop(
+    { terminationReason: "model_stop", executionNum: 3, fullyIdle: true, lastUserInput: "修好测试" },
+    [...failEvs(1000), ...failEvs(2000), ...failEvs(3000)],
+    r2.nextState,
+    { settings: settings3 }
+  );
+  assert.equal(r3.decision, "continue");
+  assert.match(r3.reason, /3\/3/);
+
+  const r4 = evaluateStop(
+    { terminationReason: "model_stop", executionNum: 4, fullyIdle: true, lastUserInput: "修好测试" },
+    [...failEvs(1000), ...failEvs(2000), ...failEvs(3000), ...failEvs(4000)],
+    r3.nextState,
+    { settings: settings3 }
+  );
+  assert.equal(r4.decision, "allow");
+  assert.equal(r4.reasonCode, "retry_limit_reached");
+
+  // With autoRetryMax=1, 1-based first attempt (executionNum: 1, no continuationActive) still gets its 1 retry
+  const oneShot = evaluateStop(
+    { terminationReason: "model_stop", executionNum: 1, fullyIdle: true, lastUserInput: "修好测试" },
+    failEvs(1000),
+    null,
+    { settings: settings1 }
+  );
+  assert.equal(oneShot.decision, "continue");
+  assert.match(oneShot.reason, /1\/1/);
+
+  // Official `max_steps_exceeded` is always allowed to stop immediately
+  const maxSteps = evaluateStop(
+    { terminationReason: "max_steps_exceeded", executionNum: 1, fullyIdle: true, lastUserInput: "修好测试" },
+    failEvs(1000),
+    null,
+    { settings: settings3 }
+  );
+  assert.equal(maxSteps.decision, "allow");
+  assert.equal(maxSteps.reasonCode, "term_max_steps_exceeded");
+});
+
+test("P1-1: PreToolUse deterministically gates exit_plan_mode with force_ask after read-only Plan Mode denial until approved", async (t) => {
+  const dir = makeTmpDir("agy-cmd-pretool-");
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const stateDir = path.join(dir, "state");
+  const env = makeEnv(stateDir);
+  const txPath = path.join(dir, "transcript.jsonl");
+  const baseRows = [
+    { step_index: 0, type: "USER_INPUT", content: "重构三个模块，先出方案" },
+    {
+      step_index: 1,
+      type: "PLANNER_RESPONSE",
+      content: "先写方案产物",
+      tool_calls: [{ name: "write_file", args: { Path: "/tmp/brain/implementation_plan.md", ArtifactMetadata: { RequestFeedback: true } } }]
+    },
+    {
+      step_index: 2,
+      type: "GENERIC",
+      status: "ERROR",
+      error: "tool call denied by pre-tool hook: Plan mode is on, and write_file changes the workspace. Plan mode is read-only: finish the plan and call exit_plan_mode with it.",
+      content: "tool call denied by pre-tool hook: Plan mode is on, and write_file changes the workspace."
+    }
+  ];
+  fs.writeFileSync(txPath, baseRows.map((r) => JSON.stringify(r)).join("\n") + "\n");
+
+  // Unapproved exit_plan_mode after Plan Mode denial -> force_ask
+  const gated = await runPreToolUse(
+    {
+      conversationId: "pt-1",
+      transcriptPath: txPath,
+      toolCall: { name: "exit_plan_mode", args: {} },
+      lastUserInput: "重构三个模块，先出方案"
+    },
+    env
+  );
+  assert.equal(gated.decision, "force_ask");
+  assert.match(gated.reason, /exit_plan_mode/);
+
+  // Non-target tool always passes immediately
+  const otherTool = await runPreToolUse(
+    { conversationId: "pt-1", transcriptPath: txPath, toolCall: { name: "read_file", args: {} } },
+    env
+  );
+  assert.deepEqual(otherTool, { decision: "allow" });
+
+  // After user explicitly approves inline plan -> allow
+  fs.appendFileSync(
+    txPath,
+    [
+      JSON.stringify({ step_index: 3, type: "PLANNER_RESPONSE", content: "[agy-cmd → /plan 审批]\n方案如下。" }),
+      JSON.stringify({ step_index: 4, type: "USER_INPUT", content: "按计划执行" })
+    ].join("\n") + "\n"
+  );
+  const approved = await runPreToolUse(
+    {
+      conversationId: "pt-1",
+      transcriptPath: txPath,
+      toolCall: { name: "exit_plan_mode", args: {} },
+      lastUserInput: "按计划执行"
+    },
+    env
+  );
+  assert.deepEqual(approved, { decision: "allow" });
+
+  // Disabled planFallbackEnabled -> allow
+  const evalOff = evaluatePreToolUse(
+    { toolCall: { name: "exit_plan_mode", args: {} } },
+    [],
+    null,
+    { settings: { planFallbackEnabled: false }, transcriptTail: { latestPlanModeDenial: { key: "tx:2" } } }
+  );
+  assert.equal(evalOff.decision, "allow");
+});
+
+test("P1-2 & P1-3: surface detection omits sidecar:// in IDE/CLI, GEMINI_HOME resolves stateDir, and v2.35.1 mid-turn restart does not double-count turns", async (t) => {
+  assert.equal(detectHostSurface({ transcriptPath: "/home/u/.gemini/antigravity/brain/c1/.system_generated/logs/transcript.jsonl" }), "app");
+  assert.equal(detectHostSurface({ transcriptPath: "C:\\Users\\u\\.gemini\\antigravity-ide\\brain\\c1\\transcript.jsonl" }), "ide");
+  assert.equal(detectHostSurface({ artifactDirectoryPath: "/home/u/.gemini/antigravity-cli/brain/c1" }), "cli");
+  assert.equal(detectHostSurface({ conversationId: "c1" }), "unknown");
+
+  const customGeminiHome = path.join(os.tmpdir(), "agy-custom-home");
+  assert.equal(
+    resolveStateDir({ GEMINI_HOME: customGeminiHome }),
+    path.join(path.resolve(customGeminiHome), ".gemini", "antigravity", "plugin_data", "agy-cmd")
+  );
+  assert.equal(
+    resolveStateDir({ GEMINI_HOME: path.join(customGeminiHome, ".gemini") }),
+    path.join(path.resolve(customGeminiHome), ".gemini", "antigravity", "plugin_data", "agy-cmd")
+  );
+
+  // IDE SessionStart emits CLI hint without broken sidecar:// link
+  const dir = makeTmpDir("agy-cmd-surface-");
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const ideState = path.join(dir, "ide-state");
+  const ideOut = await runSessionStart(
+    {
+      conversationId: "ide-c1",
+      workspacePaths: [dir],
+      artifactDirectoryPath: "/home/u/.gemini/antigravity-ide/brain/ide-c1"
+    },
+    makeEnv(ideState)
+  );
+  const ideMsg = ideOut.injectSteps?.[0]?.systemMessage?.systemMessage || "";
+  assert.doesNotMatch(ideMsg, /sidecar:\/\//);
+  assert.match(ideMsg, /setup_auto_router\.py/);
+
+  // PreInvocation auto_retry_armed adapts hint for CLI surface
+  const cliPre = evaluatePreInvocation(
+    {
+      invocationNum: 0,
+      initialNumSteps: 1,
+      lastUserInput: "帮我一直修到全部测试通过",
+      artifactDirectoryPath: "/home/u/.gemini/antigravity-cli/brain/cli-c1"
+    },
+    [],
+    null,
+    { settings: { autoRetryMode: "count", autoRetryMax: 3 } }
+  );
+  assert.equal(cliPre.reasonCode, "auto_retry_armed");
+  assert.match(cliPre.injectStep.systemMessage.systemMessage, /setup_auto_router\.py/);
+
+  // v2.35.1 restart auto-resume before first PLANNER_RESPONSE: same latestUserInputKey must NOT bump userTurnCount / debugTurnStreak
+  const turn1 = evaluatePreInvocation(
+    { invocationNum: 0, initialNumSteps: 1, lastUserInput: "帮我修一下这个报错" },
+    [],
+    null,
+    {
+      transcriptTail: {
+        latestUserInput: "帮我修一下这个报错",
+        latestUserInputKey: "step:0",
+        hasPlannerResponseSinceUserInput: false,
+        hasBgTaskCompletionSinceUserInput: false
+      }
+    }
+  );
+  assert.equal(turn1.nextState.userTurnCount, 1);
+  assert.equal(turn1.nextState.debugTurnStreak, 1);
+
+  const resumed = evaluatePreInvocation(
+    { invocationNum: 0, initialNumSteps: 2, lastUserInput: "帮我修一下这个报错" },
+    [],
+    turn1.nextState,
+    {
+      transcriptTail: {
+        latestUserInput: "帮我修一下这个报错",
+        latestUserInputKey: "step:0",
+        hasPlannerResponseSinceUserInput: false,
+        hasBgTaskCompletionSinceUserInput: false
+      }
+    }
+  );
+  assert.equal(resumed.nextState.userTurnCount, 1);
+  assert.equal(resumed.nextState.debugTurnStreak, 1);
+  assert.equal(resumed.injectStep, null);
+});
+
+test("P1-6: requestedProjectCheck recognizes static checks & && chains, and no_progress_guard ignores read-only cmds on failure retry", () => {
+  const ws = path.resolve(os.tmpdir(), "ws-static");
+  assert.deepEqual(requestedProjectCheck("验证命令：`tsc --noEmit`", [ws]), {
+    scope: ws,
+    command: "tsc --noEmit"
+  });
+  assert.deepEqual(requestedProjectCheck("请用 `npm run typecheck && npm test` 验收", [ws]), {
+    scope: ws,
+    command: "npm run typecheck && npm test"
+  });
+
+  // Failure auto-retry: running only read-only `git status` after continuation triggers no_progress_guard
+  const settings = { autoRetryMode: "count", autoRetryMax: 3, deliveryTestGateEnabled: false };
+  const initialEvents = [
+    { ts: 1000, kind: "edit", files: ["src/a.js"], applied: true },
+    { ts: 1010, kind: "cmd", cmd: "npm test", failed: true, isVerify: true, terminal: true }
+  ];
+  const c1 = evaluateStop(
+    { terminationReason: "model_stop", executionNum: 1, fullyIdle: true, lastUserInput: "修好测试" },
+    initialEvents,
+    null,
+    { settings }
+  );
+  assert.equal(c1.decision, "continue");
+
+  const c2 = evaluateStop(
+    { terminationReason: "model_stop", executionNum: 2, fullyIdle: true, lastUserInput: "修好测试" },
+    [...initialEvents, { ts: 1050, kind: "cmd", cmd: "git status", failed: false, isReadOnlyCmd: true }],
+    c1.nextState,
+    { settings }
+  );
+  assert.equal(c2.decision, "allow");
+  assert.equal(c2.reasonCode, "no_progress_guard");
 });
