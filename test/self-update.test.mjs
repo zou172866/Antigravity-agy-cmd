@@ -1983,3 +1983,34 @@ test("P1 Batch C · U1: pre/post SHA-256 asset display and oldest-supported (2.2
   assert.match(html, /待校验资产：/);
   assert.match(html, /已通过 SHA-256 校验/);
 });
+
+test("P2 · M1: single-source version check passes and JS verifier/custom-command validators match shared parity fixtures", async () => {
+  const { execFileSync } = await import("node:child_process");
+  const { inspectCustomCheckCommand } = await import("../hooks/lib/plan-verification.mjs");
+  const syncScript = path.join(REPO_ROOT, "scripts/sync-version.mjs");
+  if (fs.existsSync(syncScript)) {
+    const syncOut = execFileSync(process.execPath, [syncScript, "--check"], {
+      encoding: "utf8"
+    });
+    assert.match(syncOut, /OK: all \d+ version targets match/);
+  }
+
+  const fixtures = JSON.parse(
+    fs.readFileSync(path.join(REPO_ROOT, "test/fixtures/parity-samples.json"), "utf8")
+  );
+  for (const sample of fixtures.verifierRoleSamples) {
+    assert.equal(isValidVerifierRole(sample.content), sample.valid, `Verifier parity mismatch: ${sample.name}`);
+  }
+  for (const sample of fixtures.customCommandSamples) {
+    const res = inspectCustomCheckCommand(sample.cmd);
+    assert.equal(res.ok, sample.valid, `Custom command parity mismatch: ${sample.cmd}`);
+  }
+
+  // Verify 3-layer detector architecture DAG exports cleanly without circular dependencies
+  const facts = await import("../hooks/lib/detector-facts.mjs");
+  const ledger = await import("../hooks/lib/detector-ledger.mjs");
+  const detector = await import("../hooks/lib/detector.mjs");
+  assert.equal(detector.classifyToolEvents, facts.classifyToolEvents);
+  assert.equal(detector.unwrapCliFilterCommand, facts.unwrapCliFilterCommand);
+  assert.equal(detector.reconcileEventsWithTranscript, ledger.reconcileEventsWithTranscript);
+});

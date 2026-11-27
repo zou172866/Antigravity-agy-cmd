@@ -1052,3 +1052,39 @@ test("P1 Batch C · Panel exposes stratified Stop outcome & hostDiagnostics", as
   assert.equal(st2.body.activeSession?.lastStopOutcome?.exitReason, "no_progress_guard");
   assert.match(st2.body.activeSession?.lastStopOutcome?.exitReasonZh || "", /无新进展/);
 });
+
+test("P2 · S2 P2 Standalone HTTP CSP: emits per-request script nonce CSP header matching inline script without breaking API saves", async (t) => {
+  const dir = makeTmpDir("agy-cmd-p2-csp-");
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const csrf = "csp-test-csrf-token";
+  const server = createStandaloneServer({ stateDir: dir, csrfToken: csrf });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  const port = server.address().port;
+  const base = `http://127.0.0.1:${port}`;
+
+  const r1 = await fetch(`${base}/`);
+  assert.equal(r1.status, 200);
+  const csp1 = r1.headers.get("content-security-policy") || "";
+  const html1 = await r1.text();
+  const m1 = /script-src\s+'self'\s+'nonce-([A-Za-z0-9+/=_-]+)'/.exec(csp1);
+  assert.ok(m1, `Expected script-src nonce in CSP header, got: ${csp1}`);
+  assert.match(csp1, /object-src\s+'none'/);
+  assert.match(csp1, /frame-ancestors\s+'none'/);
+  assert.ok(html1.includes(`<script nonce="${m1[1]}">`), "Inline script tag must carry matching CSP nonce");
+  assert.ok(html1.includes('<script src="/preload.js"></script>'), "Preload script tag must remain intact");
+
+  const r2 = await fetch(`${base}/`);
+  const csp2 = r2.headers.get("content-security-policy") || "";
+  const m2 = /script-src\s+'self'\s+'nonce-([A-Za-z0-9+/=_-]+)'/.exec(csp2);
+  assert.ok(m2 && m2[1] !== m1[1], "Each GET / request must receive a fresh random CSP nonce");
+
+  // Settings save still works cleanly under standalone HTTP mode
+  const saveRes = await fetch(`${base}/api/settings`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Agy-Cmd-Csrf": csrf },
+    body: JSON.stringify({ autoRetryMax: 6 })
+  });
+  assert.equal(saveRes.status, 200);
+  assert.equal((await saveRes.json()).settings.autoRetryMax, 6);
+});

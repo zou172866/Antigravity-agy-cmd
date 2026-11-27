@@ -25,9 +25,11 @@ App（含 SSH 转发）点击 **[agy-cmd 自动路由](sidecar://agy-cmd/panel/)
 python3 scripts/setup_auto_router.py --auto-retry off|5|infinite
 python3 scripts/setup_auto_router.py --retry-scope smart
 
-# 账号套餐与 Boost 开关（free 默认防报错 / paid 开启）
+# 账号套餐、Boost、降级保护与统计清零（free 默认防报错 / paid 开启）
 python3 scripts/setup_auto_router.py --plan-tier free
-python3 scripts/setup_auto_router.py --plan-tier paid --boost on|off
+python3 scripts/setup_auto_router.py --plan-tier paid --boost on|off --boost-after-plan-approval on|off
+python3 scripts/setup_auto_router.py --free-fallback on|off --plan-fallback on|off
+python3 scripts/setup_auto_router.py --reset-stats
 
 # 交付前强制测试门禁（默认关，全套餐可用；实质改码后必过全量/自定义验证，无测项目保守放行并声明缺测；单轮「这次跳过测试」豁免）
 python3 scripts/setup_auto_router.py --delivery-test-gate on|off

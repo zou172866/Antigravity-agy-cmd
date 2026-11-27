@@ -60,13 +60,30 @@ function snapshotBackendMtimes() {
   }).join("|");
 }
 
-export function renderPanelHtml(csrfToken = "") {
+export function renderPanelHtml(csrfToken = "", { scriptNonce = "" } = {}) {
   const tpl = fs.readFileSync(HTML_PATH, "utf8");
   const localVer = readLocalVersion();
   const withVersion = localVer
     ? tpl.replace(/<span class="ver-pill">v[^<]*<\/span>/, `<span class="ver-pill">v${localVer}</span>`)
     : tpl;
-  return withVersion.replace(/__AGY_CMD_CSRF__/g, csrfToken);
+  const withToken = withVersion.replace(/__AGY_CMD_CSRF__/g, csrfToken);
+  if (typeof scriptNonce === "string" && /^[A-Za-z0-9+/=_-]{12,64}$/.test(scriptNonce)) {
+    return withToken.replace(/<script>(?=\s*\(\(\)\s*=>)/, `<script nonce="${scriptNonce}">`);
+  }
+  return withToken;
+}
+
+export function buildStandaloneCspHeader(scriptNonce) {
+  return [
+    "default-src 'self'",
+    `script-src 'self' 'nonce-${scriptNonce}'`,
+    "style-src 'self' 'unsafe-inline'",
+    "img-src 'self' data:",
+    "connect-src 'self'",
+    "object-src 'none'",
+    "base-uri 'none'",
+    "frame-ancestors 'none'"
+  ].join("; ");
 }
 
 function readJsonBody(req, maxBytes = MAX_BODY_BYTES) {
@@ -181,9 +198,11 @@ export function createStandaloneServer({
       }
 
       if (req.method === "GET" && url.pathname === "/") {
-        const html = renderPanelHtml(csrfToken);
+        const scriptNonce = crypto.randomBytes(16).toString("base64");
+        const html = renderPanelHtml(csrfToken, { scriptNonce });
         res.writeHead(200, {
           "Content-Type": "text/html; charset=utf-8",
+          "Content-Security-Policy": buildStandaloneCspHeader(scriptNonce),
           ...NO_STORE_HEADERS
         });
         res.end(html);

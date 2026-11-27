@@ -1,0 +1,60 @@
+{
+  "verifierRoleSamples": [
+    {
+      "name": "valid_minimal_readonly",
+      "valid": true,
+      "content": "---\nname: cmd-verifier\ndescription: Read-only verifier.\nmainAgent: false\nsubagent: true\nmodel: inherit\ninheritMcp: false\ninheritCustomizations: true\ntools: [\"read_file\"]\n---\nBody\n"
+    },
+    {
+      "name": "valid_extended_readonly_with_policy_off",
+      "valid": true,
+      "content": "---\nname: cmd-verifier\ndescription: Read-only verifier.\nmainAgent: false\nsubagent: true\nmodel: pro\ncommandExecutionPolicy: off\ninheritMcp: false\ninheritCustomizations: false\ntools: [\"read_file\", \"view_file\", \"grep_search\", \"find_by_name\", \"list_dir\", \"send_message\"]\n---\nBody\n"
+    },
+    {
+      "name": "invalid_write_tool",
+      "valid": false,
+      "content": "---\nname: cmd-verifier\ndescription: Bad.\nmainAgent: false\nsubagent: true\nmodel: inherit\ninheritMcp: false\ninheritCustomizations: true\ntools: [\"read_file\", \"edit_file\"]\n---\nBody\n"
+    },
+    {
+      "name": "invalid_shell_tool",
+      "valid": false,
+      "content": "---\nname: cmd-verifier\ndescription: Bad.\nmainAgent: false\nsubagent: true\nmodel: inherit\ninheritMcp: false\ninheritCustomizations: true\ntools: [\"read_file\", \"run_command\"]\n---\nBody\n"
+    },
+    {
+      "name": "invalid_mcp_inherited",
+      "valid": false,
+      "content": "---\nname: cmd-verifier\ndescription: Bad.\nmainAgent: false\nsubagent: true\nmodel: inherit\ninheritMcp: true\ninheritCustomizations: true\ntools: [\"read_file\"]\n---\nBody\n"
+    },
+    {
+      "name": "invalid_command_policy_auto",
+      "valid": false,
+      "content": "---\nname: cmd-verifier\ndescription: Bad.\nmainAgent: false\nsubagent: true\nmodel: inherit\ncommandExecutionPolicy: auto\ninheritMcp: false\ninheritCustomizations: true\ntools: [\"read_file\"]\n---\nBody\n"
+    },
+    {
+      "name": "invalid_unknown_key",
+      "valid": false,
+      "content": "---\nname: cmd-verifier\ndescription: Bad.\nmainAgent: false\nsubagent: true\nmodel: inherit\nextraFlag: true\ninheritMcp: false\ninheritCustomizations: true\ntools: [\"read_file\"]\n---\nBody\n"
+    },
+    {
+      "name": "invalid_duplicate_key",
+      "valid": false,
+      "content": "---\nname: cmd-verifier\ndescription: Bad.\nmainAgent: false\nsubagent: true\nmodel: inherit\nmodel: flash\ninheritMcp: false\ninheritCustomizations: true\ntools: [\"read_file\"]\n---\nBody\n"
+    }
+  ],
+  "customCommandSamples": [
+    { "cmd": "", "valid": true },
+    { "cmd": "npm test", "valid": true },
+    { "cmd": "cd packages/api && npm run lint && npm test", "valid": true },
+    { "cmd": "c1 && c2 && c3 && c4 && c5 && c6 && c7 && c8", "valid": true },
+    { "cmd": "c1 && c2 && c3 && c4 && c5 && c6 && c7 && c8 && c9", "valid": false },
+    { "cmd": "npm test | tee out.log", "valid": false },
+    { "cmd": "npm test || true", "valid": false },
+    { "cmd": "npm test; echo done", "valid": false },
+    { "cmd": "npm test & echo bg", "valid": false },
+    { "cmd": "npm test && $(whoami)", "valid": false },
+    { "cmd": "npm test && `whoami`", "valid": false },
+    { "cmd": "cd packages/api", "valid": false },
+    { "cmd": "cd - && npm test", "valid": false },
+    { "cmd": "npm test \"unclosed", "valid": false }
+  ]
+}

@@ -33,6 +33,8 @@ const REQUIRED_FILES = [
   "hooks/stop.mjs",
   "hooks/lib/common.mjs",
   "hooks/lib/detector.mjs",
+  "hooks/lib/detector-facts.mjs",
+  "hooks/lib/detector-ledger.mjs",
   "hooks/lib/diagnostics.mjs",
   "hooks/lib/plan-verification.mjs",
   "hooks/lib/settings.mjs",

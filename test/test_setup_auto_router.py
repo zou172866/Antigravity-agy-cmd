@@ -1049,6 +1049,28 @@ class TestStarFollowupCliAndState(unittest.TestCase):
                 self.assertEqual(ps_ok.returncode, 0, ps_ok.stderr + ps_ok.stdout)
                 self.assertTrue((ps_cfg_ok / "plugins" / "agy-cmd" / "plugin.json").is_file())
 
+    def test_p2_shared_parity_fixtures_match_python_validators(self) -> None:
+        fixtures = json.loads((PLUGIN_ROOT / "test" / "fixtures" / "parity-samples.json").read_text(encoding="utf-8"))
+        with tempfile.TemporaryDirectory() as tmp:
+            p_dir = Path(tmp)
+            (p_dir / "agents").mkdir(parents=True, exist_ok=True)
+            role_path = p_dir / "agents" / "cmd-verifier.md"
+            for sample in fixtures["verifierRoleSamples"]:
+                role_path.write_text(sample["content"], encoding="utf-8")
+                issues = router.validate_verifier(p_dir)
+                self.assertEqual(
+                    len(issues) == 0,
+                    sample["valid"],
+                    f"Python verifier parity mismatch on {sample['name']}: {issues}",
+                )
+        for sample in fixtures["customCommandSamples"]:
+            ok, _, err = router.inspect_delivery_test_command(sample["cmd"])
+            self.assertEqual(
+                ok,
+                sample["valid"],
+                f"Python custom command parity mismatch on {sample['cmd']!r}: {err}",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
