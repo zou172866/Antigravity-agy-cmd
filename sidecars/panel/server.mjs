@@ -28,7 +28,12 @@ import {
   timingSafeEqualStr
 } from "./api-handler.mjs";
 import { readLocalVersion, VERSION_ROUTE } from "./version-check.mjs";
-import { hasActiveUpdateMarker, UPDATE_MARKER_NAME, UPDATE_ROUTE } from "./version-update.mjs";
+import {
+  hasActiveUpdateMarker,
+  recoverInterruptedUpdate,
+  UPDATE_MARKER_NAME,
+  UPDATE_ROUTE
+} from "./version-update.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const HTML_PATH = path.join(__dirname, "index.html");
@@ -387,6 +392,16 @@ function shouldUseSidecarSdk(env, hasSidecarApp) {
 async function start() {
   const stateDir = resolveStateDir(process.env);
   const csrfToken = crypto.randomBytes(24).toString("hex");
+  const pluginRoot = path.resolve(__dirname, "../..");
+  let recoveredOnBoot = false;
+  if (fs.existsSync(path.join(pluginRoot, UPDATE_MARKER_NAME))) {
+    try {
+      const rec = await recoverInterruptedUpdate(pluginRoot, { reclaimStale: true });
+      recoveredOnBoot = rec?.status === "recovered";
+    } catch {
+      // Keep running so the panel can surface recovery state instead of crash-looping.
+    }
+  }
 
   let SidecarApp = null;
   let SidecarResponse = null;
@@ -406,6 +421,10 @@ async function start() {
   }
 
   if (shouldUseSidecarSdk(process.env, Boolean(SidecarApp))) {
+    if (recoveredOnBoot) {
+      // Respawn cleanly with the freshly restored module graph via restart_policy: always.
+      process.exit(0);
+    }
     const bootSig = snapshotBackendMtimes();
     const updateMarkerPath = path.join(__dirname, "../..", UPDATE_MARKER_NAME);
     const reloadTimer = setInterval(() => {

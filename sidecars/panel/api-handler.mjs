@@ -14,7 +14,7 @@ import {
   updateAutoUpdateState,
   updateSettings
 } from "../../hooks/lib/settings.mjs";
-import { readState, writeState } from "../../hooks/lib/state.mjs";
+import { readState, withSessionLock, writeState } from "../../hooks/lib/state.mjs";
 import { createVersionChecker, parseVersion, readLocalVersion } from "./version-check.mjs";
 import { createPluginUpdater, evaluateAutoInstallEligibility, verifiedAssetIdentity } from "./version-update.mjs";
 
@@ -269,21 +269,33 @@ export function handleStarPromptMutation(stateDir, rawData) {
       }
     };
   }
-  const res = setStarPromptState(stateDir, stateVal);
-  if (!res.ok) {
+  try {
+    const res = setStarPromptState(stateDir, stateVal);
+    if (!res.ok) {
+      return {
+        status: 400,
+        body: { ok: false, error: res.error }
+      };
+    }
     return {
-      status: 400,
-      body: { ok: false, error: res.error }
+      status: 200,
+      body: {
+        ok: true,
+        starPrompt: res.starPrompt,
+        alreadyResolved: Boolean(res.alreadyResolved)
+      }
+    };
+  } catch (err) {
+    return {
+      status: err?.statusCode || 500,
+      body: {
+        ok: false,
+        error: err?.message || "Failed to update star prompt state",
+        ...(err?.code ? { code: err.code } : {}),
+        ...(err?.retryable ? { retryable: true } : {})
+      }
     };
   }
-  return {
-    status: 200,
-    body: {
-      ok: true,
-      starPrompt: res.starPrompt,
-      alreadyResolved: Boolean(res.alreadyResolved)
-    }
-  };
 }
 
 export async function handleVersionCheck(
@@ -560,21 +572,38 @@ export function dispatchPanelApi(pathname, rawData, { stateDir, defaultConvId = 
     } catch (err) {
       return {
         status: err?.statusCode || 400,
-        body: { ok: false, error: err?.message || "Invalid settings payload" }
+        body: {
+          ok: false,
+          error: err?.message || "Invalid settings payload",
+          ...(err?.code ? { code: err.code } : {}),
+          ...(err?.retryable ? { retryable: true } : {})
+        }
       };
     }
   }
 
   if (pathname === "/api/dismiss-onboarding") {
-    updateSettings(
-      stateDir,
-      { configuredByUser: true, onboardingShown: true },
-      { markConfigured: true }
-    );
-    return {
-      status: 200,
-      body: buildPanelStatePayload(stateDir, convId, { markStarTriggered: false })
-    };
+    try {
+      updateSettings(
+        stateDir,
+        { configuredByUser: true, onboardingShown: true },
+        { markConfigured: true }
+      );
+      return {
+        status: 200,
+        body: buildPanelStatePayload(stateDir, convId, { markStarTriggered: false })
+      };
+    } catch (err) {
+      return {
+        status: err?.statusCode || 500,
+        body: {
+          ok: false,
+          error: err?.message || "Failed to dismiss onboarding",
+          ...(err?.code ? { code: err.code } : {}),
+          ...(err?.retryable ? { retryable: true } : {})
+        }
+      };
+    }
   }
 
   if (pathname === RESUME_NORMAL_SESSION_ROUTE) {
@@ -593,20 +622,34 @@ export function dispatchPanelApi(pathname, rawData, { stateDir, defaultConvId = 
       };
     }
     const safeId = sanitizeConversationId(convId);
-    const st = readState(stateDir, safeId);
-    const stepCandidates = [st.swarmLastActivityStep, st.lastInitialNumSteps, st.swarmClearedAtStep].filter(
-      (n) => Number.isSafeInteger(n) && n >= 0
-    );
-    const clearedAtStep = stepCandidates.length > 0 ? Math.max(...stepCandidates) : null;
-    const clearedAfterKey = st.swarmLastActivityKey || st.swarmClearedAfterKey || "__manual__";
-    writeState(stateDir, safeId, {
-      ...st,
-      swarmActive: false,
-      swarmClearedAfterKey: clearedAfterKey,
-      swarmClearedAtStep: clearedAtStep,
-      boostAlerted: false,
-      boostDetected: false
-    });
+    try {
+      withSessionLock(stateDir, safeId, () => {
+        const st = readState(stateDir, safeId);
+        const stepCandidates = [st.swarmLastActivityStep, st.lastInitialNumSteps, st.swarmClearedAtStep].filter(
+          (n) => Number.isSafeInteger(n) && n >= 0
+        );
+        const clearedAtStep = stepCandidates.length > 0 ? Math.max(...stepCandidates) : null;
+        const clearedAfterKey = st.swarmLastActivityKey || st.swarmClearedAfterKey || "__manual__";
+        writeState(stateDir, safeId, {
+          ...st,
+          swarmActive: false,
+          swarmClearedAfterKey: clearedAfterKey,
+          swarmClearedAtStep: clearedAtStep,
+          boostAlerted: false,
+          boostDetected: false
+        });
+      });
+    } catch (err) {
+      return {
+        status: err?.statusCode || 500,
+        body: {
+          ok: false,
+          error: err?.message || "Failed to resume normal session",
+          ...(err?.code ? { code: err.code } : {}),
+          ...(err?.retryable ? { retryable: true } : {})
+        }
+      };
+    }
     return {
       status: 200,
       body: buildPanelStatePayload(stateDir, convId, { markStarTriggered: false })

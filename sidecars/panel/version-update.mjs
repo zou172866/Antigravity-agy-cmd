@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import { lstatSync, readFileSync } from "node:fs";
 import { lstat, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
@@ -7,6 +8,8 @@ import { downloadArchive, readReleaseArchive, UpdateError } from "./update-archi
 
 export const UPDATE_ROUTE = "/api/update";
 export const UPDATE_MARKER_NAME = ".update-in-progress";
+export const UPDATE_JOURNAL_NAME = "journal.json";
+const UPDATE_WORK_PREFIX = ".agy-cmd-update-";
 
 const PLUGIN_NAME = "agy-cmd";
 const SIDECAR_REL_DIR = "sidecars/panel";
@@ -89,31 +92,79 @@ function defaultIsPidAlive(pid) {
   }
 }
 
+function parseMarkerJson(raw) {
+  try {
+    const parsed = JSON.parse(String(raw || "").replace(/^\uFEFF/, ""));
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return parsed;
+    }
+  } catch {
+    // Legacy plain-text marker format
+  }
+  return null;
+}
+
+function isSafeWorkDirName(name) {
+  return (
+    typeof name === "string" &&
+    name.startsWith(UPDATE_WORK_PREFIX) &&
+    name.length > UPDATE_WORK_PREFIX.length &&
+    name.length <= 96 &&
+    !name.includes("/") &&
+    !name.includes("\\") &&
+    !name.includes("..") &&
+    /^[A-Za-z0-9._-]+$/.test(name)
+  );
+}
+
+function isSafeRelPosixPath(rel) {
+  if (typeof rel !== "string" || !rel || rel.startsWith("/") || rel.includes("\\") || rel.includes("\0")) {
+    return false;
+  }
+  const parts = rel.split("/");
+  return parts.every((part) => part && part !== "." && part !== "..");
+}
+
+async function writeMarkerAtomic(markerPath, record, { exclusive = false } = {}) {
+  const serialized = JSON.stringify(record) + "\n";
+  if (exclusive) {
+    await writeFile(markerPath, serialized, { flag: "wx" });
+    return;
+  }
+  const tmpPath = `${markerPath}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
+  try {
+    await writeFile(tmpPath, serialized, "utf8");
+    await rename(tmpPath, markerPath);
+  } catch (err) {
+    await unlink(tmpPath).catch(() => {});
+    throw err;
+  }
+}
+
 function evaluateMarkerState(
   raw,
   mtimeMs,
   { now = Date.now, staleMs = STALE_MARKER_MS, isPidAlive = defaultIsPidAlive } = {}
 ) {
-  try {
-    const parsed = JSON.parse(String(raw || "").replace(/^\uFEFF/, ""));
-    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-      if (parsed.phase === "recovery") return "recovery";
-      if (Number.isInteger(parsed.pid)) {
-        if (parsed.pid === process.pid) return "active";
-        if (!isPidAlive(parsed.pid)) return "stale";
-        if (Number.isFinite(parsed.startedAt) && now() - parsed.startedAt > staleMs) return "stale";
-        return "active";
-      }
+  const parsed = parseMarkerJson(raw);
+  if (parsed) {
+    if (parsed.phase === "recovery") return "recovery";
+    if (Number.isInteger(parsed.pid)) {
+      const alive = parsed.pid === process.pid || isPidAlive(parsed.pid);
+      const expired = Number.isFinite(parsed.startedAt) && now() - parsed.startedAt > staleMs;
+      if (alive && !expired) return "active";
+      if (parsed.phase === "staging") return "stale";
+      if (parsed.phase === "committed") return "committed_stale";
+      if (parsed.phase === "replacing") return "interrupted";
+      return "stale";
     }
-  } catch {
-    // Legacy plain-text marker format
   }
   return Number.isFinite(mtimeMs) && now() - mtimeMs > staleMs ? "stale" : "active";
 }
 
 /**
- * Synchronous check used by the sidecar auto-reload poller so an active or recovery
- * update marker suppresses reloads while dead-process stale locks do not permanently disable reload.
+ * Synchronous check used by the sidecar auto-reload poller so an active, interrupted, or recovery
+ * update marker suppresses reloads while dead-process staging locks do not permanently disable reload.
  */
 export function hasActiveUpdateMarker(
   markerPath,
@@ -129,31 +180,179 @@ export function hasActiveUpdateMarker(
   try {
     const raw = readFileSync(markerPath, "utf8");
     const state = evaluateMarkerState(raw, st.mtimeMs, { now, staleMs, isPidAlive });
-    return state === "active" || state === "recovery";
+    return state === "active" || state === "recovery" || state === "interrupted";
   } catch {
     return true;
   }
 }
 
-async function checkUpdateMarker(markerPath, markerOptions, reclaimStale = false) {
+async function resolveSiblingWorkDir(root, workDirName) {
+  if (!isSafeWorkDirName(workDirName)) return null;
+  const candidate = join(dirname(root), workDirName);
+  const st = await safeLstat(candidate);
+  if (!st || !st.isDirectory() || st.isSymbolicLink()) return null;
+  return candidate;
+}
+
+async function rollbackFromJournal(root, workDir, journal, move) {
+  const orderedInstall = Array.isArray(journal?.orderedInstall) ? journal.orderedInstall : [];
+  const obsoleteFiles = Array.isArray(journal?.obsoleteFiles) ? journal.obsoleteFiles : [];
+  if (!orderedInstall.every(isSafeRelPosixPath) || !obsoleteFiles.every(isSafeRelPosixPath)) {
+    throw new UpdateError("recovery");
+  }
+  const stageDir = join(workDir, "next");
+  const prevDir = join(workDir, "backup", "prev");
+  const obsoleteDir = join(workDir, "backup", "obsolete");
+  let activePath = "plugin.json";
+
+  try {
+    for (const rel of [...obsoleteFiles].reverse()) {
+      activePath = rel;
+      const saved = join(obsoleteDir, rel);
+      const live = join(root, rel);
+      if ((await safeLstat(saved)) && !(await safeLstat(live))) {
+        await assertNoIntermediateSymlink(root, rel);
+        await mkdir(dirname(live), { recursive: true });
+        await move(saved, live);
+      }
+    }
+
+    for (const rel of [...orderedInstall].reverse()) {
+      activePath = rel;
+      const stageFile = join(stageDir, rel);
+      const prevFile = join(prevDir, rel);
+      const liveFile = join(root, rel);
+      const hasStage = Boolean(await safeLstat(stageFile));
+      const hasPrev = Boolean(await safeLstat(prevFile));
+      const hasLive = Boolean(await safeLstat(liveFile));
+
+      if (!hasStage && hasLive) {
+        await mkdir(dirname(stageFile), { recursive: true });
+        await move(liveFile, stageFile);
+      }
+      if (hasPrev) {
+        const liveAfter = await safeLstat(liveFile);
+        if (!liveAfter) {
+          await assertNoIntermediateSymlink(root, rel);
+          await mkdir(dirname(liveFile), { recursive: true });
+          await move(prevFile, liveFile);
+        }
+      }
+    }
+
+    await removeEmptyDirsRecursive(root, root).catch(() => {});
+
+    if (!journal.freshInstall && journal.previousVersion) {
+      const restoredManifest = await readDiskJson(root, "plugin.json");
+      if (parseVersion(restoredManifest?.version)?.version !== journal.previousVersion) {
+        throw new UpdateError("recovery");
+      }
+    }
+  } catch (err) {
+    throw new InstallError(err, activePath, { recovery: true });
+  }
+}
+
+/**
+ * Inspect `.update-in-progress` and deterministically recover an interrupted update
+ * using its persisted sibling journal & backup directory, or transition explicitly to `recovery`.
+ */
+export async function recoverInterruptedUpdate(
+  root,
+  { markerOptions = {}, move = rename, reclaimStale = true } = {}
+) {
+  const markerPath = join(root, UPDATE_MARKER_NAME);
   const st = await safeLstat(markerPath);
-  if (!st) return;
+  if (!st) return { status: "clean" };
   if (!st.isFile() || st.isSymbolicLink()) {
     throw new UpdateError("pathConflict");
   }
+
   const raw = await readFile(markerPath, "utf8").catch(() => "");
+  const parsed = parseMarkerJson(raw);
   const state = evaluateMarkerState(raw, st.mtimeMs, markerOptions);
-  if (state === "recovery") {
-    throw new UpdateError("recovery");
-  }
+
   if (state === "active") {
     throw new UpdateError("busy");
   }
-  if (reclaimStale) {
+
+  if (state === "stale" || state === "committed_stale") {
+    if (!reclaimStale) {
+      return { status: state };
+    }
+    const workDir = parsed?.workDirName ? await resolveSiblingWorkDir(root, parsed.workDirName) : null;
+    if (workDir) {
+      await rm(workDir, { recursive: true, force: true }).catch(() => {});
+    }
     await unlink(markerPath).catch((err) => {
       if (err?.code !== "ENOENT") throw new InstallError(err, UPDATE_MARKER_NAME);
     });
+    return { status: state === "committed_stale" ? "cleaned_committed" : "cleaned_stale" };
   }
+
+  // `interrupted` (dead-PID replacing) or `recovery` with an intact sibling journal
+  const markerNow = markerOptions.now || Date.now;
+  const workDir = parsed?.workDirName ? await resolveSiblingWorkDir(root, parsed.workDirName) : null;
+  let journal = null;
+  if (workDir) {
+    const journalPath = join(workDir, UPDATE_JOURNAL_NAME);
+    const jSt = await safeLstat(journalPath);
+    if (jSt?.isFile() && !jSt.isSymbolicLink()) {
+      try {
+        const jObj = JSON.parse((await readFile(journalPath, "utf8")).replace(/^\uFEFF/, ""));
+        if (
+          jObj &&
+          typeof jObj === "object" &&
+          !Array.isArray(jObj) &&
+          Array.isArray(jObj.orderedInstall) &&
+          (!parsed.token || jObj.token === parsed.token)
+        ) {
+          journal = jObj;
+        }
+      } catch {}
+    }
+  }
+
+  if (!workDir || !journal) {
+    if (state === "interrupted") {
+      await writeMarkerAtomic(markerPath, {
+        ...(parsed || {}),
+        schemaVersion: 2,
+        pid: process.pid,
+        startedAt: markerNow(),
+        phase: "recovery"
+      }).catch(() => {});
+    }
+    throw new UpdateError("recovery");
+  }
+
+  try {
+    await rollbackFromJournal(root, workDir, journal, move);
+    await unlink(markerPath).catch((err) => {
+      if (err?.code !== "ENOENT") throw err;
+    });
+    await rm(workDir, { recursive: true, force: true }).catch(() => {});
+    return {
+      status: "recovered",
+      restoredVersion: journal.previousVersion || ""
+    };
+  } catch (err) {
+    await writeMarkerAtomic(markerPath, {
+      ...(parsed || {}),
+      schemaVersion: 2,
+      pid: process.pid,
+      startedAt: markerNow(),
+      phase: "recovery",
+      workDirName: parsed.workDirName,
+      journalFile: UPDATE_JOURNAL_NAME
+    }).catch(() => {});
+    throw err instanceof UpdateError ? err : new InstallError(err, UPDATE_MARKER_NAME, { recovery: true });
+  }
+}
+
+async function checkUpdateMarker(markerPath, markerOptions, reclaimStale = false, move = rename) {
+  const root = dirname(markerPath);
+  return recoverInterruptedUpdate(root, { markerOptions, move, reclaimStale });
 }
 
 async function readDiskJson(root, relPath) {
@@ -528,19 +727,37 @@ async function replaceInstalledFiles(
   expectedCurrentVersion,
   selectedRelPaths,
   move,
-  { caseInsensitiveFs = process.platform === "win32" || process.platform === "darwin", markerOptions = {} } = {}
+  {
+    caseInsensitiveFs = process.platform === "win32" || process.platform === "darwin",
+    markerOptions = {},
+    targetVersion = "",
+    workDirName = ""
+  } = {}
 ) {
   await mkdir(backupDir, { recursive: true });
   const markerPath = join(root, UPDATE_MARKER_NAME);
-  await checkUpdateMarker(markerPath, markerOptions, true);
+  await checkUpdateMarker(markerPath, markerOptions, true, move);
 
   const markerNow = markerOptions.now || Date.now;
+  const token = randomBytes(8).toString("hex");
+  const resolvedWorkDirName = workDirName || basename(dirname(stageDir));
+  const workDir = dirname(stageDir);
+  const journalPath = join(workDir, UPDATE_JOURNAL_NAME);
+
+  const baseMarker = {
+    schemaVersion: 2,
+    pid: process.pid,
+    token,
+    source: "sidecar",
+    startedAt: markerNow(),
+    previousVersion: expectedCurrentVersion || "",
+    targetVersion: targetVersion || "",
+    workDirName: resolvedWorkDirName,
+    journalFile: UPDATE_JOURNAL_NAME
+  };
+
   try {
-    await writeFile(
-      markerPath,
-      JSON.stringify({ pid: process.pid, startedAt: markerNow(), phase: "replacing" }) + "\n",
-      { flag: "wx" }
-    );
+    await writeMarkerAtomic(markerPath, { ...baseMarker, phase: "staging" }, { exclusive: true });
   } catch (err) {
     if (err?.code === "EEXIST") throw new UpdateError("busy");
     throw new InstallError(err, UPDATE_MARKER_NAME);
@@ -579,6 +796,30 @@ async function replaceInstalledFiles(
       ...selectedRelPaths.filter((rel) => tail.has(rel))
     ];
 
+    const preexistingPaths = [];
+    for (const rel of orderedInstall) {
+      const existing = await safeLstat(join(root, rel));
+      if (existing) {
+        if (existing.isDirectory()) throw new UpdateError("pathConflict");
+        preexistingPaths.push(rel);
+      }
+    }
+
+    // Persist crash-recovery journal BEFORE transitioning marker to `replacing` and mutating live files.
+    const journalRecord = {
+      schemaVersion: 2,
+      token,
+      source: "sidecar",
+      previousVersion: expectedCurrentVersion || "",
+      targetVersion: targetVersion || "",
+      freshInstall: false,
+      orderedInstall,
+      preexistingPaths,
+      obsoleteFiles
+    };
+    await writeFile(journalPath, JSON.stringify(journalRecord, null, 2) + "\n", "utf8");
+    await writeMarkerAtomic(markerPath, { ...baseMarker, phase: "replacing" });
+
     for (const rel of orderedInstall) {
       activePath = rel;
       const incoming = join(stageDir, rel);
@@ -603,6 +844,7 @@ async function replaceInstalledFiles(
     }
 
     await removeEmptyDirsRecursive(root, root).catch(() => {});
+    await writeMarkerAtomic(markerPath, { ...baseMarker, phase: "committed" });
     activePath = UPDATE_MARKER_NAME;
     await unlink(markerPath);
   } catch (err) {
@@ -617,10 +859,11 @@ async function replaceInstalledFiles(
       activePath = UPDATE_MARKER_NAME;
       await unlink(markerPath);
     } catch (rollbackErr) {
-      await writeFile(
-        markerPath,
-        JSON.stringify({ pid: process.pid, startedAt: markerNow(), phase: "recovery" }) + "\n"
-      ).catch(() => {});
+      await writeMarkerAtomic(markerPath, {
+        ...baseMarker,
+        startedAt: markerNow(),
+        phase: "recovery"
+      }).catch(() => {});
       throw new InstallError(rollbackErr, activePath, { recovery: true });
     }
     throw new InstallError(err, failedPath, { restored });
@@ -723,7 +966,7 @@ export function createPluginUpdater({
 
       step = "inspect";
       const root = await resolveInstalledRoot(sidecarDirectory, { pluginsDirectory, allowCustomRoot });
-      await checkUpdateMarker(join(root, UPDATE_MARKER_NAME), markerOptions);
+      await checkUpdateMarker(join(root, UPDATE_MARKER_NAME), markerOptions, false, move);
       const localManifest = await readDiskJson(root, "plugin.json");
       const currentVersion = parseVersion(localManifest?.version)?.version;
       if (!currentVersion || localManifest?.name !== PLUGIN_NAME) {
@@ -774,7 +1017,7 @@ export function createPluginUpdater({
       });
 
       step = "stage";
-      workDir = await mkdtemp(join(dirname(root), ".agy-cmd-update-"));
+      workDir = await mkdtemp(join(dirname(root), UPDATE_WORK_PREFIX));
       const stageDir = join(workDir, "next");
       for (const [relPath, bytes] of selectedFiles) {
         stagedFile = relPath;
@@ -795,7 +1038,12 @@ export function createPluginUpdater({
         currentVersion,
         Array.from(selectedFiles.keys()),
         move,
-        { caseInsensitiveFs, markerOptions }
+        {
+          caseInsensitiveFs,
+          markerOptions,
+          targetVersion: releaseParsed.version,
+          workDirName: basename(workDir)
+        }
       );
 
       return {

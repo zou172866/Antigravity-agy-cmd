@@ -46,8 +46,10 @@ import {
   hasActiveUpdateMarker,
   isValidVerifierRole,
   preservePinnedNodeCommand,
+  recoverInterruptedUpdate,
   resolveInstalledRoot,
   shouldPreserveExecutableMode,
+  UPDATE_JOURNAL_NAME,
   UPDATE_MARKER_NAME,
   UPDATE_ROUTE
 } from "../sidecars/panel/version-update.mjs";
@@ -591,10 +593,10 @@ test("version-update: atomic ZIP & TAR.GZ self-update, case-insensitive FS, roll
     const nextSha = sha256Hex(nextZip);
     const assetUrl = `https://github.com/${REPO}/releases/download/v2.5.0/agy-cmd-v2.5.0.zip`;
 
-    // Plant a dead-PID orphan lock to verify automatic reclamation
+    // Plant a dead-PID staging lock to verify automatic reclamation when live files were untouched
     fs.writeFileSync(
       path.join(installedRoot, UPDATE_MARKER_NAME),
-      JSON.stringify({ pid: 99999999, startedAt: Date.now() - 5000, phase: "replacing" }) + "\n"
+      JSON.stringify({ schemaVersion: 2, pid: 99999999, startedAt: Date.now() - 5000, phase: "staging" }) + "\n"
     );
     assert.equal(
       hasActiveUpdateMarker(path.join(installedRoot, UPDATE_MARKER_NAME), { isPidAlive: () => false }),
@@ -820,7 +822,7 @@ test("manual and automatic updates pin the selected official asset across the fr
   for (const mode of ["manual", "auto"]) {
     const root = path.join(tmp, mode, "plugins", "agy-cmd");
     writeBundleToDir(root, collectRepoBundleFiles(release.currentVersion, {
-      [UPDATE_MARKER_NAME]: JSON.stringify({ pid: 99999999, phase: "replacing" })
+      [UPDATE_MARKER_NAME]: JSON.stringify({ schemaVersion: 2, pid: 99999999, phase: "staging" })
     }));
     const initial = snapshotFiles(root);
     let fresh;
@@ -1748,4 +1750,125 @@ test("v2.7.0 hardening: plugin.json schema contract, managedByHost guard, POSIX 
     fs.rmSync(tmpBase, { recursive: true, force: true });
     fs.rmSync(stateDir, { recursive: true, force: true });
   }
+});
+
+test("P1 Batch B · B-4: dead-PID replacing marker blocks reload, journal recovers interrupted install cleanly, and journal-less replacing enters recovery", async (t) => {
+  const tmpBase = makeTmpDir("agy-cmd-b4-rec-");
+  t.after(() => fs.rmSync(tmpBase, { recursive: true, force: true }));
+  const pluginsDir = path.join(tmpBase, "cfg", "plugins");
+  const root = path.join(pluginsDir, "agy-cmd");
+  const prevFiles = collectRepoBundleFiles("2.6.0", {
+    "rules/user.local.md": "preserve-me\n",
+    "legacy-obsolete.txt": "old-obsolete\n",
+    "sidecars/panel/sidecar.json": JSON.stringify({ command: "C:\\Program Files\\nodejs\\node.exe", args: ["server.mjs"], restart_policy: "always" }, null, 2) + "\n"
+  });
+  writeBundleToDir(root, prevFiles);
+
+  // 1. Simulate a SIGKILL mid-way through `replacing` (some files swapped, one moved to backup without replacement yet, one obsolete moved)
+  const workDirName = ".agy-cmd-update-crash1";
+  const workDir = path.join(pluginsDir, workDirName);
+  const stageDir = path.join(workDir, "next");
+  const prevDir = path.join(workDir, "backup", "prev");
+  const obsDir = path.join(workDir, "backup", "obsolete");
+  fs.mkdirSync(stageDir, { recursive: true });
+  fs.mkdirSync(prevDir, { recursive: true });
+  fs.mkdirSync(obsDir, { recursive: true });
+  const nextFiles = collectRepoBundleFiles("2.7.0", { "hooks/brand-new.mjs": "export const n = 1;\n" });
+  writeBundleToDir(stageDir, nextFiles);
+
+  const orderedInstall = [...nextFiles.keys()];
+  const tok = "aabbccdd11223344";
+  fs.writeFileSync(
+    path.join(workDir, UPDATE_JOURNAL_NAME),
+    JSON.stringify({
+      schemaVersion: 2,
+      token: tok,
+      source: "sidecar",
+      previousVersion: "2.6.0",
+      targetVersion: "2.7.0",
+      freshInstall: false,
+      orderedInstall,
+      preexistingPaths: orderedInstall.filter((p) => p !== "hooks/brand-new.mjs"),
+      obsoleteFiles: ["legacy-obsolete.txt"]
+    })
+  );
+  // Swap file 1 completely (hooks/lib/common.mjs -> backup/prev, stage -> live)
+  fs.mkdirSync(path.join(prevDir, "hooks/lib"), { recursive: true });
+  fs.renameSync(path.join(root, "hooks/lib/common.mjs"), path.join(prevDir, "hooks/lib/common.mjs"));
+  fs.renameSync(path.join(stageDir, "hooks/lib/common.mjs"), path.join(root, "hooks/lib/common.mjs"));
+  // Crash mid-swap on file 2 (hooks/stop.mjs moved to backup/prev, live missing!)
+  fs.mkdirSync(path.join(prevDir, "hooks"), { recursive: true });
+  fs.renameSync(path.join(root, "hooks/stop.mjs"), path.join(prevDir, "hooks/stop.mjs"));
+  // Brand-new file already installed
+  fs.renameSync(path.join(stageDir, "hooks/brand-new.mjs"), path.join(root, "hooks/brand-new.mjs"));
+  // Obsolete file already moved out
+  fs.renameSync(path.join(root, "legacy-obsolete.txt"), path.join(obsDir, "legacy-obsolete.txt"));
+
+  const markerPath = path.join(root, UPDATE_MARKER_NAME);
+  fs.writeFileSync(
+    markerPath,
+    JSON.stringify({
+      schemaVersion: 2,
+      pid: 99999999,
+      token: tok,
+      source: "sidecar",
+      startedAt: Date.now() - 5000,
+      phase: "replacing",
+      previousVersion: "2.6.0",
+      targetVersion: "2.7.0",
+      workDirName,
+      journalFile: UPDATE_JOURNAL_NAME
+    }) + "\n"
+  );
+
+  // Dead-PID replacing marker MUST block auto-reload until recovered
+  assert.equal(hasActiveUpdateMarker(markerPath, { isPidAlive: () => false }), true);
+
+  // Recovery restores intact v2.6.0, restores obsolete & missing files, removes brand-new file, preserves local file & pinned node
+  const rec = await recoverInterruptedUpdate(root, { markerOptions: { isPidAlive: () => false } });
+  assert.equal(rec.status, "recovered");
+  assert.equal(rec.restoredVersion, "2.6.0");
+  assert.equal(readLocalVersion(root), "2.6.0");
+  assert.equal(fs.existsSync(markerPath), false);
+  assert.equal(fs.existsSync(workDir), false);
+  assert.equal(fs.existsSync(path.join(root, "hooks/stop.mjs")), true);
+  assert.equal(fs.existsSync(path.join(root, "hooks/brand-new.mjs")), false);
+  assert.equal(fs.readFileSync(path.join(root, "legacy-obsolete.txt"), "utf8"), "old-obsolete\n");
+  assert.equal(fs.readFileSync(path.join(root, "rules/user.local.md"), "utf8"), "preserve-me\n");
+  assert.equal(
+    JSON.parse(fs.readFileSync(path.join(root, "sidecars/panel/sidecar.json"), "utf8")).command,
+    "C:\\Program Files\\nodejs\\node.exe"
+  );
+
+  // 2. Dead-PID `replacing` WITHOUT journal cannot be silently reclaimed -> transitions to `recovery`
+  fs.writeFileSync(
+    markerPath,
+    JSON.stringify({ schemaVersion: 2, pid: 99999999, startedAt: Date.now() - 5000, phase: "replacing" }) + "\n"
+  );
+  assert.equal(hasActiveUpdateMarker(markerPath, { isPidAlive: () => false }), true);
+  await assert.rejects(
+    recoverInterruptedUpdate(root, { markerOptions: { isPidAlive: () => false } }),
+    (err) => err instanceof UpdateError && err.reason === "recovery"
+  );
+  assert.equal(JSON.parse(fs.readFileSync(markerPath, "utf8")).phase, "recovery");
+  fs.unlinkSync(markerPath);
+
+  // 3. Dead-PID `committed` marker cleans up workDir and marker keeping live files intact
+  const committedWork = path.join(pluginsDir, ".agy-cmd-update-done1");
+  fs.mkdirSync(committedWork, { recursive: true });
+  fs.writeFileSync(
+    markerPath,
+    JSON.stringify({
+      schemaVersion: 2,
+      pid: 99999999,
+      startedAt: Date.now() - 5000,
+      phase: "committed",
+      workDirName: ".agy-cmd-update-done1"
+    }) + "\n"
+  );
+  const cleaned = await recoverInterruptedUpdate(root, { markerOptions: { isPidAlive: () => false } });
+  assert.equal(cleaned.status, "cleaned_committed");
+  assert.equal(fs.existsSync(markerPath), false);
+  assert.equal(fs.existsSync(committedWork), false);
+  assert.equal(readLocalVersion(root), "2.6.0");
 });

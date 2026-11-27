@@ -15,7 +15,7 @@ import {
 } from "./lib/common.mjs";
 import { evaluatePreToolUse } from "./lib/detector.mjs";
 import { readSettings } from "./lib/settings.mjs";
-import { readEvents, readState } from "./lib/state.mjs";
+import { createDefaultState, readEvents, readState } from "./lib/state.mjs";
 import {
   inspectTranscriptTail,
   isSubagentTranscript,
@@ -43,8 +43,8 @@ export async function runPreToolUse(rawInput, env = process.env) {
 
   try {
     const settings = readSettings(stateDir);
-    const prevState = readState(stateDir, convId);
-    const events = readEvents(stateDir, convId);
+    const prevState = convId ? readState(stateDir, convId) : createDefaultState();
+    const events = convId ? readEvents(stateDir, convId, { compact: false }) : [];
     const transcriptTail = transcriptPath ? inspectTranscriptTail(transcriptPath) : null;
 
     const verdict = evaluatePreToolUse(payload, events, prevState, {

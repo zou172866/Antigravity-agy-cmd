@@ -5,11 +5,14 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
+import ctypes
 from datetime import datetime, timezone
 import json
 import math
 import os
+import posixpath
 import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -17,6 +20,7 @@ import tempfile
 import time
 from pathlib import Path
 
+MIN_PYTHON_VERSION = (3, 8)
 PLUGIN_NAME = "agy-cmd"
 RULE_FILENAME = "agy-auto-router.md"
 MIN_RETRY_MAX = 1
@@ -26,7 +30,46 @@ MAX_DELIVERY_CMD_LEN = 240
 MAX_CUSTOM_SEGMENTS = 8
 MAX_CHAIN_PARTS = 32
 SETTINGS_VERSION = 3
+SETTINGS_LOCK_STALE_SEC = 2.0
+SETTINGS_LOCK_DEAD_PID_GRACE_SEC = 0.1
+SETTINGS_LOCK_DEFAULT_WAIT_SEC = 1.0
+SETTINGS_LOCK_STEP_SEC = 0.008
+UPDATE_MARKER_NAME = ".update-in-progress"
+UPDATE_JOURNAL_NAME = "journal.json"
+UPDATE_WORK_PREFIX = ".agy-cmd-update-"
+UPDATE_STALE_MARKER_MS = 10 * 60 * 1000
+BUNDLE_ROOT_FILES = (
+    "plugin.json",
+    "hooks.json",
+    "package.json",
+    "README.md",
+    "README.zh-CN.md",
+    "install.ps1",
+    "install.sh",
+    "LICENSE",
+    "SECURITY.md",
+)
+BUNDLE_DIRS = ("assets", "rules", "agents", "hooks", "sidecars", "skills", "test")
+PRESERVED_HIDDEN_FILES = {UPDATE_MARKER_NAME, ".gitignore"}
 CD_SEGMENT_RE = re.compile(r"^(?:cd(?:\s+/d)?|pushd|Set-Location(?:\s+-Path)?)\s+(.+)$", re.IGNORECASE)
+
+
+class SettingsLockTimeoutError(RuntimeError):
+    code = "SETTINGS_LOCK_TIMEOUT"
+    retryable = True
+
+
+class UpdateTransactionError(RuntimeError):
+    def __init__(self, reason: str, message: str) -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
+def _ensure_supported_python_version() -> None:
+    if sys.version_info < MIN_PYTHON_VERSION:
+        cur = f"{sys.version_info[0]}.{sys.version_info[1]}.{sys.version_info[2]}"
+        req = f"{MIN_PYTHON_VERSION[0]}.{MIN_PYTHON_VERSION[1]}"
+        raise SystemExit(f"ERROR：agy-cmd 需要 Python >= {req}（当前版本：{cur}）。")
 
 GITHUB_REPO_URL = "https://github.com/zou172866/Antigravity-agy-cmd"
 GH_STAR_COMMAND = "gh api -X PUT /user/starred/zou172866/Antigravity-agy-cmd"
@@ -110,55 +153,167 @@ def resolve_state_dir(custom_state_dir: str | None = None) -> Path:
     return Path.home() / ".gemini" / "antigravity" / "plugin_data" / PLUGIN_NAME
 
 
-@contextmanager
-def _with_settings_lock(state_dir: Path):
-    lock_fd: int | None = None
-    lock_path = state_dir / ".settings.lock"
-    try:
-        state_dir.mkdir(parents=True, exist_ok=True)
-        deadline = time.monotonic() + 0.32
-        while True:
+def _is_pid_alive(pid: int) -> bool:
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return False
+    if pid == os.getpid():
+        return True
+    if os.name == "nt":
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        STILL_ACTIVE = 259
+        try:
+            kernel32 = ctypes.windll.kernel32
+            handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+            if not handle:
+                err = ctypes.get_last_error()
+                return err == 5  # ERROR_ACCESS_DENIED => process exists
             try:
-                lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-                break
-            except FileExistsError:
+                exit_code = ctypes.c_ulong(0)
+                if kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                    return exit_code.value == STILL_ACTIVE
+                return True
+            finally:
+                kernel32.CloseHandle(handle)
+        except Exception:
+            return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+def _read_lock_info(lock_path: Path) -> dict | None:
+    try:
+        raw = lock_path.read_text(encoding="utf-8").lstrip("\ufeff")
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:
+        pass
+    return None
+
+
+def _resolve_settings_lock_wait_sec(max_wait_sec: float | None = None) -> float:
+    if max_wait_sec is not None:
+        return max(0.0, float(max_wait_sec))
+    raw_env = os.environ.get("AGY_CMD_SETTINGS_LOCK_WAIT_MS", "").strip()
+    if raw_env:
+        try:
+            val = float(raw_env)
+            if math.isfinite(val) and val >= 0:
+                return val / 1000.0
+        except ValueError:
+            pass
+    return SETTINGS_LOCK_DEFAULT_WAIT_SEC
+
+
+def _is_settings_lock_stale(
+    lock_path: Path,
+    stale_sec: float,
+    pid_alive_fn,
+) -> tuple[bool, str | None]:
+    try:
+        st = lock_path.stat()
+    except OSError:
+        return False, None
+    now_sec = time.time()
+    age_sec = now_sec - st.st_mtime
+    info = _read_lock_info(lock_path)
+    if info and isinstance(info.get("pid"), int) and not isinstance(info.get("pid"), bool):
+        pid = info["pid"]
+        tok = info.get("token") if isinstance(info.get("token"), str) else None
+        raw_ts = info.get("ts")
+        ts_age = (now_sec - (float(raw_ts) / 1000.0)) if isinstance(raw_ts, (int, float)) else age_sec
+        if pid != os.getpid() and not pid_alive_fn(pid) and age_sec >= SETTINGS_LOCK_DEAD_PID_GRACE_SEC:
+            return True, tok
+        if ts_age > stale_sec and age_sec > stale_sec:
+            return True, tok
+        return False, tok
+    if age_sec > stale_sec:
+        return True, None
+    return False, None
+
+
+def _try_reclaim_stale_settings_lock(
+    lock_path: Path,
+    expected_token: str | None,
+    stale_sec: float,
+    pid_alive_fn,
+) -> bool:
+    stale, cur_token = _is_settings_lock_stale(lock_path, stale_sec, pid_alive_fn)
+    if not stale:
+        return False
+    if expected_token is not None and cur_token != expected_token:
+        return False
+    try:
+        lock_path.unlink()
+        return True
+    except OSError:
+        return False
+
+
+@contextmanager
+def _with_settings_lock(
+    state_dir: Path,
+    *,
+    max_wait_sec: float | None = None,
+    stale_sec: float = SETTINGS_LOCK_STALE_SEC,
+    pid_alive_fn=None,
+):
+    lock_path = state_dir / ".settings.lock"
+    wait_sec = _resolve_settings_lock_wait_sec(max_wait_sec)
+    alive_fn = pid_alive_fn or _is_pid_alive
+    token = secrets.token_hex(8)
+    acquired = False
+
+    state_dir.mkdir(parents=True, exist_ok=True)
+    deadline = time.monotonic() + wait_sec
+    while True:
+        try:
+            lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            try:
+                record = json.dumps({"pid": os.getpid(), "token": token, "ts": int(time.time() * 1000)}) + "\n"
+                os.write(lock_fd, record.encode("utf-8"))
+            finally:
                 try:
-                    if time.time() - lock_path.stat().st_mtime > 2.0:
-                        lock_path.unlink()
-                        continue
+                    os.close(lock_fd)
                 except OSError:
                     pass
-                if time.monotonic() >= deadline:
-                    break
-                time.sleep(0.008)
-            except OSError:
-                break
-    except OSError:
-        pass
+            acquired = True
+            break
+        except FileExistsError:
+            stale, stale_tok = _is_settings_lock_stale(lock_path, stale_sec, alive_fn)
+            if stale and _try_reclaim_stale_settings_lock(lock_path, stale_tok, stale_sec, alive_fn):
+                continue
+            if time.monotonic() >= deadline:
+                raise SettingsLockTimeoutError(
+                    "配置文件当前被其他进程占用（锁等待超时），未执行写入，请稍后重试。"
+                )
+            time.sleep(SETTINGS_LOCK_STEP_SEC)
 
     try:
         yield
     finally:
-        if lock_fd is not None:
+        if acquired:
             try:
-                os.close(lock_fd)
-            except OSError:
-                pass
-            try:
-                lock_path.unlink()
+                cur = _read_lock_info(lock_path)
+                if cur and cur.get("token") == token:
+                    lock_path.unlink()
             except OSError:
                 pass
 
 
-def save_json_atomic(file_path: Path, data: dict) -> None:
+def _write_text_lf_atomic(file_path: Path, text: str) -> None:
     file_path.parent.mkdir(parents=True, exist_ok=True)
-    serialized = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
-    fd, tmp_name = tempfile.mkstemp(prefix=".tmp-", suffix=".json", dir=str(file_path.parent))
+    fd, tmp_name = tempfile.mkstemp(prefix=".tmp-", suffix=".tmp", dir=str(file_path.parent))
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
-            fh.write(serialized)
+            fh.write(text)
         last_err: Exception | None = None
-        for attempt in range(6):
+        for attempt in range(8):
             try:
                 os.replace(tmp_name, file_path)
                 last_err = None
@@ -169,17 +324,18 @@ def save_json_atomic(file_path: Path, data: dict) -> None:
                     raise
                 time.sleep(0.01 * (attempt + 1))
         if last_err is not None:
-            file_path.write_text(serialized, encoding="utf-8", newline="\n")
-            try:
-                os.unlink(tmp_name)
-            except OSError:
-                pass
+            raise last_err
     except Exception:
         try:
             os.unlink(tmp_name)
         except OSError:
             pass
         raise
+
+
+def save_json_atomic(file_path: Path, data: dict) -> None:
+    serialized = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
+    _write_text_lf_atomic(file_path, serialized)
 
 
 def is_gh_cli_authenticated(
@@ -484,42 +640,97 @@ def default_settings() -> dict:
     }
 
 
+def _clamp_retry_max(val: object, fallback: int = DEFAULT_RETRY_MAX) -> int:
+    if isinstance(val, bool) or val is None:
+        return fallback
+    try:
+        n = float(val)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return fallback
+    if not math.isfinite(n):
+        return fallback
+    return min(MAX_RETRY_MAX, max(MIN_RETRY_MAX, int(math.floor(n))))
+
+
 def load_settings(state_dir: Path) -> dict:
     base = default_settings()
     settings_path = state_dir / "settings.json"
-    if not settings_path.is_file():
-        return base
-    try:
-        raw = json.loads(settings_path.read_text(encoding="utf-8"))
-        if isinstance(raw, dict):
-            base.update({k: v for k, v in raw.items() if k not in ("stats", "starPrompt", "autoUpdateState")})
-            if isinstance(raw.get("stats"), dict):
-                base["stats"].update(raw["stats"])
-            base["starPrompt"] = normalize_star_prompt_state(raw.get("starPrompt"))
-            base["autoUpdateState"] = normalize_auto_update_state(raw.get("autoUpdateState"))
-            if (
-                raw.get("version") == 1
-                and raw.get("configuredByUser") is False
-                and raw.get("autoRetryScope") == "goal_only"
-            ):
-                base["autoRetryScope"] = "smart"
-            if not _is_valid_current_settings_version(raw.get("version")):
-                base["boostAfterPlanApproval"] = False
-            base["version"] = SETTINGS_VERSION
-    except Exception:
+    raw = None
+    for attempt in range(4):
+        try:
+            if not settings_path.is_file():
+                return base
+            text = settings_path.read_text(encoding="utf-8")
+            if not text.strip() and attempt < 3:
+                time.sleep(0.008 * (attempt + 1))
+                continue
+            raw = json.loads(text)
+            break
+        except PermissionError:
+            if attempt < 3:
+                time.sleep(0.008 * (attempt + 1))
+                continue
+            return default_settings()
+        except Exception:
+            return default_settings()
+    if not isinstance(raw, dict):
         return default_settings()
+
+    base.update({k: v for k, v in raw.items() if k not in ("stats", "starPrompt", "autoUpdateState")})
+    raw_stats = raw.get("stats") if isinstance(raw.get("stats"), dict) else {}
+    raw_total = raw_stats.get("totalAutoRetries", 0)
+    total_retries = 0
+    if not isinstance(raw_total, bool):
+        try:
+            num_total = float(raw_total)
+            if math.isfinite(num_total) and num_total >= 0:
+                total_retries = int(math.floor(num_total))
+        except (TypeError, ValueError):
+            total_retries = 0
+    base["stats"] = {
+        "totalAutoRetries": total_retries,
+        "lastAutoRetryAt": raw_stats.get("lastAutoRetryAt") if isinstance(raw_stats.get("lastAutoRetryAt"), str) else "",
+        "lastAutoRetryConvId": (
+            raw_stats.get("lastAutoRetryConvId") if isinstance(raw_stats.get("lastAutoRetryConvId"), str) else ""
+        ),
+    }
+    base["starPrompt"] = normalize_star_prompt_state(raw.get("starPrompt"))
+    base["autoUpdateState"] = normalize_auto_update_state(raw.get("autoUpdateState"))
+    if (
+        raw.get("version") == 1
+        and raw.get("configuredByUser") is False
+        and raw.get("autoRetryScope") == "goal_only"
+    ):
+        base["autoRetryScope"] = "smart"
+    if not _is_valid_current_settings_version(raw.get("version")):
+        base["boostAfterPlanApproval"] = False
+    base["version"] = SETTINGS_VERSION
+
+    if base.get("autoRetryMode") not in ("off", "count", "infinite"):
+        base["autoRetryMode"] = "count"
+    base["autoRetryMax"] = _clamp_retry_max(base.get("autoRetryMax"), DEFAULT_RETRY_MAX)
     if base.get("autoRetryScope") not in ("smart", "all_failures", "goal_only"):
         base["autoRetryScope"] = "smart"
     if base.get("planTier") != "paid":
         base["planTier"] = "free"
         base["boostEnabled"] = False
+    else:
+        base["boostEnabled"] = base.get("boostEnabled") is True
     base["boostAfterPlanApproval"] = base.get("boostAfterPlanApproval") is True
     base["freePlanReviewEnabled"] = base.get("freePlanReviewEnabled") is True
     base["deliveryTestGateEnabled"] = base.get("deliveryTestGateEnabled") is True
     base["deliveryTestCommand"] = sanitize_delivery_test_command(base.get("deliveryTestCommand"), strict=False)
-    raw_auto_update = base.get("autoUpdateCheck")
-    base["autoUpdateCheck"] = raw_auto_update if isinstance(raw_auto_update, bool) else True
+    base["freeFallbackEnabled"] = (
+        base["freeFallbackEnabled"] if isinstance(base.get("freeFallbackEnabled"), bool) else True
+    )
+    base["planFallbackEnabled"] = (
+        base["planFallbackEnabled"] if isinstance(base.get("planFallbackEnabled"), bool) else True
+    )
+    base["autoUpdateCheck"] = base["autoUpdateCheck"] if isinstance(base.get("autoUpdateCheck"), bool) else True
     base["autoUpdateInstall"] = base.get("autoUpdateInstall") is True
+    base["configuredByUser"] = base["configuredByUser"] if isinstance(base.get("configuredByUser"), bool) else False
+    base["onboardingShown"] = base["onboardingShown"] if isinstance(base.get("onboardingShown"), bool) else False
+    base["updatedAt"] = base["updatedAt"] if isinstance(base.get("updatedAt"), str) else ""
     base["autoUpdateState"] = normalize_auto_update_state(base.get("autoUpdateState"))
     base["starPrompt"] = normalize_star_prompt_state(base.get("starPrompt"))
     return base
@@ -612,9 +823,14 @@ def apply_settings_cli(
     delivery_test_cmd: str | None = None,
     auto_update_check: str | None = None,
     auto_update_install: str | None = None,
+    boost_after_plan_approval: str | None = None,
+    free_fallback: str | None = None,
+    plan_fallback: str | None = None,
+    reset_stats: bool = False,
 ) -> dict:
     with _with_settings_lock(state_dir):
         current = load_settings(state_dir)
+        prev_tier = current["planTier"]
         if auto_retry is not None:
             mode, count_val = parse_auto_retry_arg(auto_retry)
             current["autoRetryMode"] = mode
@@ -626,7 +842,7 @@ def apply_settings_cli(
             current["planTier"] = plan_tier
             if plan_tier == "free":
                 current["boostEnabled"] = False
-            elif plan_tier == "paid" and boost_flag is None:
+            elif plan_tier == "paid" and boost_flag is None and prev_tier == "free":
                 current["boostEnabled"] = True
         if boost_flag is not None:
             want_on = boost_flag == "on"
@@ -637,12 +853,18 @@ def apply_settings_cli(
                     )
                 current["planTier"] = "paid"
             current["boostEnabled"] = want_on
+        if boost_after_plan_approval is not None:
+            current["boostAfterPlanApproval"] = boost_after_plan_approval == "on"
         if free_plan_review is not None:
             current["freePlanReviewEnabled"] = free_plan_review == "on"
         if delivery_test_gate is not None:
             current["deliveryTestGateEnabled"] = delivery_test_gate == "on"
         if delivery_test_cmd is not None:
             current["deliveryTestCommand"] = sanitize_delivery_test_command(delivery_test_cmd, strict=True)
+        if free_fallback is not None:
+            current["freeFallbackEnabled"] = free_fallback == "on"
+        if plan_fallback is not None:
+            current["planFallbackEnabled"] = plan_fallback == "on"
         if auto_update_check is not None:
             current["autoUpdateCheck"] = auto_update_check == "on"
         if auto_update_install is not None:
@@ -650,6 +872,12 @@ def apply_settings_cli(
             current["autoUpdateInstall"] = want_install
             if want_install and auto_update_check is None and not current.get("autoUpdateCheck", True):
                 current["autoUpdateCheck"] = True
+        if reset_stats:
+            current["stats"] = {
+                "totalAutoRetries": 0,
+                "lastAutoRetryAt": "",
+                "lastAutoRetryConvId": "",
+            }
 
         current["configuredByUser"] = True
         current["onboardingShown"] = True
@@ -817,6 +1045,10 @@ def validate_bundle_sync(plugin_dir: Path) -> list[str]:
                 src_txt = normalize_lf(src_fp.read_text(encoding="utf-8"))
                 dst_txt = normalize_lf(dst_fp.read_text(encoding="utf-8"))
                 if src_txt != dst_txt:
+                    if rel.as_posix() == "sidecars/panel/sidecar.json" and _sidecar_json_matches_except_pinned_node(
+                        src_txt, dst_txt
+                    ):
+                        continue
                     issues.append(f"插件运行文件与源码仓库存在漂移：{dst_fp}")
             except UnicodeDecodeError:
                 if src_fp.read_bytes() != dst_fp.read_bytes():
@@ -836,7 +1068,7 @@ def validate_verifier(plugin_dir: Path) -> list[str]:
     # while rejecting duplicates, unknown keys, write/shell tools, or MCP access.
     if not contents.startswith("---\n"):
         return [f"独立复核角色的只读工具或权限配置无效：{role}"]
-    header, divider, _ = contents.removeprefix("---\n").partition("\n---\n")
+    header, divider, _ = contents[4:].partition("\n---\n")
     if not divider:
         return [f"独立复核角色的只读工具或权限配置无效：{role}"]
 
@@ -953,31 +1185,542 @@ def _clean_pycache_dirs(root_dir: Path) -> None:
             shutil.rmtree(cache_dir, ignore_errors=True)
 
 
-def sync_plugin_bundle_if_needed(target_plugin_dir: Path) -> bool:
-    """When invoked from a cloned source checkout containing plugin.json, sync runtime files into target_plugin_dir."""
+def _is_pinned_node_command(command: object) -> bool:
+    if not isinstance(command, str) or not command or re.search(r"[\x00-\x1f\r\n]", command):
+        return False
+    is_win_node = bool(
+        re.match(r"^[A-Za-z]:[\\/]", command)
+        and not command.startswith("\\\\")
+        and os.path.basename(command.replace("/", "\\")).lower() == "node.exe"
+    )
+    is_posix_node = bool(
+        command.startswith("/")
+        and not command.startswith("//")
+        and posixpath.basename(command) == "node"
+    )
+    return is_win_node or is_posix_node
+
+
+def _preserve_pinned_node_command(sidecar_bytes: bytes, installed_sidecar: dict | None) -> bytes:
+    if not isinstance(installed_sidecar, dict):
+        return sidecar_bytes
+    command = installed_sidecar.get("command")
+    if not _is_pinned_node_command(command):
+        return sidecar_bytes
+    try:
+        sidecar = json.loads(sidecar_bytes.decode("utf-8").lstrip("\ufeff"))
+        if isinstance(sidecar, dict):
+            sidecar["command"] = command
+            return (json.dumps(sidecar, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+    except Exception:
+        pass
+    return sidecar_bytes
+
+
+def _sidecar_json_matches_except_pinned_node(src_txt: str, dst_txt: str) -> bool:
+    try:
+        src_obj = json.loads(src_txt.lstrip("\ufeff"))
+        dst_obj = json.loads(dst_txt.lstrip("\ufeff"))
+    except Exception:
+        return False
+    if not isinstance(src_obj, dict) or not isinstance(dst_obj, dict):
+        return False
+    if not _is_pinned_node_command(dst_obj.get("command")):
+        return False
+    src_copy = dict(src_obj)
+    dst_copy = dict(dst_obj)
+    src_copy.pop("command", None)
+    dst_copy.pop("command", None)
+    return src_copy == dst_copy
+
+
+def _is_preserved_local_file(rel_posix: str) -> bool:
+    if rel_posix in PRESERVED_HIDDEN_FILES:
+        return True
+    if re.match(r"^rules/[^/]+\.local\.md$", rel_posix, re.IGNORECASE):
+        return True
+    return False
+
+
+def _is_safe_work_dir_name(name: object) -> bool:
+    return bool(
+        isinstance(name, str)
+        and name.startswith(UPDATE_WORK_PREFIX)
+        and len(name) > len(UPDATE_WORK_PREFIX)
+        and len(name) <= 96
+        and "/" not in name
+        and "\\" not in name
+        and ".." not in name
+        and re.match(r"^[A-Za-z0-9._-]+$", name)
+    )
+
+
+def _is_safe_rel_posix(rel: object) -> bool:
+    if not isinstance(rel, str) or not rel or rel.startswith("/") or "\\" in rel or "\x00" in rel:
+        return False
+    parts = rel.split("/")
+    return all(part and part not in (".", "..") for part in parts)
+
+
+def _assert_no_intermediate_symlink(root: Path, rel_posix: str) -> None:
+    cur = root
+    for part in rel_posix.split("/")[:-1]:
+        cur = cur / part
+        if not cur.exists() and not cur.is_symlink():
+            break
+        if cur.is_symlink() or not cur.is_dir():
+            raise UpdateTransactionError("pathConflict", f"目录路径存在符号链接或非目录冲突：{rel_posix}")
+
+
+def _list_live_files(root_dir: Path, current_rel: str = "") -> list[str]:
+    abs_dir = root_dir / current_rel if current_rel else root_dir
+    if not abs_dir.is_dir():
+        return []
+    results: list[str] = []
+    for entry in sorted(abs_dir.iterdir(), key=lambda p: p.name):
+        rel_posix = f"{current_rel}/{entry.name}" if current_rel else entry.name
+        if _is_preserved_local_file(rel_posix):
+            continue
+        if entry.is_dir() and not entry.is_symlink():
+            results.extend(_list_live_files(root_dir, rel_posix))
+        else:
+            results.append(rel_posix)
+    return results
+
+
+def _remove_empty_dirs_recursive(dir_path: Path, root_dir: Path) -> None:
+    if not dir_path.is_dir() or dir_path.is_symlink():
+        return
+    for entry in list(dir_path.iterdir()):
+        if entry.is_dir() and not entry.is_symlink():
+            _remove_empty_dirs_recursive(entry, root_dir)
+    if dir_path.resolve() != root_dir.resolve():
+        try:
+            if not any(dir_path.iterdir()):
+                dir_path.rmdir()
+        except OSError:
+            pass
+
+
+def _parse_update_marker(raw: str) -> dict | None:
+    try:
+        parsed = json.loads(raw.lstrip("\ufeff"))
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:
+        pass
+    return None
+
+
+def _evaluate_update_marker_state(
+    raw: str,
+    mtime_ms: float,
+    *,
+    now_ms: float | None = None,
+    stale_ms: float = UPDATE_STALE_MARKER_MS,
+    pid_alive_fn=None,
+) -> str:
+    cur_ms = time.time() * 1000.0 if now_ms is None else float(now_ms)
+    alive_fn = pid_alive_fn or _is_pid_alive
+    parsed = _parse_update_marker(raw)
+    if parsed:
+        if parsed.get("phase") == "recovery":
+            return "recovery"
+        pid = parsed.get("pid")
+        if isinstance(pid, int) and not isinstance(pid, bool):
+            alive = pid == os.getpid() or alive_fn(pid)
+            started_at = parsed.get("startedAt")
+            expired = isinstance(started_at, (int, float)) and not isinstance(started_at, bool) and (
+                cur_ms - float(started_at) > stale_ms
+            )
+            if alive and not expired:
+                return "active"
+            phase = parsed.get("phase")
+            if phase == "staging":
+                return "stale"
+            if phase == "committed":
+                return "committed_stale"
+            if phase == "replacing":
+                return "interrupted"
+            return "stale"
+    return "stale" if (cur_ms - mtime_ms > stale_ms) else "active"
+
+
+def _write_update_marker(marker_path: Path, record: dict, *, exclusive: bool = False) -> None:
+    serialized = json.dumps(record, ensure_ascii=False) + "\n"
+    if exclusive:
+        fd = os.open(str(marker_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        try:
+            os.write(fd, serialized.encode("utf-8"))
+        finally:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        return
+    _write_text_lf_atomic(marker_path, serialized)
+
+
+def _move_path(src: Path, dst: Path) -> None:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    last_err: Exception | None = None
+    for attempt in range(6):
+        try:
+            os.replace(str(src), str(dst))
+            return
+        except PermissionError as exc:
+            last_err = exc
+            if os.name != "nt":
+                raise
+            time.sleep(0.01 * (attempt + 1))
+        except OSError:
+            shutil.move(str(src), str(dst))
+            return
+    if last_err is not None:
+        raise last_err
+
+
+def _read_plugin_version(root: Path) -> str:
+    manifest = root / "plugin.json"
+    if not manifest.is_file() or manifest.is_symlink():
+        return ""
+    try:
+        parsed = json.loads(manifest.read_text(encoding="utf-8").lstrip("\ufeff"))
+        ver = parsed.get("version") if isinstance(parsed, dict) else ""
+        return ver.strip().lstrip("v") if isinstance(ver, str) else ""
+    except Exception:
+        return ""
+
+
+def _rollback_from_journal(root: Path, work_dir: Path, journal: dict) -> None:
+    ordered_install = journal.get("orderedInstall")
+    obsolete_files = journal.get("obsoleteFiles")
+    if not isinstance(ordered_install, list) or not isinstance(obsolete_files, list):
+        raise UpdateTransactionError("recovery", "恢复清单格式无效。")
+    if not all(_is_safe_rel_posix(rel) for rel in ordered_install) or not all(
+        _is_safe_rel_posix(rel) for rel in obsolete_files
+    ):
+        raise UpdateTransactionError("recovery", "恢复清单包含非法路径。")
+
+    stage_dir = work_dir / "next"
+    prev_dir = work_dir / "backup" / "prev"
+    obsolete_dir = work_dir / "backup" / "obsolete"
+
+    for rel in reversed(obsolete_files):
+        saved = obsolete_dir / rel
+        live = root / rel
+        if (saved.exists() or saved.is_symlink()) and not (live.exists() or live.is_symlink()):
+            _assert_no_intermediate_symlink(root, rel)
+            _move_path(saved, live)
+
+    for rel in reversed(ordered_install):
+        stage_file = stage_dir / rel
+        prev_file = prev_dir / rel
+        live_file = root / rel
+        has_stage = stage_file.exists() or stage_file.is_symlink()
+        has_prev = prev_file.exists() or prev_file.is_symlink()
+        has_live = live_file.exists() or live_file.is_symlink()
+        if not has_stage and has_live:
+            _move_path(live_file, stage_file)
+        if has_prev and not (live_file.exists() or live_file.is_symlink()):
+            _assert_no_intermediate_symlink(root, rel)
+            _move_path(prev_file, live_file)
+
+    _remove_empty_dirs_recursive(root, root)
+    prev_ver = journal.get("previousVersion")
+    if not journal.get("freshInstall") and isinstance(prev_ver, str) and prev_ver:
+        if _read_plugin_version(root) != prev_ver.lstrip("v"):
+            raise UpdateTransactionError("recovery", "回滚后 plugin.json 版本核验失败。")
+
+
+def recover_interrupted_update(
+    plugin_dir: Path,
+    *,
+    reclaim_stale: bool = True,
+    pid_alive_fn=None,
+    now_ms: float | None = None,
+) -> dict:
+    marker_path = plugin_dir / UPDATE_MARKER_NAME
+    if not marker_path.exists() and not marker_path.is_symlink():
+        return {"status": "clean"}
+    if marker_path.is_symlink() or not marker_path.is_file():
+        raise UpdateTransactionError("pathConflict", f"更新标记不是普通文件：{marker_path}")
+
+    st = marker_path.stat()
+    raw = marker_path.read_text(encoding="utf-8", errors="replace")
+    parsed = _parse_update_marker(raw)
+    state = _evaluate_update_marker_state(raw, st.st_mtime * 1000.0, now_ms=now_ms, pid_alive_fn=pid_alive_fn)
+
+    if state == "active":
+        raise UpdateTransactionError("busy", "检测到另一进程正在更新/同步 agy-cmd 插件，请稍后再试。")
+
+    work_dir: Path | None = None
+    if parsed and _is_safe_work_dir_name(parsed.get("workDirName")):
+        candidate = plugin_dir.parent / str(parsed["workDirName"])
+        if candidate.is_dir() and not candidate.is_symlink():
+            work_dir = candidate
+
+    if state in ("stale", "committed_stale"):
+        if not reclaim_stale:
+            return {"status": state}
+        if work_dir is not None:
+            shutil.rmtree(work_dir, ignore_errors=True)
+        try:
+            marker_path.unlink()
+        except FileNotFoundError:
+            pass
+        return {"status": "cleaned_committed" if state == "committed_stale" else "cleaned_stale"}
+
+    journal: dict | None = None
+    if work_dir is not None:
+        journal_path = work_dir / UPDATE_JOURNAL_NAME
+        if journal_path.is_file() and not journal_path.is_symlink():
+            try:
+                j_obj = json.loads(journal_path.read_text(encoding="utf-8").lstrip("\ufeff"))
+                if (
+                    isinstance(j_obj, dict)
+                    and isinstance(j_obj.get("orderedInstall"), list)
+                    and (not parsed or not parsed.get("token") or j_obj.get("token") == parsed.get("token"))
+                ):
+                    journal = j_obj
+            except Exception:
+                journal = None
+
+    cur_ms = int(time.time() * 1000) if now_ms is None else int(now_ms)
+    if work_dir is None or journal is None:
+        if state == "interrupted":
+            rec = dict(parsed or {})
+            rec.update({"schemaVersion": 2, "pid": os.getpid(), "startedAt": cur_ms, "phase": "recovery"})
+            try:
+                _write_update_marker(marker_path, rec)
+            except OSError:
+                pass
+        raise UpdateTransactionError(
+            "recovery",
+            f"检测到中断的安装事务且缺少完整备份清单，已保持待恢复状态：{marker_path}",
+        )
+
+    try:
+        _rollback_from_journal(plugin_dir, work_dir, journal)
+        try:
+            marker_path.unlink()
+        except FileNotFoundError:
+            pass
+        shutil.rmtree(work_dir, ignore_errors=True)
+        return {"status": "recovered", "restoredVersion": journal.get("previousVersion") or ""}
+    except Exception as exc:
+        rec = dict(parsed or {})
+        rec.update(
+            {
+                "schemaVersion": 2,
+                "pid": os.getpid(),
+                "startedAt": cur_ms,
+                "phase": "recovery",
+                "workDirName": work_dir.name,
+                "journalFile": UPDATE_JOURNAL_NAME,
+            }
+        )
+        try:
+            _write_update_marker(marker_path, rec)
+        except OSError:
+            pass
+        raise UpdateTransactionError("recovery", f"中断安装恢复失败，已保留备份目录：{exc}") from exc
+
+
+def check_update_marker_issues(plugin_dir: Path, *, pid_alive_fn=None) -> list[str]:
+    marker_path = plugin_dir / UPDATE_MARKER_NAME
+    if not marker_path.exists() and not marker_path.is_symlink():
+        return []
+    if marker_path.is_symlink() or not marker_path.is_file():
+        return [f"更新标记文件异常：{marker_path}"]
+    try:
+        st = marker_path.stat()
+        raw = marker_path.read_text(encoding="utf-8", errors="replace")
+        state = _evaluate_update_marker_state(raw, st.st_mtime * 1000.0, pid_alive_fn=pid_alive_fn)
+    except OSError as exc:
+        return [f"无法读取更新标记文件：{marker_path}（{exc}）"]
+    if state == "active":
+        return [f"插件正在更新中，暂不建议修改或重载：{marker_path}"]
+    if state in ("interrupted", "recovery"):
+        return [f"检测到未完成或待恢复的插件更新标记（可运行 --install 自动恢复）：{marker_path}"]
+    return []
+
+
+def sync_plugin_bundle_if_needed(target_plugin_dir: Path, *, _fail_after_moves: int | None = None) -> bool:
+    """Atomically sync runtime files from a source checkout into target_plugin_dir using the shared update journal."""
     source_root = Path(__file__).resolve().parents[3]
     if not (source_root / "plugin.json").is_file():
         return False
     if source_root.resolve() == target_plugin_dir.resolve():
         return True
 
-    ignore_fn = shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo")
-    target_plugin_dir.mkdir(parents=True, exist_ok=True)
-    for item_name in ("plugin.json", "hooks.json", "package.json", "README.md", "README.zh-CN.md", "install.ps1", "install.sh", "LICENSE", "SECURITY.md"):
-        src_file = source_root / item_name
-        if src_file.is_file():
-            shutil.copy2(src_file, target_plugin_dir / item_name)
-    for dir_name in ("assets", "rules", "agents", "hooks", "sidecars", "skills", "test"):
-        src_dir = source_root / dir_name
-        if src_dir.is_dir():
-            shutil.copytree(
-                src_dir,
-                target_plugin_dir / dir_name,
-                dirs_exist_ok=True,
-                ignore=ignore_fn,
-            )
-    _clean_pycache_dirs(target_plugin_dir)
-    return True
+    target_plugin_dir.parent.mkdir(parents=True, exist_ok=True)
+    if target_plugin_dir.exists():
+        recover_interrupted_update(target_plugin_dir, reclaim_stale=True)
+
+    installed_sidecar: dict | None = None
+    installed_sidecar_path = target_plugin_dir / "sidecars" / "panel" / "sidecar.json"
+    if installed_sidecar_path.is_file() and not installed_sidecar_path.is_symlink():
+        try:
+            parsed_sc = json.loads(installed_sidecar_path.read_text(encoding="utf-8").lstrip("\ufeff"))
+            if isinstance(parsed_sc, dict):
+                installed_sidecar = parsed_sc
+        except Exception:
+            installed_sidecar = None
+
+    previous_version = _read_plugin_version(target_plugin_dir)
+    target_version = _read_plugin_version(source_root)
+    fresh_install = not (target_plugin_dir / "plugin.json").is_file()
+
+    work_dir = Path(tempfile.mkdtemp(prefix=UPDATE_WORK_PREFIX, dir=str(target_plugin_dir.parent)))
+    stage_dir = work_dir / "next"
+    backup_dir = work_dir / "backup"
+    stage_dir.mkdir(parents=True, exist_ok=True)
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    keep_work_dir = False
+
+    selected_rel_paths: list[str] = []
+    try:
+        for item_name in BUNDLE_ROOT_FILES:
+            src_file = source_root / item_name
+            if src_file.is_file():
+                dst_file = stage_dir / item_name
+                dst_file.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src_file, dst_file)
+                selected_rel_paths.append(item_name)
+
+        for dir_name in BUNDLE_DIRS:
+            src_dir = source_root / dir_name
+            if not src_dir.is_dir():
+                continue
+            for src_fp in sorted(src_dir.rglob("*")):
+                if not src_fp.is_file() or src_fp.is_symlink():
+                    continue
+                if "__pycache__" in src_fp.parts or src_fp.suffix.lower() in (".pyc", ".pyo"):
+                    continue
+                rel_posix = src_fp.relative_to(source_root).as_posix()
+                dst_fp = stage_dir / rel_posix
+                dst_fp.parent.mkdir(parents=True, exist_ok=True)
+                if rel_posix == "sidecars/panel/sidecar.json":
+                    data = _preserve_pinned_node_command(src_fp.read_bytes(), installed_sidecar)
+                    dst_fp.write_bytes(data)
+                elif rel_posix == "rules/AGENTS.md":
+                    with open(dst_fp, "w", encoding="utf-8", newline="\n") as fh:
+                        fh.write(RULE_BODY)
+                else:
+                    shutil.copy2(src_fp, dst_fp)
+                selected_rel_paths.append(rel_posix)
+
+        target_plugin_dir.mkdir(parents=True, exist_ok=True)
+        marker_path = target_plugin_dir / UPDATE_MARKER_NAME
+        token = secrets.token_hex(8)
+        base_marker = {
+            "schemaVersion": 2,
+            "pid": os.getpid(),
+            "token": token,
+            "source": "python-cli",
+            "startedAt": int(time.time() * 1000),
+            "previousVersion": previous_version,
+            "targetVersion": target_version,
+            "workDirName": work_dir.name,
+            "journalFile": UPDATE_JOURNAL_NAME,
+        }
+        try:
+            _write_update_marker(marker_path, {**base_marker, "phase": "staging"}, exclusive=True)
+        except FileExistsError as exc:
+            raise UpdateTransactionError("busy", "检测到另一进程正在更新 agy-cmd 插件，请稍后再试。") from exc
+
+        case_insensitive = os.name == "nt" or sys.platform == "darwin"
+        norm_key = (lambda p: p.lower()) if case_insensitive else (lambda p: p)
+        selected_keys = {norm_key(rel) for rel in selected_rel_paths}
+        live_files = _list_live_files(target_plugin_dir)
+        obsolete_files = [rel for rel in live_files if norm_key(rel) not in selected_keys]
+
+        for rel in selected_rel_paths:
+            _assert_no_intermediate_symlink(target_plugin_dir, rel)
+
+        tail = {"sidecars/panel/server.mjs", "plugin.json"}
+        ordered_install = [rel for rel in selected_rel_paths if rel not in tail] + [
+            rel for rel in selected_rel_paths if rel in tail
+        ]
+        preexisting_paths: list[str] = []
+        for rel in ordered_install:
+            live = target_plugin_dir / rel
+            if live.exists() or live.is_symlink():
+                if live.is_dir() and not live.is_symlink():
+                    raise UpdateTransactionError("pathConflict", f"目标文件位置已被目录占用：{rel}")
+                preexisting_paths.append(rel)
+
+        journal = {
+            "schemaVersion": 2,
+            "token": token,
+            "source": "python-cli",
+            "previousVersion": previous_version,
+            "targetVersion": target_version,
+            "freshInstall": fresh_install,
+            "orderedInstall": ordered_install,
+            "preexistingPaths": preexisting_paths,
+            "obsoleteFiles": obsolete_files,
+        }
+        _write_text_lf_atomic(work_dir / UPDATE_JOURNAL_NAME, json.dumps(journal, indent=2, ensure_ascii=False) + "\n")
+        _write_update_marker(marker_path, {**base_marker, "phase": "replacing"})
+
+        moves_done = 0
+        try:
+            for rel in ordered_install:
+                incoming = stage_dir / rel
+                live = target_plugin_dir / rel
+                if live.exists() or live.is_symlink():
+                    if live.is_dir() and not live.is_symlink():
+                        raise UpdateTransactionError("pathConflict", f"目标文件位置已被目录占用：{rel}")
+                    _move_path(live, backup_dir / "prev" / rel)
+                    moves_done += 1
+                    if _fail_after_moves is not None and moves_done >= _fail_after_moves:
+                        raise RuntimeError("Injected move failure for recovery testing")
+                _move_path(incoming, live)
+                moves_done += 1
+                if _fail_after_moves is not None and moves_done >= _fail_after_moves:
+                    raise RuntimeError("Injected move failure for recovery testing")
+
+            for rel in obsolete_files:
+                live = target_plugin_dir / rel
+                if (live.exists() or live.is_symlink()) and not (live.is_dir() and not live.is_symlink()):
+                    _move_path(live, backup_dir / "obsolete" / rel)
+                    moves_done += 1
+                    if _fail_after_moves is not None and moves_done >= _fail_after_moves:
+                        raise RuntimeError("Injected move failure for recovery testing")
+
+            _remove_empty_dirs_recursive(target_plugin_dir, target_plugin_dir)
+            _clean_pycache_dirs(target_plugin_dir)
+            _write_update_marker(marker_path, {**base_marker, "phase": "committed"})
+            try:
+                marker_path.unlink()
+            except FileNotFoundError:
+                pass
+            return True
+        except Exception as exc:
+            try:
+                _rollback_from_journal(target_plugin_dir, work_dir, journal)
+                try:
+                    marker_path.unlink()
+                except FileNotFoundError:
+                    pass
+            except Exception as rb_exc:
+                keep_work_dir = True
+                try:
+                    _write_update_marker(
+                        marker_path,
+                        {**base_marker, "startedAt": int(time.time() * 1000), "phase": "recovery"},
+                    )
+                except OSError:
+                    pass
+                raise UpdateTransactionError(
+                    "recovery", f"安装失败且自动回滚失败，已保留备份目录 {work_dir}：{rb_exc}"
+                ) from exc
+            raise
+    finally:
+        if not keep_work_dir:
+            shutil.rmtree(work_dir, ignore_errors=True)
 
 
 def sync_skill_if_needed(config_dir: Path) -> str | None:
@@ -999,6 +1742,7 @@ def sync_skill_if_needed(config_dir: Path) -> str | None:
 
 def main(argv: list[str] | None = None) -> int:
     _configure_stdio()
+    _ensure_supported_python_version()
     parser = argparse.ArgumentParser(
         description="管理 Antigravity agy-cmd 插件、自动续跑次数与套餐档位设置"
     )
@@ -1032,6 +1776,12 @@ def main(argv: list[str] | None = None) -> int:
         help="开启或关闭疑难任务与连续失败时的 Boost 自动派工（开启时自动切至 paid 档位）",
     )
     parser.add_argument(
+        "--boost-after-plan-approval",
+        choices=["on", "off"],
+        default=None,
+        help="开启或关闭计划获批后自动单次调度 Boost 子智能体（默认关闭，仅 paid+Boost 生效）",
+    )
+    parser.add_argument(
         "--free-plan-review",
         choices=["on", "off"],
         help="开启或关闭免费档计划实施后的单次独立复核",
@@ -1048,6 +1798,18 @@ def main(argv: list[str] | None = None) -> int:
         help="设置交付测试门禁的自定义验证命令（支持 && 组合；传空字符串清空并回退自动探测）",
     )
     parser.add_argument(
+        "--free-fallback",
+        choices=["on", "off"],
+        default=None,
+        help="开启或关闭免费版/关闭 Boost 时的卡壳只读换视角排查（默认开启）",
+    )
+    parser.add_argument(
+        "--plan-fallback",
+        choices=["on", "off"],
+        default=None,
+        help="开启或关闭只读 Plan Mode 拒写方案时的正文审批兜底与 exit_plan_mode 拦截（默认开启）",
+    )
+    parser.add_argument(
         "--auto-update-check",
         choices=["on", "off"],
         default=None,
@@ -1058,6 +1820,11 @@ def main(argv: list[str] | None = None) -> int:
         choices=["on", "off"],
         default=None,
         help="开启或关闭发现同主版本且通过 SHA-256 校验的新版本时静默自动更新（默认关闭）",
+    )
+    parser.add_argument(
+        "--reset-stats",
+        action="store_true",
+        help="清空累计自动重试统计（不修改账号档位、Boost 或 Star 提醒状态）",
     )
     parser.add_argument(
         "--standalone",
@@ -1081,23 +1848,26 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    has_settings_mutation = any(
+    has_settings_mutation = bool(args.reset_stats) or any(
         x is not None
         for x in (
             args.auto_retry,
             args.retry_scope,
             args.plan_tier,
             args.boost,
+            args.boost_after_plan_approval,
             args.free_plan_review,
             args.delivery_test_gate,
             args.delivery_test_cmd,
+            args.free_fallback,
+            args.plan_fallback,
             args.auto_update_check,
             args.auto_update_install,
         )
     )
     has_lifecycle_action = any((args.install, args.remove, args.status, args.sync_check))
     if not has_settings_mutation and not has_lifecycle_action:
-        parser.error("请至少指定一项操作（如 --status / --install / --auto-retry / --plan-tier / --boost）")
+        parser.error("请至少指定一项操作（如 --status / --install / --auto-retry / --plan-tier / --boost / --reset-stats）")
 
     config_dir = resolve_config_dir(args.config_dir)
     state_dir = resolve_state_dir(args.state_dir)
@@ -1110,18 +1880,39 @@ def main(argv: list[str] | None = None) -> int:
     has_plugin = plugin_manifest.is_file()
 
     if has_settings_mutation:
-        updated = apply_settings_cli(
-            state_dir,
-            auto_retry=args.auto_retry,
-            retry_scope=args.retry_scope,
-            plan_tier=args.plan_tier,
-            boost_flag=args.boost,
-            free_plan_review=args.free_plan_review,
-            delivery_test_gate=args.delivery_test_gate,
-            delivery_test_cmd=args.delivery_test_cmd,
-            auto_update_check=args.auto_update_check,
-            auto_update_install=args.auto_update_install,
-        )
+        try:
+            updated = apply_settings_cli(
+                state_dir,
+                auto_retry=args.auto_retry,
+                retry_scope=args.retry_scope,
+                plan_tier=args.plan_tier,
+                boost_flag=args.boost,
+                free_plan_review=args.free_plan_review,
+                delivery_test_gate=args.delivery_test_gate,
+                delivery_test_cmd=args.delivery_test_cmd,
+                auto_update_check=args.auto_update_check,
+                auto_update_install=args.auto_update_install,
+                boost_after_plan_approval=args.boost_after_plan_approval,
+                free_fallback=args.free_fallback,
+                plan_fallback=args.plan_fallback,
+                reset_stats=bool(args.reset_stats),
+            )
+        except SettingsLockTimeoutError as exc:
+            if args.json:
+                print(
+                    json.dumps(
+                        {
+                            "ok": False,
+                            "code": exc.code,
+                            "retryable": True,
+                            "error": str(exc),
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+            else:
+                print(f"ERROR：{exc}", file=sys.stderr)
+            return 3
         if not args.json:
             print(f"已更新 agy-cmd 运行设置（{state_dir / 'settings.json'}）：")
             print(f"  {format_settings_summary(updated)}")
@@ -1139,7 +1930,11 @@ def main(argv: list[str] | None = None) -> int:
             ) == normalize_lf(RULE_BODY)
             hook_issues = validate_hooks_json(plugin_dir, plugin_hooks_path)
             sidecar_issues = validate_sidecar(plugin_dir)
-            drift_issues = validate_verifier(plugin_dir) + validate_bundle_sync(plugin_dir)
+            drift_issues = (
+                check_update_marker_issues(plugin_dir)
+                + validate_verifier(plugin_dir)
+                + validate_bundle_sync(plugin_dir)
+            )
             warnings = list(hook_issues) + list(sidecar_issues) + list(drift_issues)
             if cfg_warning:
                 warnings.insert(0, cfg_warning)
@@ -1244,6 +2039,7 @@ def main(argv: list[str] | None = None) -> int:
                 issues.append(f"存在重复的旧版独立规则：{standalone_rule_path}")
             if legacy_skill_path.is_file():
                 issues.append(f"存在重复的旧版独立 Skill：{legacy_skill_path.parent}")
+            issues.extend(check_update_marker_issues(plugin_dir))
             issues.extend(validate_hooks_json(plugin_dir, plugin_hooks_path))
             issues.extend(validate_sidecar(plugin_dir))
             issues.extend(validate_verifier(plugin_dir))
@@ -1380,9 +2176,21 @@ def main(argv: list[str] | None = None) -> int:
                 else:
                     print(role_issues[0], file=sys.stderr)
                 return 2
-            synced_bundle = sync_plugin_bundle_if_needed(plugin_dir)
-            plugin_rule_path.parent.mkdir(parents=True, exist_ok=True)
-            plugin_rule_path.write_text(RULE_BODY, encoding="utf-8", newline="\n")
+            try:
+                synced_bundle = sync_plugin_bundle_if_needed(plugin_dir)
+            except UpdateTransactionError as exc:
+                if args.json:
+                    print(
+                        json.dumps(
+                            {"ok": False, "reason": exc.reason, "error": str(exc)},
+                            ensure_ascii=False,
+                        )
+                    )
+                else:
+                    print(f"ERROR：{exc}", file=sys.stderr)
+                return 3 if exc.reason == "busy" else 2
+            if not synced_bundle or source_root.resolve() == plugin_dir.resolve():
+                _write_text_lf_atomic(plugin_rule_path, RULE_BODY)
             cfg = set_plugin_enabled(config_dir, True)
             migrate_legacy_settings_if_needed(state_dir)
             had_legacy_rule = standalone_rule_path.is_file()
@@ -1417,8 +2225,7 @@ def main(argv: list[str] | None = None) -> int:
             print_star_followup_hint(mode="install")
             return 0
 
-        standalone_rule_path.parent.mkdir(parents=True, exist_ok=True)
-        standalone_rule_path.write_text(RULE_CONTENT, encoding="utf-8", newline="\n")
+        _write_text_lf_atomic(standalone_rule_path, RULE_CONTENT)
         synced = sync_skill_if_needed(config_dir)
         if args.json:
             print(

@@ -21,7 +21,7 @@ import {
 } from "./lib/common.mjs";
 import { evaluateStop } from "./lib/detector.mjs";
 import { readSettings, recordAutoRetryStat } from "./lib/settings.mjs";
-import { readEvents, readState, writeState } from "./lib/state.mjs";
+import { readEvents, readState, withSessionLock, writeState } from "./lib/state.mjs";
 import {
   inspectTranscriptTail,
   isSubagentTranscript,
@@ -41,23 +41,28 @@ export async function runStop(rawInput, env = process.env, nowMs = Date.now()) {
 
   const stateDir = resolveStateDir(env);
   const convId = resolveConversationId(payload, env);
+  if (!convId) {
+    return { decision: "allow" };
+  }
 
   try {
     const settings = readSettings(stateDir);
-    const prevState = readState(stateDir, convId);
-    const events = readEvents(stateDir, convId);
     const transcriptTail = transcriptPath ? inspectTranscriptTail(transcriptPath) : null;
 
-    const verdict = evaluateStop(payload, events, prevState, {
-      nowMs,
-      env,
-      settings,
-      transcriptTail
+    const verdict = withSessionLock(stateDir, convId, () => {
+      const prevState = readState(stateDir, convId);
+      const events = readEvents(stateDir, convId);
+      const res = evaluateStop(payload, events, prevState, {
+        nowMs,
+        env,
+        settings,
+        transcriptTail
+      });
+      if (res.stateChanged) {
+        writeState(stateDir, convId, res.nextState);
+      }
+      return res;
     });
-
-    if (verdict.stateChanged) {
-      writeState(stateDir, convId, verdict.nextState);
-    }
 
     if (verdict.decision === "continue") {
       if (

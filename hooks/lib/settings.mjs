@@ -166,10 +166,21 @@ export function getSettingsFilePath(stateDir) {
   return path.join(stateDir, "settings.json");
 }
 
-const STAR_LOCK_STALE_MS = 2000;
-const STAR_LOCK_MAX_WAIT_MS = 320;
-const STAR_LOCK_STEP_MS = 8;
+const SETTINGS_LOCK_STALE_MS = 2000;
+const SETTINGS_LOCK_DEAD_PID_GRACE_MS = 100;
+const SETTINGS_LOCK_DEFAULT_WAIT_MS = 1000;
+const SETTINGS_LOCK_STEP_MS = 8;
 const WAIT_BUF = new Int32Array(new SharedArrayBuffer(4));
+
+export class SettingsLockTimeoutError extends Error {
+  constructor(message = "Settings file is busy (lock timeout); please retry.") {
+    super(message);
+    this.name = "SettingsLockTimeoutError";
+    this.code = "SETTINGS_LOCK_TIMEOUT";
+    this.statusCode = 503;
+    this.retryable = true;
+  }
+}
 
 function sleepSyncMs(ms) {
   if (ms <= 0) return;
@@ -178,46 +189,123 @@ function sleepSyncMs(ms) {
   } catch {}
 }
 
-function withSettingsLock(stateDir, fn) {
-  let lockFd = null;
-  const lockPath = path.join(stateDir, ".settings.lock");
+function isPidAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
   try {
-    fs.mkdirSync(stateDir, { recursive: true });
-    const deadline = Date.now() + STAR_LOCK_MAX_WAIT_MS;
-    while (true) {
-      try {
-        lockFd = fs.openSync(lockPath, "wx");
-        break;
-      } catch (err) {
-        if (err?.code !== "EEXIST") {
-          break;
-        }
-        try {
-          const st = fs.statSync(lockPath);
-          if (Date.now() - st.mtimeMs > STAR_LOCK_STALE_MS) {
-            fs.unlinkSync(lockPath);
-            continue;
-          }
-        } catch {}
-        if (Date.now() >= deadline) {
-          break;
-        }
-        sleepSyncMs(STAR_LOCK_STEP_MS);
-      }
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return err?.code === "EPERM";
+  }
+}
+
+function readLockInfo(lockPath) {
+  try {
+    const raw = fs.readFileSync(lockPath, "utf8");
+    const parsed = JSON.parse(raw.replace(/^\uFEFF/, ""));
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return parsed;
     }
+  } catch {}
+  return null;
+}
+
+function resolveSettingsLockWaitMs(options = {}) {
+  const opt = Number(options.maxWaitMs);
+  if (Number.isFinite(opt) && opt >= 0) return Math.floor(opt);
+  const envVal = Number(process.env.AGY_CMD_SETTINGS_LOCK_WAIT_MS);
+  if (Number.isFinite(envVal) && envVal >= 0) return Math.floor(envVal);
+  return SETTINGS_LOCK_DEFAULT_WAIT_MS;
+}
+
+function isLockStale(lockPath, staleMs, pidAliveFn) {
+  let st;
+  try {
+    st = fs.statSync(lockPath);
   } catch {
-    // Fail open if stateDir is unwritable
+    return { stale: false, token: null };
+  }
+  const ageMs = Date.now() - st.mtimeMs;
+  const info = readLockInfo(lockPath);
+  if (info && Number.isInteger(info.pid)) {
+    const tsAge = Number.isFinite(info.ts) ? Date.now() - info.ts : ageMs;
+    if (info.pid !== process.pid && !pidAliveFn(info.pid) && ageMs >= SETTINGS_LOCK_DEAD_PID_GRACE_MS) {
+      return { stale: true, token: typeof info.token === "string" ? info.token : null };
+    }
+    if (tsAge > staleMs && ageMs > staleMs) {
+      return { stale: true, token: typeof info.token === "string" ? info.token : null };
+    }
+    return { stale: false, token: typeof info.token === "string" ? info.token : null };
+  }
+  if (ageMs > staleMs) {
+    return { stale: true, token: null };
+  }
+  return { stale: false, token: null };
+}
+
+function tryReclaimStaleLock(lockPath, expectedToken, staleMs, pidAliveFn) {
+  const check = isLockStale(lockPath, staleMs, pidAliveFn);
+  if (!check.stale) return false;
+  if (expectedToken !== null && check.token !== expectedToken) return false;
+  try {
+    fs.unlinkSync(lockPath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function withSettingsLock(stateDir, fn, options = {}) {
+  const lockPath = path.join(stateDir, ".settings.lock");
+  const maxWaitMs = resolveSettingsLockWaitMs(options);
+  const staleMs =
+    Number.isFinite(Number(options.staleMs)) && Number(options.staleMs) > 0
+      ? Number(options.staleMs)
+      : SETTINGS_LOCK_STALE_MS;
+  const pidAliveFn = typeof options.isPidAlive === "function" ? options.isPidAlive : isPidAlive;
+  const token = crypto.randomBytes(8).toString("hex");
+  let acquired = false;
+
+  fs.mkdirSync(stateDir, { recursive: true });
+  const deadline = Date.now() + maxWaitMs;
+  while (true) {
+    let lockFd = null;
+    try {
+      lockFd = fs.openSync(lockPath, "wx");
+      try {
+        const record = JSON.stringify({ pid: process.pid, token, ts: Date.now() }) + "\n";
+        fs.writeFileSync(lockFd, record, "utf8");
+      } finally {
+        try {
+          fs.closeSync(lockFd);
+        } catch {}
+      }
+      acquired = true;
+      break;
+    } catch (err) {
+      if (err?.code !== "EEXIST") {
+        throw err;
+      }
+      const { stale, token: staleToken } = isLockStale(lockPath, staleMs, pidAliveFn);
+      if (stale && tryReclaimStaleLock(lockPath, staleToken, staleMs, pidAliveFn)) {
+        continue;
+      }
+      if (Date.now() >= deadline) {
+        throw new SettingsLockTimeoutError();
+      }
+      sleepSyncMs(SETTINGS_LOCK_STEP_MS);
+    }
   }
 
   try {
     return fn();
   } finally {
-    if (lockFd !== null) {
+    if (acquired) {
       try {
-        fs.closeSync(lockFd);
-      } catch {}
-      try {
-        fs.unlinkSync(lockPath);
+        const current = readLockInfo(lockPath);
+        if (current && current.token === token) {
+          fs.unlinkSync(lockPath);
+        }
       } catch {}
     }
   }
@@ -229,7 +317,7 @@ function writeFileAtomic(filePath, content) {
   try {
     fs.writeFileSync(tmpName, content, "utf8");
     let lastErr = null;
-    for (let attempt = 0; attempt < 6; attempt++) {
+    for (let attempt = 0; attempt < 8; attempt++) {
       try {
         fs.renameSync(tmpName, filePath);
         lastErr = null;
@@ -246,10 +334,12 @@ function writeFileAtomic(filePath, content) {
       }
     }
     if (lastErr) {
-      fs.writeFileSync(filePath, content, "utf8");
-      try {
-        fs.unlinkSync(tmpName);
-      } catch {}
+      const wrapped = new Error(`Failed to atomically replace settings file: ${lastErr.message}`);
+      wrapped.code = lastErr.code || "SETTINGS_WRITE_BUSY";
+      wrapped.statusCode = 503;
+      wrapped.retryable = true;
+      wrapped.cause = lastErr;
+      throw wrapped;
     }
   } catch (err) {
     try {
@@ -678,27 +768,31 @@ export function evaluateStarPrompt(stateDir, { markTriggered = false, nowIso = n
 
   if (initialEval.shouldShow && markTriggered && !initialEval.triggeredAt) {
     const ts = typeof nowIso === "string" && nowIso.trim() ? nowIso.trim() : new Date().toISOString();
-    return withSettingsLock(stateDir, () => {
-      const freshSettings = readSettings(stateDir);
-      const freshCur = normalizeStarPromptState(freshSettings.starPrompt);
-      const freshRetries = Math.max(0, Math.floor(Number(freshSettings.stats?.totalAutoRetries || 0)));
-      if (freshCur.state !== "pending" || freshRetries < STAR_PROMPT_MIN_AUTO_RETRIES || freshCur.triggeredAt) {
-        return buildStarPromptEvalFromSettings(freshSettings);
-      }
-      const next = {
-        state: "pending",
-        triggeredAt: ts,
-        resolvedAt: null,
-        milestoneAutoRetries: Math.max(freshCur.milestoneAutoRetries, freshRetries)
-      };
-      const merged = { ...freshSettings, starPrompt: next };
-      try {
-        const saved = writeSettings(stateDir, merged);
-        return buildStarPromptEvalFromSettings(saved);
-      } catch {
-        return buildStarPromptEvalFromSettings(merged);
-      }
-    });
+    try {
+      return withSettingsLock(stateDir, () => {
+        const freshSettings = readSettings(stateDir);
+        const freshCur = normalizeStarPromptState(freshSettings.starPrompt);
+        const freshRetries = Math.max(0, Math.floor(Number(freshSettings.stats?.totalAutoRetries || 0)));
+        if (freshCur.state !== "pending" || freshRetries < STAR_PROMPT_MIN_AUTO_RETRIES || freshCur.triggeredAt) {
+          return buildStarPromptEvalFromSettings(freshSettings);
+        }
+        const next = {
+          state: "pending",
+          triggeredAt: ts,
+          resolvedAt: null,
+          milestoneAutoRetries: Math.max(freshCur.milestoneAutoRetries, freshRetries)
+        };
+        const merged = { ...freshSettings, starPrompt: next };
+        try {
+          const saved = writeSettings(stateDir, merged);
+          return buildStarPromptEvalFromSettings(saved);
+        } catch {
+          return buildStarPromptEvalFromSettings(merged);
+        }
+      });
+    } catch {
+      return initialEval;
+    }
   }
 
   return initialEval;

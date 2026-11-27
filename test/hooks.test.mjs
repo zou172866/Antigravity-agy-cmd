@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -10,6 +10,7 @@ import {
   detectHostSurface,
   extractActiveSlashCommands,
   isSubagentPayload,
+  resolveConversationId,
   resolveHostSlashCapability,
   resolveStateDir,
   sanitizeConversationId,
@@ -24,7 +25,15 @@ import {
   reconcileEventsWithTranscript,
   unwrapCliFilterCommand
 } from "../hooks/lib/detector.mjs";
-import { maybeGcStaleSessions, readEvents, readState } from "../hooks/lib/state.mjs";
+import {
+  appendEvents,
+  maybeGcStaleSessions,
+  readEvents,
+  readState,
+  SessionLockTimeoutError,
+  withSessionLock,
+  writeState
+} from "../hooks/lib/state.mjs";
 import { inspectTranscriptTail, isSubagentTranscript } from "../hooks/lib/transcript.mjs";
 import { runSessionStart } from "../hooks/session-start.mjs";
 import { runPreToolUse } from "../hooks/pre-tool-use.mjs";
@@ -524,7 +533,7 @@ test("common: sanitizeConversationId blocks path traversal and preserves safe ID
   assert.match(escaped, /^h_[0-9a-f]{24}$/);
   assert.ok(!escaped.includes(".."));
   assert.ok(!escaped.includes("/"));
-  assert.equal(sanitizeConversationId(""), "default");
+  assert.equal(sanitizeConversationId(""), "");
 });
 
 test("common: sanitizeSnippet redacts secrets and strips backticks/newlines", () => {
@@ -4981,4 +4990,235 @@ test("P1-Teamwork-Surface: paid migration branch requires App surface and host c
   );
   assert.equal(paidAppUnknown.reasonCode, "suggest_teamwork");
   assert.match(paidAppUnknown.injectStep.systemMessage.systemMessage, /First verify that "\/teamwork" is listed/);
+});
+
+test("P1 Batch B · B-4: hooks.json blocks mixed-version imports when .update-in-progress exists without falling back", (t) => {
+  const dir = makeTmpDir("agy-cmd-hook-upd-");
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const stateDir = path.join(dir, "state");
+  const primary = path.join(dir, "primary");
+  const secondary = path.join(dir, "secondary");
+  fs.mkdirSync(primary, { recursive: true });
+  fs.mkdirSync(secondary, { recursive: true });
+  fs.cpSync(path.join(PLUGIN_ROOT, "hooks"), path.join(primary, "hooks"), { recursive: true });
+  fs.copyFileSync(path.join(PLUGIN_ROOT, "plugin.json"), path.join(primary, "plugin.json"));
+  fs.cpSync(path.join(PLUGIN_ROOT, "hooks"), path.join(secondary, "hooks"), { recursive: true });
+  fs.copyFileSync(path.join(PLUGIN_ROOT, "plugin.json"), path.join(secondary, "plugin.json"));
+  // Plant broken hook in primary + update marker: must return neutral response with `update_in_progress` and NEVER load hook or fall through
+  fs.writeFileSync(path.join(primary, "hooks", "stop.mjs"), "throw new Error('must not import during update');\n");
+  fs.writeFileSync(
+    path.join(primary, ".update-in-progress"),
+    JSON.stringify({ schemaVersion: 2, pid: 99999999, phase: "replacing" }) + "\n"
+  );
+
+  const spec = JSON.parse(fs.readFileSync(path.join(PLUGIN_ROOT, "hooks.json"), "utf8"))["agy-cmd-router"];
+  const env = makeEnv(stateDir, { PLUGIN_ROOT: primary, AGY_PLUGIN_ROOT: secondary });
+  delete env.AGY_CMD_DEV_ROOT;
+
+  for (const [hook, handlers] of Object.entries(spec)) {
+    const handler = handlers[0].hooks?.[0] ?? handlers[0];
+    const res = spawnSync(handler.command, {
+      shell: true,
+      windowsHide: true,
+      timeout: 5000,
+      encoding: "utf8",
+      input: "{}",
+      cwd: dir,
+      env
+    });
+    assert.equal(res.status, 0, `${hook}: ${res.stderr}`);
+    assert.equal(res.stderr, "", hook);
+    const out = JSON.parse(res.stdout);
+    assert.deepEqual(out, ["PreToolUse", "Stop"].includes(hook) ? { decision: "allow" } : {}, hook);
+  }
+  const rows = fs
+    .readFileSync(path.join(stateDir, "hook-bootstrap.log"), "utf8")
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line));
+  assert.deepEqual(rows.map((r) => r.hook), Object.keys(spec));
+  assert.ok(rows.every((r) => r.reason === "update_in_progress"));
+});
+
+test("P1 Batch B · B-5: no-ID sessions avoid shared 'default', transcript paths isolate keys, and raw lastUserInput never hits disk", async (t) => {
+  const dir = makeTmpDir("agy-cmd-b5-");
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const env = makeEnv(dir, { ANTIGRAVITY_CONVERSATION_ID: "" });
+  updateSettings(dir, { autoRetryMode: "count", autoRetryMax: 2, autoRetryScope: "all_failures" });
+
+  // 1. Missing ID and missing transcript/artifact path -> empty key, no default.* files, Stop allows cleanly
+  assert.equal(resolveConversationId({}, {}), "");
+  await runPreInvocation({ invocationNum: 0, initialNumSteps: 1, lastUserInput: "修一下测试" }, env, 1000);
+  await runPostToolUse(
+    { toolCall: { name: "run_command", args: { CommandLine: "npm test" } }, error: "exit 1" },
+    env,
+    1010
+  );
+  const noIdStop = await runStop({ terminationReason: "NO_TOOL_CALL", fullyIdle: true }, env, 1020);
+  assert.equal(noIdStop.decision, "allow");
+  const sessionsDir = path.join(dir, "sessions");
+  const sessionFiles = fs.existsSync(sessionsDir) ? fs.readdirSync(sessionsDir) : [];
+  assert.equal(sessionFiles.some((f) => f.startsWith("default.")), false);
+  assert.equal(sessionFiles.length, 0);
+
+  // 2. Missing conversationId WITH distinct transcriptPath -> derives distinct tx_<hash> keys and isolates budgets
+  const txA = path.join(dir, "tx-a.jsonl");
+  const txB = path.join(dir, "tx-b.jsonl");
+  fs.writeFileSync(txA, JSON.stringify({ step_index: 0, type: "USER_INPUT", content: "<USER_REQUEST>\n修 A\n</USER_REQUEST>" }) + "\n");
+  fs.writeFileSync(txB, JSON.stringify({ step_index: 0, type: "USER_INPUT", content: "<USER_REQUEST>\n修 B\n</USER_REQUEST>" }) + "\n");
+  const idA = resolveConversationId({ transcriptPath: txA }, {});
+  const idB = resolveConversationId({ transcriptPath: txB }, {});
+  assert.match(idA, /^tx_[0-9a-f]{24}$/);
+  assert.match(idB, /^tx_[0-9a-f]{24}$/);
+  assert.notEqual(idA, idB);
+
+  await runPreInvocation({ transcriptPath: txA, invocationNum: 0, initialNumSteps: 1, lastUserInput: "修 A" }, env, 2000);
+  await runPostToolUse(
+    { transcriptPath: txA, toolCall: { name: "run_command", args: { CommandLine: "npm test" } }, error: "exit 1" },
+    env,
+    2010
+  );
+  const stopA = await runStop({ transcriptPath: txA, terminationReason: "NO_TOOL_CALL", fullyIdle: true }, env, 2020);
+  assert.equal(stopA.decision, "continue");
+  // Session B must NOT inherit Session A's failure or retry count
+  const stopB = await runStop({ transcriptPath: txB, terminationReason: "NO_TOOL_CALL", fullyIdle: true }, env, 2030);
+  assert.equal(stopB.decision, "allow");
+
+  // 3. Raw lastUserInput (including secrets & prose) NEVER written to .state.json, while mid-turn, plan approval, Stop fallback & legacy stripping work
+  const secretPrompt = "帮我修一下支付逻辑 sk-live-SUPERSECRET9876543210 不要派子智能体 这次跳过测试";
+  const convSec = "sec-boundary-1";
+  await runPreInvocation(
+    { conversationId: convSec, invocationNum: 0, initialNumSteps: 1, lastUserInput: secretPrompt },
+    env,
+    3000
+  );
+  const rawDisk = fs.readFileSync(path.join(dir, "sessions", `${convSec}.state.json`), "utf8");
+  assert.equal(rawDisk.includes("SUPERSECRET9876543210"), false, "Raw secret must not appear in persisted state");
+  assert.equal(rawDisk.includes("帮我修一下支付逻辑"), false, "Raw user prose must not appear in persisted state");
+  const parsedDisk = JSON.parse(rawDisk);
+  assert.equal("lastUserInput" in parsedDisk, false);
+  assert.match(parsedDisk.lastUserInputHash, /^[0-9a-f]{24}$/);
+  assert.equal(parsedDisk.lastTurnSignals?.declinesDelegation, true);
+  assert.equal(parsedDisk.lastTurnSignals?.skipCheck, true);
+
+  // Mid-turn invocation without payload.lastUserInput still honors declinesDelegation from lastTurnSignals
+  updateSettings(dir, { planTier: "paid", boostEnabled: true, freeFallbackEnabled: true });
+  const midEvs = [
+    { kind: "cmd", failed: true, ts: 3010, cmd: "npm test" },
+    { kind: "cmd", failed: true, ts: 3020, cmd: "npm test" },
+    { kind: "cmd", failed: true, ts: 3030, cmd: "npm test" }
+  ];
+  const midDecision = evaluatePreInvocation(
+    { conversationId: convSec, invocationNum: 1, initialNumSteps: 4, lastUserInput: "" },
+    midEvs,
+    readState(dir, convSec),
+    { nowMs: 3040, settings: readSettings(dir) }
+  );
+  assert.equal(midDecision.injectStep, null, "Mid-turn without lastUserInput must still honor declinesDelegation");
+
+  // Stop without payload.lastUserInput still honors skipCheck from lastTurnSignals
+  const stopNoInput = evaluateStop(
+    { conversationId: convSec, terminationReason: "NO_TOOL_CALL", fullyIdle: true },
+    [{ kind: "cmd", failed: true, isVerify: true, ts: 3050, cmd: "npm test" }],
+    { ...readState(dir, convSec), deliveryGate: { key: "turn:1", skipCheck: false, wroteSource: true, scopes: {}, customReceipts: {} } },
+    { nowMs: 3060, settings: { ...readSettings(dir), deliveryTestGateEnabled: true, autoRetryScope: "smart" } }
+  );
+  assert.equal(stopNoInput.decision, "allow");
+
+  // Legacy state file on disk containing raw lastUserInput is transparently hashed and stripped on read & write
+  const legacyConv = "legacy-strip-1";
+  const legacyPath = path.join(dir, "sessions", `${legacyConv}.state.json`);
+  fs.writeFileSync(legacyPath, JSON.stringify({ version: 1, userTurnCount: 1, lastUserInput: "legacy secret token=abc12345" }));
+  const loadedLegacy = readState(dir, legacyConv);
+  assert.equal("lastUserInput" in loadedLegacy, false);
+  assert.match(loadedLegacy.lastUserInputHash, /^[0-9a-f]{24}$/);
+  writeState(dir, legacyConv, loadedLegacy);
+  const rewrittenLegacy = fs.readFileSync(legacyPath, "utf8");
+  assert.equal(rewrittenLegacy.includes("legacy secret"), false);
+  assert.equal("lastUserInput" in JSON.parse(rewrittenLegacy), false);
+});
+
+test("P1 Batch B · B-3: session lock prevents lost appends during compaction, serializes concurrent PreInvocation/Stop, and rejects lock timeout", async (t) => {
+  const dir = makeTmpDir("agy-cmd-b3-");
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const convId = "conc-sess-1";
+
+  // 1. Holding active session lock rejects contention cleanly without clobbering lock or state
+  writeState(dir, convId, { userTurnCount: 7 });
+  const lockPath = path.join(dir, "sessions", `${convId}.lock`);
+  const holderToken = "deadbeefcafebabe";
+  fs.writeFileSync(lockPath, JSON.stringify({ pid: process.pid, token: holderToken, ts: Date.now() }) + "\n");
+  assert.throws(
+    () => withSessionLock(dir, convId, () => {}, { maxWaitMs: 40 }),
+    (err) => err instanceof SessionLockTimeoutError && err.statusCode === 503 && err.retryable === true
+  );
+  assert.equal(JSON.parse(fs.readFileSync(lockPath, "utf8")).token, holderToken, "Foreign lock must not be unlinked");
+  fs.unlinkSync(lockPath);
+  assert.equal(readState(dir, convId).userTurnCount, 7);
+
+  // 2. Concurrent multi-process appendEvents + >180-line compaction preserves every latest appended event and keeps valid JSONL
+  const seed = Array.from({ length: 185 }, (_, i) => ({ kind: "cmd", failed: false, ts: 1000 + i, seq: i }));
+  appendEvents(dir, convId, seed);
+
+  const workerAppend = `
+    import { appendEvents } from ${JSON.stringify(new URL("../hooks/lib/state.mjs", import.meta.url).href)};
+    const dir = process.argv[1], conv = process.argv[2], start = Number(process.argv[3]);
+    for (let i = 0; i < 15; i++) {
+      appendEvents(dir, conv, [{ kind: "cmd", failed: false, ts: 5000 + start + i, tag: "w" + start + "_" + i }]);
+    }
+  `;
+  const workerCompact = `
+    import { readEvents } from ${JSON.stringify(new URL("../hooks/lib/state.mjs", import.meta.url).href)};
+    const dir = process.argv[1], conv = process.argv[2];
+    for (let i = 0; i < 8; i++) {
+      readEvents(dir, conv, { compact: true, maxLines: 120 });
+    }
+  `;
+  const runNode = (code, args) =>
+    new Promise((resolve, reject) => {
+      const child = spawn(process.execPath, ["--input-type=module", "-e", code, ...args], {
+        stdio: ["ignore", "pipe", "pipe"],
+        windowsHide: true
+      });
+      let stderr = "";
+      child.stderr.on("data", (c) => { stderr += c; });
+      child.on("close", (codeExit) => (codeExit === 0 ? resolve() : reject(new Error(`exit ${codeExit}: ${stderr}`))));
+    });
+
+  await Promise.all([
+    runNode(workerAppend, [dir, convId, "100"]),
+    runNode(workerAppend, [dir, convId, "200"]),
+    runNode(workerCompact, [dir, convId])
+  ]);
+
+  const finalEvents = readEvents(dir, convId, { compact: false, maxLines: 500 });
+  const tags = new Set(finalEvents.map((e) => e.tag).filter(Boolean));
+  assert.equal(tags.size, 30, `Expected all 30 concurrent appended events to survive compaction, got ${tags.size}`);
+
+  // 3. Concurrent PreInvocation and Stop multi-process updates produce valid state JSON with monotonic rev
+  const convRace = "conc-race-2";
+  updateSettings(dir, { autoRetryMode: "count", autoRetryMax: 5, autoRetryScope: "all_failures" });
+  const preScript = `
+    import { runPreInvocation } from ${JSON.stringify(new URL("../hooks/pre-invocation.mjs", import.meta.url).href)};
+    const dir = process.argv[1], conv = process.argv[2];
+    const env = { ...process.env, AGY_CMD_STATE_DIR: dir };
+    for (let i = 0; i < 5; i++) {
+      await runPreInvocation({ conversationId: conv, invocationNum: 0, initialNumSteps: i + 1, lastUserInput: "turn " + i }, env, 10000 + i);
+    }
+  `;
+  const stopScript = `
+    import { runStop } from ${JSON.stringify(new URL("../hooks/stop.mjs", import.meta.url).href)};
+    const dir = process.argv[1], conv = process.argv[2];
+    const env = { ...process.env, AGY_CMD_STATE_DIR: dir };
+    for (let i = 0; i < 5; i++) {
+      await runStop({ conversationId: conv, terminationReason: "NO_TOOL_CALL", fullyIdle: true }, env, 10050 + i);
+    }
+  `;
+  await Promise.all([
+    runNode(preScript, [dir, convRace]),
+    runNode(stopScript, [dir, convRace])
+  ]);
+  const finalRaceState = readState(dir, convRace);
+  assert.ok(finalRaceState.rev >= 5, `Expected monotonic rev >= 5, got ${finalRaceState.rev}`);
+  assert.equal(finalRaceState.userTurnCount, 5);
 });

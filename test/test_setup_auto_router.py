@@ -732,6 +732,323 @@ class TestStarFollowupCliAndState(unittest.TestCase):
             summary = router.format_settings_summary(router.load_settings(st_dir))
             self.assertIn("自定义命令无效，需修正", summary)
 
+    def test_p1_batch_b_cli_parity_tier_semantics_and_lock_timeout(self) -> None:
+        import os
+
+        with tempfile.TemporaryDirectory() as tmp:
+            st_py = Path(tmp) / "state_py"
+            st_js = Path(tmp) / "state_js"
+
+            # 1. New CLI flags: boost-after-plan-approval, free-fallback, plan-fallback, reset-stats
+            r_init = run_cli(
+                "--plan-tier",
+                "paid",
+                "--boost",
+                "off",
+                "--boost-after-plan-approval",
+                "on",
+                "--free-fallback",
+                "off",
+                "--plan-fallback",
+                "off",
+                "--state-dir",
+                str(st_py),
+                "--json",
+            )
+            self.assertEqual(r_init.returncode, 0, r_init.stderr)
+            s_py = json.loads(r_init.stdout)["settings"]
+            self.assertEqual(s_py["planTier"], "paid")
+            self.assertFalse(s_py["boostEnabled"])
+            self.assertTrue(s_py["boostAfterPlanApproval"])
+            self.assertFalse(s_py["freeFallbackEnabled"])
+            self.assertFalse(s_py["planFallbackEnabled"])
+
+            # 2. Tier semantic parity: paid + boostEnabled=False then `--plan-tier paid` keeps boostEnabled=False!
+            r_same_paid = run_cli("--plan-tier", "paid", "--state-dir", str(st_py), "--json")
+            self.assertEqual(r_same_paid.returncode, 0, r_same_paid.stderr)
+            self.assertFalse(json.loads(r_same_paid.stdout)["settings"]["boostEnabled"])
+
+            # 3. --reset-stats zeroes stats without changing planTier, boostEnabled, or starPrompt
+            raw = json.loads((st_py / "settings.json").read_text(encoding="utf-8"))
+            raw["stats"] = {"totalAutoRetries": 7, "lastAutoRetryAt": "2026-01-01T00:00:00Z", "lastAutoRetryConvId": "c9"}
+            raw["starPrompt"] = {"state": "dismissed", "triggeredAt": "2026-01-01T00:00:00Z", "resolvedAt": "2026-01-02T00:00:00Z", "milestoneAutoRetries": 7}
+            (st_py / "settings.json").write_text(json.dumps(raw, indent=2) + "\n", encoding="utf-8")
+
+            r_reset = run_cli("--reset-stats", "--state-dir", str(st_py), "--json")
+            self.assertEqual(r_reset.returncode, 0, r_reset.stderr)
+            s_after_reset = json.loads(r_reset.stdout)["settings"]
+            self.assertEqual(s_after_reset["stats"]["totalAutoRetries"], 0)
+            self.assertEqual(s_after_reset["stats"]["lastAutoRetryAt"], "")
+            self.assertEqual(s_after_reset["planTier"], "paid")
+            self.assertFalse(s_after_reset["boostEnabled"])
+            self.assertEqual(s_after_reset["starPrompt"]["state"], "dismissed")
+
+            # 4. Cross-language parity against JS updateSettings with identical patch sequence
+            js_url = (PLUGIN_ROOT / "hooks" / "lib" / "settings.mjs").resolve().as_uri()
+            js_code = (
+                f"import {{ updateSettings }} from {json.dumps(js_url)};"
+                "const d = process.argv[1];"
+                "updateSettings(d, { planTier: 'paid', boostEnabled: false, boostAfterPlanApproval: true, freeFallbackEnabled: false, planFallbackEnabled: false });"
+                "const out = updateSettings(d, { planTier: 'paid', resetStats: true });"
+                "console.log(JSON.stringify(out));"
+            )
+            js_run = subprocess.run(
+                ["node", "--input-type=module", "-e", js_code, str(st_js)],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                check=False,
+            )
+            self.assertEqual(js_run.returncode, 0, js_run.stderr)
+            s_js = json.loads(js_run.stdout)
+            for key in (
+                "version",
+                "planTier",
+                "boostEnabled",
+                "boostAfterPlanApproval",
+                "freeFallbackEnabled",
+                "planFallbackEnabled",
+                "stats",
+            ):
+                self.assertEqual(s_after_reset[key], s_js[key], f"JS/Python parity mismatch on {key}")
+
+            # 5. Dirty non-boolean values in settings.json normalize identically to JS
+            dirty = {
+                "version": 3,
+                "planTier": "paid",
+                "boostEnabled": "yes",
+                "freeFallbackEnabled": "nope",
+                "planFallbackEnabled": 0,
+                "autoRetryMax": 999,
+            }
+            (st_py / "settings.json").write_text(json.dumps(dirty), encoding="utf-8")
+            norm = router.load_settings(st_py)
+            self.assertFalse(norm["boostEnabled"])
+            self.assertTrue(norm["freeFallbackEnabled"])
+            self.assertTrue(norm["planFallbackEnabled"])
+            self.assertEqual(norm["autoRetryMax"], 50)
+
+            # 6. Active .settings.lock timeout aborts cleanly with exit 3, preserves settings.json & foreign lock
+            (st_py / "settings.json").write_text(json.dumps(s_after_reset, indent=2) + "\n", encoding="utf-8")
+            lock_path = st_py / ".settings.lock"
+            lock_path.write_text(json.dumps({"pid": os.getpid(), "token": "keep-holder", "ts": int(router.time.time() * 1000)}) + "\n", encoding="utf-8")
+            env_short = dict(os.environ)
+            env_short["AGY_CMD_SETTINGS_LOCK_WAIT_MS"] = "50"
+            r_locked = subprocess.run(
+                [sys.executable, str(SCRIPT_PATH), "--auto-retry", "9", "--state-dir", str(st_py), "--json"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                env=env_short,
+                check=False,
+            )
+            self.assertEqual(r_locked.returncode, 3, r_locked.stderr)
+            lock_err = json.loads(r_locked.stdout)
+            self.assertEqual(lock_err["ok"], False)
+            self.assertEqual(lock_err["code"], "SETTINGS_LOCK_TIMEOUT")
+            self.assertEqual(lock_err["retryable"], True)
+            self.assertEqual(json.loads(lock_path.read_text(encoding="utf-8"))["token"], "keep-holder")
+            self.assertEqual(router.load_settings(st_py)["autoRetryMax"], 3)
+
+    def test_p1_batch_b_shared_install_transaction_recovery_and_python_compat(self) -> None:
+        import ast
+        import hashlib
+        import os
+        import shutil
+        import zipfile
+
+        # 1. Python 3.8+ AST compatibility check (no write_text(newline=...), no removeprefix/removesuffix)
+        source_text = SCRIPT_PATH.read_text(encoding="utf-8")
+        tree = ast.parse(source_text)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+                if node.func.attr == "write_text":
+                    kw_names = {kw.arg for kw in node.keywords}
+                    self.assertNotIn("newline", kw_names, "Path.write_text(newline=...) breaks Python < 3.10")
+                self.assertNotIn(node.func.attr, ("removeprefix", "removesuffix"), "str.removeprefix breaks Python 3.8")
+
+        # 2. Pinned-release remote installer static checks & version alignment
+        pkg_ver = json.loads((PLUGIN_ROOT / "package.json").read_text(encoding="utf-8"))["version"]
+        expected_tag = f"v{pkg_ver}"
+        for rel_name in ("install.ps1", "install.sh", "README.md", "README.zh-CN.md"):
+            txt = (PLUGIN_ROOT / rel_name).read_text(encoding="utf-8")
+            self.assertNotIn("archive/refs/heads/main", txt, f"{rel_name} must not download mutable main archive")
+            self.assertNotIn("/main/install.", txt, f"{rel_name} must not point one-line installer at mutable main")
+            self.assertIn(expected_tag, txt, f"{rel_name} must reference pinned tag {expected_tag}")
+        for script_name in ("install.ps1", "install.sh"):
+            txt = (PLUGIN_ROOT / script_name).read_text(encoding="utf-8")
+            self.assertNotIn("git clone", txt, f"{script_name} must not git clone mutable default branch")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_dir = Path(tmp) / "cfg"
+            st_dir = Path(tmp) / "state"
+            p_dir = cfg_dir / "plugins" / "agy-cmd"
+
+            # 3. Staged Python install preserves pinned sidecar Node path, .local.md, .gitignore, removes obsolete files, and passes --sync-check
+            self.assertEqual(run_cli("--install", "--config-dir", str(cfg_dir), "--state-dir", str(st_dir), "--json").returncode, 0)
+            sc_path = p_dir / "sidecars" / "panel" / "sidecar.json"
+            sc_obj = json.loads(sc_path.read_text(encoding="utf-8"))
+            pinned_node = r"C:\Program Files\nodejs\node.exe" if os.name == "nt" else "/usr/local/bin/node"
+            sc_obj["command"] = pinned_node
+            sc_path.write_text(json.dumps(sc_obj, indent=2) + "\n", encoding="utf-8")
+            (p_dir / "rules" / "custom.local.md").write_text("# local rule\n", encoding="utf-8")
+            (p_dir / ".gitignore").write_text("*.tmp\n", encoding="utf-8")
+            (p_dir / "obsolete-artifact.txt").write_text("stale\n", encoding="utf-8")
+
+            r_reinstall = run_cli("--install", "--config-dir", str(cfg_dir), "--state-dir", str(st_dir), "--json")
+            self.assertEqual(r_reinstall.returncode, 0, r_reinstall.stderr)
+            self.assertEqual(json.loads(sc_path.read_text(encoding="utf-8"))["command"], pinned_node)
+            self.assertEqual((p_dir / "rules" / "custom.local.md").read_text(encoding="utf-8"), "# local rule\n")
+            self.assertTrue((p_dir / ".gitignore").is_file())
+            self.assertFalse((p_dir / "obsolete-artifact.txt").exists())
+            r_sync = run_cli("--sync-check", "--config-dir", str(cfg_dir), "--state-dir", str(st_dir), "--json")
+            self.assertEqual(r_sync.returncode, 0, r_sync.stdout)
+
+            # 4. Injected mid-replace failure rolls back cleanly without leaving marker or corrupting files
+            orig_common = (p_dir / "hooks" / "lib" / "common.mjs").read_text(encoding="utf-8")
+            with self.assertRaises(RuntimeError):
+                router.sync_plugin_bundle_if_needed(p_dir, _fail_after_moves=3)
+            self.assertFalse((p_dir / router.UPDATE_MARKER_NAME).exists())
+            self.assertEqual((p_dir / "hooks" / "lib" / "common.mjs").read_text(encoding="utf-8"), orig_common)
+
+            # 5. Active live-PID marker from Sidecar blocks concurrent Python --install with busy (exit 3)
+            marker_path = p_dir / router.UPDATE_MARKER_NAME
+            marker_path.write_text(
+                json.dumps({"schemaVersion": 2, "pid": os.getpid(), "phase": "replacing", "startedAt": int(router.time.time() * 1000)}) + "\n",
+                encoding="utf-8",
+            )
+            r_busy = run_cli("--install", "--config-dir", str(cfg_dir), "--state-dir", str(st_dir), "--json")
+            self.assertEqual(r_busy.returncode, 3, r_busy.stdout)
+            self.assertEqual(json.loads(r_busy.stdout)["reason"], "busy")
+            marker_path.unlink()
+
+            # 6. Simulated dead-PID interrupted Sidecar update is automatically recovered by Python --install
+            work_dir = p_dir.parent / ".agy-cmd-update-pyrec1"
+            (work_dir / "next" / "hooks").mkdir(parents=True, exist_ok=True)
+            (work_dir / "backup" / "prev" / "hooks").mkdir(parents=True, exist_ok=True)
+            shutil.move(str(p_dir / "hooks" / "stop.mjs"), str(work_dir / "backup" / "prev" / "hooks" / "stop.mjs"))
+            (work_dir / "journal.json").write_text(
+                json.dumps({
+                    "schemaVersion": 2,
+                    "token": "tok-pyrec",
+                    "previousVersion": pkg_ver,
+                    "targetVersion": "9.9.9",
+                    "freshInstall": False,
+                    "orderedInstall": ["hooks/stop.mjs"],
+                    "preexistingPaths": ["hooks/stop.mjs"],
+                    "obsoleteFiles": [],
+                }),
+                encoding="utf-8",
+            )
+            marker_path.write_text(
+                json.dumps({
+                    "schemaVersion": 2,
+                    "pid": 99999999,
+                    "token": "tok-pyrec",
+                    "phase": "replacing",
+                    "startedAt": int(router.time.time() * 1000) - 5000,
+                    "previousVersion": pkg_ver,
+                    "workDirName": work_dir.name,
+                    "journalFile": "journal.json",
+                }) + "\n",
+                encoding="utf-8",
+            )
+            r_rec = run_cli("--install", "--config-dir", str(cfg_dir), "--state-dir", str(st_dir), "--json")
+            self.assertEqual(r_rec.returncode, 0, r_rec.stderr)
+            self.assertTrue((p_dir / "hooks" / "stop.mjs").is_file())
+            self.assertFalse(marker_path.exists())
+            self.assertFalse(work_dir.exists())
+
+            # 7. Real Windows PowerShell offline --archive + --checksums verification test
+            if os.name == "nt" and shutil.which("powershell"):
+                zip_path = Path(tmp) / f"agy-cmd-{expected_tag}.zip"
+                with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                    for root_name in router.BUNDLE_ROOT_FILES:
+                        fp = PLUGIN_ROOT / root_name
+                        if fp.is_file():
+                            zf.write(fp, f"agy-cmd-{expected_tag}/{root_name}")
+                    for d_name in router.BUNDLE_DIRS:
+                        d_root = PLUGIN_ROOT / d_name
+                        if not d_root.is_dir():
+                            continue
+                        for fp in sorted(d_root.rglob("*")):
+                            if fp.is_file() and "__pycache__" not in fp.parts and fp.suffix not in (".pyc", ".pyo"):
+                                zf.write(fp, f"agy-cmd-{expected_tag}/{fp.relative_to(PLUGIN_ROOT).as_posix()}")
+                actual_sha = hashlib.sha256(zip_path.read_bytes()).hexdigest()
+                good_sums = Path(tmp) / "SHA256SUMS.txt"
+                good_sums.write_text(f"{actual_sha}  {zip_path.name}\n", encoding="utf-8")
+                bad_sums = Path(tmp) / "BAD_SUMS.txt"
+                bad_sums.write_text(f"{'0' * 64}  {zip_path.name}\n", encoding="utf-8")
+
+                ps_cfg_bad = Path(tmp) / "ps_cfg_bad"
+                ps_bad = subprocess.run(
+                    [
+                        "powershell",
+                        "-NoProfile",
+                        "-ExecutionPolicy",
+                        "Bypass",
+                        "-File",
+                        str(PLUGIN_ROOT / "install.ps1"),
+                        "--archive",
+                        str(zip_path),
+                        "--checksums",
+                        str(bad_sums),
+                        "--config-dir",
+                        str(ps_cfg_bad),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    check=False,
+                )
+                self.assertNotEqual(ps_bad.returncode, 0)
+                self.assertFalse((ps_cfg_bad / "plugins" / "agy-cmd").exists())
+
+                ps_bad_ver = subprocess.run(
+                    [
+                        "powershell",
+                        "-NoProfile",
+                        "-ExecutionPolicy",
+                        "Bypass",
+                        "-File",
+                        str(PLUGIN_ROOT / "install.ps1"),
+                        "--version",
+                        "main",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    check=False,
+                )
+                self.assertNotEqual(ps_bad_ver.returncode, 0)
+
+                ps_cfg_ok = Path(tmp) / "ps_cfg_ok"
+                ps_st_ok = Path(tmp) / "ps_st_ok"
+                ps_ok = subprocess.run(
+                    [
+                        "powershell",
+                        "-NoProfile",
+                        "-ExecutionPolicy",
+                        "Bypass",
+                        "-File",
+                        str(PLUGIN_ROOT / "install.ps1"),
+                        "--archive",
+                        str(zip_path),
+                        "--checksums",
+                        str(good_sums),
+                        "--config-dir",
+                        str(ps_cfg_ok),
+                        "--state-dir",
+                        str(ps_st_ok),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    check=False,
+                )
+                self.assertEqual(ps_ok.returncode, 0, ps_ok.stderr + ps_ok.stdout)
+                self.assertTrue((ps_cfg_ok / "plugins" / "agy-cmd" / "plugin.json").is_file())
+
 
 if __name__ == "__main__":
     unittest.main()

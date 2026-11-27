@@ -23,9 +23,11 @@ import { evaluatePreInvocation } from "./lib/detector.mjs";
 import { readSettings } from "./lib/settings.mjs";
 import {
   clearEvents,
+  createDefaultState,
   maybeGcStaleSessions,
   readEvents,
   readState,
+  withSessionLock,
   writeState
 } from "./lib/state.mjs";
 import {
@@ -51,24 +53,38 @@ export async function runPreInvocation(rawInput, env = process.env, nowMs = Date
 
   try {
     const settings = readSettings(stateDir);
-    const prevState = readState(stateDir, convId);
-    const events = readEvents(stateDir, convId);
     const transcriptTail = transcriptPath ? inspectTranscriptTail(transcriptPath) : null;
 
-    const decision = evaluatePreInvocation(payload, events, prevState, {
-      nowMs,
-      env,
-      uiOnly,
-      settings,
-      transcriptTail
+    if (!convId) {
+      const decision = evaluatePreInvocation(payload, [], createDefaultState(), {
+        nowMs,
+        env,
+        uiOnly,
+        settings,
+        transcriptTail
+      });
+      return decision.injectStep ? { injectSteps: [decision.injectStep] } : {};
+    }
+
+    const decision = withSessionLock(stateDir, convId, () => {
+      const prevState = readState(stateDir, convId);
+      const events = readEvents(stateDir, convId);
+      const res = evaluatePreInvocation(payload, events, prevState, {
+        nowMs,
+        env,
+        uiOnly,
+        settings,
+        transcriptTail
+      });
+      if (res.shouldResetEvents) {
+        clearEvents(stateDir, convId);
+      }
+      if (res.stateChanged) {
+        writeState(stateDir, convId, res.nextState);
+      }
+      return res;
     });
 
-    if (decision.shouldResetEvents) {
-      clearEvents(stateDir, convId);
-    }
-    if (decision.stateChanged) {
-      writeState(stateDir, convId, decision.nextState);
-    }
     maybeGcStaleSessions(stateDir, nowMs);
 
     if (!decision.injectStep) {

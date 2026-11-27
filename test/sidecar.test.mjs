@@ -1,14 +1,19 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 import vm from "node:vm";
 
 import {
   createDefaultSettings,
   parseTurnRetryOverride,
   readSettings,
+  recordAutoRetryStat,
+  SettingsLockTimeoutError,
+  updateAutoUpdateState,
   updateSettings
 } from "../hooks/lib/settings.mjs";
 import { runPostToolUse } from "../hooks/post-tool-use.mjs";
@@ -936,4 +941,83 @@ test("P1 Batch A panel API & UI: rejects invalid/9-segment deliveryTestCommand p
   await new Promise((r) => setTimeout(r, 20));
   assert.equal(getEl("row-swarm-resume").hidden, true);
   assert.equal(dispatchPanelApi("/api/state", { conversationId: convId }, { stateDir: dir }).body.activeSession?.swarmActive, false);
+});
+
+test("P1 Batch B · B-2: settings lock timeout aborts writes with 503 preserving file/lock, telemetry stays fail-open, and concurrent JS+Python writes do not clobber", async (t) => {
+  const dir = makeTmpDir("agy-cmd-b2-lock-");
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const prevWait = process.env.AGY_CMD_SETTINGS_LOCK_WAIT_MS;
+  t.after(() => {
+    if (prevWait === undefined) delete process.env.AGY_CMD_SETTINGS_LOCK_WAIT_MS;
+    else process.env.AGY_CMD_SETTINGS_LOCK_WAIT_MS = prevWait;
+  });
+
+  updateSettings(dir, { planTier: "paid", boostEnabled: true, autoRetryMax: 4 });
+  const lockPath = path.join(dir, ".settings.lock");
+  const holderToken = "0123456789abcdef";
+  fs.writeFileSync(lockPath, JSON.stringify({ pid: process.pid, token: holderToken, ts: Date.now() }) + "\n");
+  process.env.AGY_CMD_SETTINGS_LOCK_WAIT_MS = "50";
+
+  // 1. Strict write paths reject with 503 SETTINGS_LOCK_TIMEOUT and keep settings.json & foreign lock intact
+  assert.throws(
+    () => updateSettings(dir, { autoRetryMax: 9 }),
+    (err) => err instanceof SettingsLockTimeoutError && err.statusCode === 503 && err.retryable === true
+  );
+  const apiRes = dispatchPanelApi("/api/settings", { autoRetryMax: 9 }, { stateDir: dir });
+  assert.equal(apiRes.status, 503);
+  assert.equal(apiRes.body.code, "SETTINGS_LOCK_TIMEOUT");
+  assert.equal(apiRes.body.retryable, true);
+
+  const dismissRes = dispatchPanelApi("/api/dismiss-onboarding", {}, { stateDir: dir });
+  assert.equal(dismissRes.status, 503);
+  assert.equal(dismissRes.body.code, "SETTINGS_LOCK_TIMEOUT");
+
+  const starRes = dispatchPanelApi("/api/star-prompt", { state: "dismissed" }, { stateDir: dir });
+  assert.equal(starRes.status, 503);
+  assert.equal(starRes.body.code, "SETTINGS_LOCK_TIMEOUT");
+
+  assert.equal(readSettings(dir).autoRetryMax, 4, "Original settings must remain untouched on lock timeout");
+  assert.equal(JSON.parse(fs.readFileSync(lockPath, "utf8")).token, holderToken, "Holder lock must not be unlinked");
+
+  // 2. Non-critical telemetry & /api/state read remain fail-open under lock contention
+  assert.doesNotThrow(() => recordAutoRetryStat(dir, "c1"));
+  assert.equal(updateAutoUpdateState(dir, { failedVersion: "2.9.9" }), null);
+  const stateRead = dispatchPanelApi("/api/state", {}, { stateDir: dir });
+  assert.equal(stateRead.status, 200);
+  assert.equal(stateRead.body.settings.autoRetryMax, 4);
+
+  // Release lock and run concurrent JS + Python CLI writes to distinct fields
+  fs.unlinkSync(lockPath);
+  process.env.AGY_CMD_SETTINGS_LOCK_WAIT_MS = "2500";
+  const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+  const pyScript = path.join(repoRoot, "skills", "agy-cmd", "scripts", "setup_auto_router.py");
+  const pyBin = process.platform === "win32" ? "python" : "python3";
+
+  const runSub = (cmd, args) =>
+    new Promise((resolve, reject) => {
+      const child = spawn(cmd, args, {
+        env: { ...process.env, AGY_CMD_SETTINGS_LOCK_WAIT_MS: "2500" },
+        stdio: ["ignore", "pipe", "pipe"],
+        windowsHide: true
+      });
+      let out = "", err = "";
+      child.stdout.on("data", (d) => { out += d; });
+      child.stderr.on("data", (d) => { err += d; });
+      child.on("close", (code) => (code === 0 ? resolve(out) : reject(new Error(`${cmd} exit ${code}: ${err || out}`))));
+    });
+
+  const jsWorker = `
+    import { updateSettings } from ${JSON.stringify(new URL("../hooks/lib/settings.mjs", import.meta.url).href)};
+    updateSettings(process.argv[1], { autoRetryMax: 12, freeFallbackEnabled: false });
+  `;
+  await Promise.all([
+    runSub(process.execPath, ["--input-type=module", "-e", jsWorker, dir]),
+    runSub(pyBin, [pyScript, "--delivery-test-gate", "on", "--plan-fallback", "off", "--state-dir", dir, "--json"])
+  ]);
+
+  const merged = readSettings(dir);
+  assert.equal(merged.autoRetryMax, 12);
+  assert.equal(merged.freeFallbackEnabled, false);
+  assert.equal(merged.deliveryTestGateEnabled, true);
+  assert.equal(merged.planFallbackEnabled, false);
 });

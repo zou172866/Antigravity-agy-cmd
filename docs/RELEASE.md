@@ -23,7 +23,7 @@
 
 - **保留 `hooks.json` 跨工作区引导器**：不得删除 `hooks.json` 中的跨工作区路径解析引导器，避免旧版 IDE 在外部业务仓库 `cwd` 下找不到插件钩子脚本。
 - **不将 Sidecar 面板迁移为 MCP Apps**：保持独立 `sidecars/panel` 架构，确保设置页与钩子低延迟互通。
-- **版本号多处同步**：正式切版时需同步更新 `package.json`、`plugin.json`（含 `description`）、`sidecars/panel/index.html`（`.ver-pill`）与 `skills/agy-cmd/SKILL.md` 标题版本；未附带正式 `LICENSE` 文件前不在 `plugin.json` 虚填 `license` 字段。
+- **版本号多处同步**：正式切版时需同步更新 `package.json`、`plugin.json`（含 `description`）、`sidecars/panel/index.html`（`.ver-pill`）、`skills/agy-cmd/SKILL.md` 标题版本，以及远程首装固定标签引用（`install.ps1`、`install.sh` 的默认标签与 `README.md`、`README.zh-CN.md` 的固定标签安装命令）；未附带正式 `LICENSE` 文件前不在 `plugin.json` 虚填 `license` 字段。
 - **单机同步与零漂移**：源码改动后若需在本机立即生效并消除同步漂移，先运行：
   ```bash
   python skills/agy-cmd/scripts/setup_auto_router.py --install

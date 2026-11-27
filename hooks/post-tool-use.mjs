@@ -48,6 +48,9 @@ export async function runPostToolUse(rawInput, env = process.env, nowMs = Date.n
 
   const stateDir = resolveStateDir(env);
   const convId = resolveConversationId(payload, env);
+  if (!convId) {
+    return {};
+  }
   const settings = readSettings(stateDir);
   const state = readState(stateDir, convId);
   const deliveryGate = settings.deliveryTestGateEnabled

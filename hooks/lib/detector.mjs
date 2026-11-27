@@ -1126,6 +1126,36 @@ function hashText(val) {
   return crypto.createHash("sha1").update(String(val || "")).digest("hex").slice(0, 16);
 }
 
+function hashUserInput(val) {
+  const s = nonEmptyString(val);
+  if (!s) return "";
+  return crypto.createHash("sha256").update(s).digest("hex").slice(0, 24);
+}
+
+function deriveTurnSignals(rawText, wsRoots) {
+  const cleaned = nonEmptyString(rawText);
+  if (!cleaned) return null;
+  const prose = extractProseForIntent(cleaned);
+  const stripped = cleaned.replace(/```[\s\S]*?```/g, " ");
+  const prefs = planPreferences(stripped);
+  const directFixIntent = hasDirectFixOrChangeIntent(prose);
+  return {
+    activeSlash: [...extractActiveSlashCommands(cleaned)],
+    leadingSwarm: LEADING_SWARM_SLASH_RE.test(cleaned),
+    leadingAutonomy: LEADING_AUTONOMY_SLASH_RE.test(cleaned),
+    declinesDelegation: DECLINES_DELEGATION_RE.test(prose),
+    debugDiscussion: DEBUG_DISCUSSION_RE.test(prose),
+    allowFix: directFixIntent && !/只读|\bread[- ]only\b/i.test(prose),
+    directFixIntent,
+    explicitNoEdit: NEGATED_EDIT_INTENT_RE.test(prose) || DEFERRED_EDIT_INTENT_RE.test(prose),
+    matchesHardTask: DEBUG_ACTION_RE.test(prose) && HARD_DEBUG_TASK_RE.test(prose),
+    skipCheck: Boolean(prefs.skipCheck),
+    skipReview: Boolean(prefs.skipReview),
+    allowTestWeakening: Boolean(allowsTestWeakening(cleaned)),
+    requestedCheck: requestedProjectCheck(cleaned, wsRoots)
+  };
+}
+
 /**
  * Build a strictly protojson-compatible `CortexStepSystemMessage` payload.
  * Note: Antigravity's desktop Go protojson unmarshaler rejects unknown nested
@@ -1409,6 +1439,23 @@ export function evaluatePreInvocation(payload, events = [], prevStateInput = nul
   const isMidTurn = invocationNum !== null && invocationNum >= 1;
 
   let nextState = { ...prevState };
+  delete nextState.lastUserInput;
+  const wsRoots = payload.workspacePaths ?? payload.workspace_paths;
+  const prevInputHash =
+    nonEmptyString(prevState.lastUserInputHash) || hashUserInput(prevState.lastUserInput);
+  if (prevInputHash && !nextState.lastUserInputHash) {
+    nextState.lastUserInputHash = prevInputHash;
+  }
+  const prevSavedSignals =
+    prevState.lastTurnSignals && typeof prevState.lastTurnSignals === "object"
+      ? prevState.lastTurnSignals
+      : prevState.lastUserInput
+        ? deriveTurnSignals(prevState.lastUserInput, wsRoots)
+        : null;
+  if (prevSavedSignals && !nextState.lastTurnSignals) {
+    nextState.lastTurnSignals = prevSavedSignals;
+  }
+  const rawInputHash = hashUserInput(rawLastUserInput);
   let rawEvents = Array.isArray(events) ? events : [];
   let shouldResetEvents = false;
   let stateChanged = false;
@@ -1457,9 +1504,12 @@ export function evaluatePreInvocation(payload, events = [], prevStateInput = nul
     }
   }
 
-  const turnInput = rawLastUserInput || (isMidTurn ? nextState.lastUserInput : "");
-  const activeSlash = extractActiveSlashCommands(turnInput);
-  const intentProse = extractProseForIntent(turnInput);
+  const hasFreshInput = Boolean(rawLastUserInput);
+  const midTurnSignals = isMidTurn ? nextState.lastTurnSignals : null;
+  const activeSlash = hasFreshInput
+    ? extractActiveSlashCommands(rawLastUserInput)
+    : new Set(Array.isArray(midTurnSignals?.activeSlash) ? midTurnSignals.activeSlash : []);
+  const intentProse = hasFreshInput ? extractProseForIntent(rawLastUserInput) : "";
 
   // 2. Detect new user turn entry (excluding background-task, subagent, swarm, and Stop wakeups
   //    that carry no new USER_INPUT — Antigravity often runs PreInvocation before flushing the
@@ -1481,10 +1531,11 @@ export function evaluatePreInvocation(payload, events = [], prevStateInput = nul
       Boolean(transcriptTail?.awaitingUserApprovalOrQuestion) &&
       latestPlanPromptKey !== "" &&
       latestPlanPromptKey !== (nextState.lastPlanBoostPromptKey || ""));
+  const sameAsPrevInput = rawInputHash === (nextState.lastUserInputHash || "");
   const isWakeupWithNoNewInput =
     !rawPayloadInput ||
     (!isFreshPlanApprovalClick &&
-      rawLastUserInput === nextState.lastUserInput &&
+      sameAsPrevInput &&
       (sameTxTurnKey || Boolean(transcriptTail?.tailRolledOverWithoutUserInput)));
   const isBgTaskWakeup =
     !isMidTurn &&
@@ -1498,16 +1549,19 @@ export function evaluatePreInvocation(payload, events = [], prevStateInput = nul
     !isBgTaskWakeup &&
     ((invocationNum === 0 &&
       (initialNumSteps !== nextState.lastTurnInitialSteps ||
-        rawLastUserInput !== nextState.lastUserInput ||
+        !sameAsPrevInput ||
         nextState.userTurnCount === 0)) ||
-      (invocationNum === null && rawLastUserInput !== "" && rawLastUserInput !== nextState.lastUserInput));
+      (invocationNum === null && rawLastUserInput !== "" && !sameAsPrevInput));
 
   const approval = resolvePendingPlanApprovalState(inputEnvelope, transcriptTail, metrics.latestPlanModeBlock,
     isNewUserTurn ? nowMs : nextState.lastTurnStartTs, effSettings.planFallbackEnabled);
   const { approvedNotice } = approval;
-  const inheritedPlanSource = approval.isApproved
-    ? unwrapUserRequestText(nonEmptyString(transcriptTail?.planRequest) || prevState.lastUserInput)
-    : "";
+  const txPlanRequest = approval.isApproved ? unwrapUserRequestText(nonEmptyString(transcriptTail?.planRequest)) : "";
+  const inheritedPlanSignals = approval.isApproved
+    ? txPlanRequest
+      ? deriveTurnSignals(txPlanRequest, wsRoots)
+      : prevSavedSignals
+    : null;
 
   if (isNewUserTurn) {
     let maxEventStep = -1;
@@ -1516,7 +1570,8 @@ export function evaluatePreInvocation(payload, events = [], prevStateInput = nul
       if (st !== null && st > maxEventStep) maxEventStep = st;
     }
     nextState.userTurnCount = (nextState.userTurnCount || 0) + 1;
-    nextState.lastUserInput = rawLastUserInput;
+    nextState.lastUserInputHash = rawInputHash;
+    nextState.lastTurnSignals = deriveTurnSignals(rawLastUserInput, wsRoots);
     nextState.lastTurnUserInputKey = latestTxUserKey;
     if (!isPlanApprovalNotice(inputEnvelope)) {
       nextState.lastPlanBoostNoticeHash = "";
@@ -1526,8 +1581,7 @@ export function evaluatePreInvocation(payload, events = [], prevStateInput = nul
     nextState.turnAuditFloorTs = nowMs;
     nextState.turnAuditFloorStep = maxEventStep;
     nextState.turnAllowTestWeakening = Boolean(
-      allowsTestWeakening(rawLastUserInput) ||
-        (inheritedPlanSource && allowsTestWeakening(inheritedPlanSource))
+      allowsTestWeakening(rawLastUserInput) || inheritedPlanSignals?.allowTestWeakening
     );
     nextState.turnAutoRetries = 0;
     nextState.turnBaseExecutionNum = null;
@@ -1569,6 +1623,8 @@ export function evaluatePreInvocation(payload, events = [], prevStateInput = nul
       nextState.lastPlanBoostNoticeHash = "";
       nextState.lastPlanBoostPromptKey = "";
       nextState.lastTurnUserInputKey = "";
+      nextState.lastUserInputHash = "";
+      nextState.lastTurnSignals = null;
       nextState.resolvedSteps = {};
       shouldResetEvents = true;
       return {
@@ -1626,26 +1682,22 @@ export function evaluatePreInvocation(payload, events = [], prevStateInput = nul
   if (effSettings.deliveryTestGateEnabled) {
     if (isNewUserTurn || !nextState.deliveryGate) {
       const gateKey = `turn:${nextState.userTurnCount || 0}`;
-      const inheritedSource = inheritedPlanSource;
       const strippedUserProse = rawLastUserInput.replace(/```[\s\S]*?```/g, " ");
-      const strippedInheritedProse = inheritedSource.replace(/```[\s\S]*?```/g, " ");
       const gatePrefs = planPreferences(strippedUserProse);
-      const inheritedPrefs = strippedInheritedProse
-        ? planPreferences(strippedInheritedProse)
-        : { skipCheck: false };
       const gateAllowTestWeakening = Boolean(
-        allowsTestWeakening(rawLastUserInput) ||
-          (inheritedSource && allowsTestWeakening(inheritedSource))
+        allowsTestWeakening(rawLastUserInput) || inheritedPlanSignals?.allowTestWeakening
       );
-      const wsRoots = payload.workspacePaths ?? payload.workspace_paths;
-      const gateRequested =
-        requestedProjectCheck(rawLastUserInput, wsRoots) ||
-        (inheritedSource
-          ? requestedProjectCheck(inheritedSource + "\n" + (transcriptTail?.planCheckText || ""), wsRoots)
-          : null);
+      const inheritedRequested = approval.isApproved
+        ? txPlanRequest
+          ? requestedProjectCheck(txPlanRequest + "\n" + (transcriptTail?.planCheckText || ""), wsRoots)
+          : requestedProjectCheck(transcriptTail?.planCheckText || "", wsRoots) ||
+            inheritedPlanSignals?.requestedCheck ||
+            null
+        : null;
+      const gateRequested = requestedProjectCheck(rawLastUserInput, wsRoots) || inheritedRequested;
       nextState.deliveryGate = {
         key: gateKey,
-        skipCheck: Boolean(gatePrefs.skipCheck || inheritedPrefs.skipCheck),
+        skipCheck: Boolean(gatePrefs.skipCheck || inheritedPlanSignals?.skipCheck),
         ...(gateAllowTestWeakening ? { allowTestWeakening: true } : {}),
         requested: gateRequested,
         wroteSource: false,
@@ -1699,7 +1751,9 @@ export function evaluatePreInvocation(payload, events = [], prevStateInput = nul
   // Active Swarm Coordinator sessions manage their own shared board, @verifier and @monitor.
   // Never interrupt them with Boost/fallback/goal/delivery-gate injections, while still supporting
   // clean lifecycle exit on verifiable teardown events or explicit "恢复普通会话" requests.
-  const wantsLeadingSwarm = LEADING_SWARM_SLASH_RE.test(turnInput);
+  const wantsLeadingSwarm = hasFreshInput
+    ? LEADING_SWARM_SLASH_RE.test(rawLastUserInput)
+    : Boolean(midTurnSignals?.leadingSwarm);
   const hostSwarmEnded = isHostSwarmEndedPayload(payload);
   const explicitResumeNormal =
     isNewUserTurn && !isBgTaskWakeup && !wantsLeadingSwarm && isResumeNormalSessionRequest(rawLastUserInput);
@@ -1787,10 +1841,13 @@ export function evaluatePreInvocation(payload, events = [], prevStateInput = nul
   const blockedByTailState =
     Boolean(transcriptTail?.tailRolledOverWithoutUserInput) ||
     (!isDirectUnflushedNotice && Boolean(transcriptTail?.hasPlannerResponseSinceUserInput));
+  const inheritedDeclinesDelegation = txPlanRequest
+    ? DECLINES_DELEGATION_RE.test(extractProseForIntent(txPlanRequest))
+    : Boolean(prevSavedSignals?.declinesDelegation);
   if (
     ((paidBoostActive && effSettings.boostAfterPlanApproval &&
       !DECLINES_DELEGATION_RE.test(intentProse) &&
-      !DECLINES_DELEGATION_RE.test(extractProseForIntent(transcriptTail?.planRequest || prevState.lastUserInput))) ||
+      !inheritedDeclinesDelegation) ||
       effSettings.planTier === "free") &&
     isNewUserTurn &&
     activeSlash.size === 0 &&
@@ -1806,12 +1863,20 @@ export function evaluatePreInvocation(payload, events = [], prevStateInput = nul
       nextState.lastPlanBoostPromptKey = latestPlanPromptKey;
       stateChanged = true;
       if (effSettings.planTier === "free") {
-        const source = unwrapUserRequestText(nonEmptyString(transcriptTail?.planRequest) || prevState.lastUserInput);
-        const prefs = planPreferences(source);
+        const prefs = txPlanRequest
+          ? planPreferences(txPlanRequest)
+          : {
+              skipCheck: Boolean(inheritedPlanSignals?.skipCheck),
+              skipReview: Boolean(inheritedPlanSignals?.skipReview)
+            };
         const planAllowTestWeakening = Boolean(
-          allowsTestWeakening(source) || allowsTestWeakening(rawLastUserInput)
+          inheritedPlanSignals?.allowTestWeakening || allowsTestWeakening(rawLastUserInput)
         );
-        const requested = requestedProjectCheck(source + "\n" + (transcriptTail?.planCheckText || ""), payload.workspacePaths ?? payload.workspace_paths);
+        const requested = txPlanRequest
+          ? requestedProjectCheck(txPlanRequest + "\n" + (transcriptTail?.planCheckText || ""), wsRoots)
+          : requestedProjectCheck(transcriptTail?.planCheckText || "", wsRoots) ||
+            inheritedPlanSignals?.requestedCheck ||
+            null;
         nextState.freePlan = {
           key: planBoostKey,
           ...prefs,
@@ -1896,7 +1961,9 @@ export function evaluatePreInvocation(payload, events = [], prevStateInput = nul
     (nextState.debugTurnStreak || 0) >= 2;
   const multiTurnDebugHit =
     (isNewUserTurn && (nextState.debugTurnStreak || 0) >= 2) || pendingTurnDebugDetect;
-  const matchesHardTask = DEBUG_ACTION_RE.test(intentProse) && HARD_DEBUG_TASK_RE.test(intentProse);
+  const matchesHardTask = hasFreshInput
+    ? DEBUG_ACTION_RE.test(intentProse) && HARD_DEBUG_TASK_RE.test(intentProse)
+    : Boolean(midTurnSignals?.matchesHardTask);
   const pendingTurnHardDetect =
     !nextState.boostAlerted &&
     nextState.boostDetected &&
@@ -1905,14 +1972,21 @@ export function evaluatePreInvocation(payload, events = [], prevStateInput = nul
   const hardTaskHit = (isNewUserTurn && matchesHardTask) || pendingTurnHardDetect;
   const stuck = oscHit || failStreakHit || multiTurnDebugHit;
 
+  const declinesDelegation = hasFreshInput
+    ? DECLINES_DELEGATION_RE.test(intentProse)
+    : Boolean(midTurnSignals?.declinesDelegation);
+  const isDebugDiscussion = hasFreshInput
+    ? DEBUG_DISCUSSION_RE.test(intentProse)
+    : Boolean(midTurnSignals?.debugDiscussion);
+
   // Shared dispatch-eligibility gate for BOTH paid Boost and free stuck fallback
   const dispatchEligible =
     activeSlash.size === 0 &&
-    !DECLINES_DELEGATION_RE.test(intentProse) &&
+    !declinesDelegation &&
     !isBgTaskWakeup &&
     !activePlanBlock &&
     !transcriptTail?.awaitingUserApprovalOrQuestion &&
-    !DEBUG_DISCUSSION_RE.test(intentProse) &&
+    !isDebugDiscussion &&
     !(isNewUserTurn && (nextState.turnUnattendedGoal || requestsMigration(intentProse)));
 
   const branchTriggered = paidBoostActive
@@ -1980,7 +2054,9 @@ export function evaluatePreInvocation(payload, events = [], prevStateInput = nul
 
       if (paidBoostActive) {
         nextState.lastPaidBoostTurn = nextState.userTurnCount;
-        const allowFix = hasDirectFixOrChangeIntent(intentProse) && !/只读|\bread[- ]only\b/i.test(intentProse);
+        const allowFix = hasFreshInput
+          ? hasDirectFixOrChangeIntent(intentProse) && !/只读|\bread[- ]only\b/i.test(intentProse)
+          : Boolean(midTurnSignals?.allowFix);
         const role = allowFix ? "DeepCoder" : "DeepInvestigator";
         return {
           nextState,
@@ -2358,6 +2434,7 @@ export function evaluateStop(payload, events = [], prevStateInput = null, option
   }
 
   let nextState = { ...prevState };
+  delete nextState.lastUserInput;
   let stateChanged = false;
 
   const reconciled = reconcileEventsWithTranscript(events, transcriptTail, nextState.resolvedSteps);
@@ -2369,13 +2446,21 @@ export function evaluateStop(payload, events = [], prevStateInput = null, option
 
   const rawLastUserInput = unwrapUserRequestText(
     nonEmptyString(payload.lastUserInput ?? payload.last_user_input) ||
-      nonEmptyString(transcriptTail?.latestUserInput) ||
-      nonEmptyString(nextState.lastUserInput)
+      nonEmptyString(transcriptTail?.latestUserInput)
   );
+  const hasFreshInput = Boolean(rawLastUserInput);
+  const savedSignals =
+    nextState.lastTurnSignals && typeof nextState.lastTurnSignals === "object"
+      ? nextState.lastTurnSignals
+      : prevState.lastUserInput
+        ? deriveTurnSignals(prevState.lastUserInput, payload.workspacePaths ?? payload.workspace_paths)
+        : null;
 
   // Safety Brake 3: Do not double-continue when user explicitly invoked native `/goal`,
   // `/swarm`, `/teamwork`, `/boost`, `/run-workflow`, or when this conversation is an active Swarm coordinator.
-  const activeSlash = extractActiveSlashCommands(rawLastUserInput);
+  const activeSlash = hasFreshInput
+    ? extractActiveSlashCommands(rawLastUserInput)
+    : new Set(Array.isArray(savedSignals?.activeSlash) ? savedSignals.activeSlash : []);
   if (activeSlash.has("goal")) {
     return {
       decision: "allow",
@@ -2386,9 +2471,14 @@ export function evaluateStop(payload, events = [], prevStateInput = null, option
       metrics: null
     };
   }
-  const wantsLeadingSwarm = LEADING_SWARM_SLASH_RE.test(rawLastUserInput);
+  const wantsLeadingSwarm = hasFreshInput
+    ? LEADING_SWARM_SLASH_RE.test(rawLastUserInput)
+    : Boolean(savedSignals?.leadingSwarm);
+  const wantsLeadingAutonomy = hasFreshInput
+    ? LEADING_AUTONOMY_SLASH_RE.test(rawLastUserInput)
+    : Boolean(savedSignals?.leadingAutonomy);
   const hostSwarmEnded = isHostSwarmEndedPayload(payload);
-  const explicitResumeNormal = !wantsLeadingSwarm && isResumeNormalSessionRequest(rawLastUserInput);
+  const explicitResumeNormal = hasFreshInput && !wantsLeadingSwarm && isResumeNormalSessionRequest(rawLastUserInput);
   const postTeardownUserTurn = isTranscriptUserTurnAfterSwarmEnd(transcriptTail);
   const freshTxSwarm = hasFreshTranscriptSwarmActivity(transcriptTail, nextState);
   const txSwarmKey = nonEmptyString(transcriptTail?.latestSwarmActivityKey);
@@ -2428,7 +2518,7 @@ export function evaluateStop(payload, events = [], prevStateInput = null, option
     hasActiveSwarm = true;
   }
 
-  if (hasActiveSwarm || LEADING_AUTONOMY_SLASH_RE.test(rawLastUserInput)) {
+  if (hasActiveSwarm || wantsLeadingAutonomy) {
     return {
       decision: "allow",
       reason: "",
@@ -2439,7 +2529,7 @@ export function evaluateStop(payload, events = [], prevStateInput = null, option
     };
   }
 
-  const intentProse = extractProseForIntent(rawLastUserInput);
+  const intentProse = hasFreshInput ? extractProseForIntent(rawLastUserInput) : "";
   const turnOverride = nextState.turnRetryOverride ?? parseTurnRetryOverride(intentProse);
   const turnGoal = Boolean(
     nextState.turnUnattendedGoal ||
@@ -2491,8 +2581,11 @@ export function evaluateStop(payload, events = [], prevStateInput = null, option
     nextState.deliveryGate = deliveryGate;
     stateChanged = true;
   }
-  const strippedStopProse = rawLastUserInput.replace(/```[\s\S]*?```/g, " ");
-  const userSkipTests = Boolean(planPreferences(strippedStopProse).skipCheck || deliveryGate?.skipCheck);
+  const strippedStopProse = hasFreshInput ? rawLastUserInput.replace(/```[\s\S]*?```/g, " ") : "";
+  const inputSkipCheck = hasFreshInput
+    ? planPreferences(strippedStopProse).skipCheck
+    : Boolean(savedSignals?.skipCheck);
+  const userSkipTests = Boolean(inputSkipCheck || deliveryGate?.skipCheck);
   const skipDeliveryGate =
     !deliveryGate ||
     userSkipTests ||
@@ -2517,7 +2610,7 @@ export function evaluateStop(payload, events = [], prevStateInput = null, option
 
   // A scope outside this plan, another package's green test or arbitrary
   // successful command cannot clear a known failed project check.
-  const skipPlanChecks = plan && (plan.skipCheck || planPreferences(strippedStopProse).skipCheck);
+  const skipPlanChecks = plan && (plan.skipCheck || inputSkipCheck);
   const checks = plan && !skipPlanChecks &&
     !transcriptTail?.latestPlanModeDenial ? pendingPlanChecks(plan) : [];
   const scopedFailure = gateFailedCheck || checks.find(check => check.failed);
@@ -2592,14 +2685,17 @@ export function evaluateStop(payload, events = [], prevStateInput = null, option
     (metrics.consecutiveCmdFailures >= 1 && metrics.latestFailureTs >= turnFloorTs &&
      !stalePlanFailure && !staleGateFailure &&
      !((skipPlanChecks || (effSettings.deliveryTestGateEnabled && userSkipTests)) && metrics.lastFailureIsVerify));
-  const explicitNoEdit =
-    !turnGoal &&
-    !metrics.hasTurnEdit &&
-    (NEGATED_EDIT_INTENT_RE.test(intentProse) || DEFERRED_EDIT_INTENT_RE.test(intentProse));
+  const explicitNoEditInput = hasFreshInput
+    ? NEGATED_EDIT_INTENT_RE.test(intentProse) || DEFERRED_EDIT_INTENT_RE.test(intentProse)
+    : Boolean(savedSignals?.explicitNoEdit);
+  const directFixIntent = hasFreshInput
+    ? hasDirectFixOrChangeIntent(intentProse)
+    : Boolean(savedSignals?.directFixIntent);
+  const explicitNoEdit = !turnGoal && !metrics.hasTurnEdit && explicitNoEditInput;
   const smartTriggered =
     !explicitNoEdit &&
     (metrics.hasTurnEdit || plan?.wroteSource || deliveryGate?.wroteSource ||
-      (metrics.lastFailureIsVerify && hasDirectFixOrChangeIntent(intentProse)));
+      (metrics.lastFailureIsVerify && directFixIntent));
   const baseRetryPolicy = resolveEffectiveRetryPolicy(
     effSettings,
     turnOverride,
@@ -2732,7 +2828,7 @@ export function evaluateStop(payload, events = [], prevStateInput = null, option
   stateChanged = true;
 
   const stopAllowWeakening = Boolean(
-    allowsTestWeakening(intentProse) ||
+    (hasFreshInput ? allowsTestWeakening(intentProse) : Boolean(savedSignals?.allowTestWeakening)) ||
       plan?.allowTestWeakening ||
       deliveryGate?.allowTestWeakening ||
       nextState.turnAllowTestWeakening

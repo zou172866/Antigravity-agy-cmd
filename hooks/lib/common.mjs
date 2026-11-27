@@ -90,19 +90,40 @@ export function parseMaybeJson(val) {
 export function resolveConversationId(payload = {}, env = process.env) {
   const p = payload && typeof payload === "object" ? payload : {};
   const e = env && typeof env === "object" ? env : {};
-  return (
+  const explicit =
     nonEmptyString(p.conversationId) ||
     nonEmptyString(p.conversation_id) ||
     nonEmptyString(p.sessionId) ||
     nonEmptyString(p.session_id) ||
-    nonEmptyString(e.ANTIGRAVITY_CONVERSATION_ID) ||
-    "default"
-  );
+    nonEmptyString(e.ANTIGRAVITY_CONVERSATION_ID);
+  if (explicit) return explicit;
+
+  const pathCandidates = [
+    p.transcriptPath,
+    p.transcript_path,
+    p.metadata?.transcriptPath,
+    p.metadata?.transcript_path,
+    p.artifactDirectoryPath,
+    p.artifact_directory_path,
+    p.metadata?.artifactDirectoryPath,
+    p.metadata?.artifact_directory_path
+  ];
+  for (const rawPath of pathCandidates) {
+    const cleaned = nonEmptyString(rawPath);
+    if (!cleaned) continue;
+    let normalized = path.resolve(cleaned);
+    if (process.platform === "win32") {
+      normalized = normalized.toLowerCase();
+    }
+    const digest = crypto.createHash("sha256").update(normalized).digest("hex").slice(0, 24);
+    return `tx_${digest}`;
+  }
+  return "";
 }
 
 export function sanitizeConversationId(convId) {
   const raw = nonEmptyString(convId);
-  if (!raw) return "default";
+  if (!raw) return "";
   if (
     raw.length <= 96 &&
     raw !== "." &&

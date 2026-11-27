@@ -34,25 +34,27 @@
 
 ## 快速安装
 
-环境要求：**Google Antigravity 桌面版**、**Node.js 20+**、**Python 3**。
+环境要求：**Google Antigravity 桌面版**、**Node.js 20+**、**Python 3.8+**。
 
-打开终端，跑一行对应系统的安装命令，然后重启或刷新 Antigravity 窗口。
+打开终端，跑一行对应系统的固定版本安装命令（下载同源 `SHA256SUMS.txt` 并校验正式发行 ZIP 摘要后才解压安装），然后重启或刷新 Antigravity 窗口。
 
 **Windows（PowerShell 一行直装）：**
 
 ```powershell
-irm https://raw.githubusercontent.com/zou172866/Antigravity-agy-cmd/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/zou172866/Antigravity-agy-cmd/v2.7.6/install.ps1 | iex
 ```
 
 **macOS / Linux（一行直装）：**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zou172866/Antigravity-agy-cmd/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/zou172866/Antigravity-agy-cmd/v2.7.6/install.sh | sh
 ```
 
 ### 其他安装方式
 
-- **离线稳定包**：从 [GitHub Releases](https://github.com/zou172866/Antigravity-agy-cmd/releases/latest) 下载 ZIP 解压。Windows 运行 `.\install.ps1`，macOS / Linux 运行 `sh ./install.sh`。
+- **离线稳定包（带 SHA-256 验签）**：从 [GitHub Releases](https://github.com/zou172866/Antigravity-agy-cmd/releases/latest) 下载正式 ZIP 与 `SHA256SUMS.txt`：
+  - 先验签再装：Windows 运行 `.\install.ps1 --archive .\agy-cmd-v2.7.6.zip --checksums .\SHA256SUMS.txt`，macOS / Linux 运行 `sh ./install.sh --archive ./agy-cmd-v2.7.6.zip --checksums ./SHA256SUMS.txt`。
+  - 或解压后在目录内运行 `.\install.ps1`（Windows）/ `sh ./install.sh`（macOS / Linux）。
 - **手动克隆仓库**（含 `.git` 目录时，面板在线自更新会自动关闭以防覆盖源码；后续用 `git pull` 更新，或改用上方一行直装）：
 
 ```powershell
@@ -136,9 +138,14 @@ python skills/agy-cmd/scripts/setup_auto_router.py --auto-retry off
 python skills/agy-cmd/scripts/setup_auto_router.py --auto-retry 5
 python skills/agy-cmd/scripts/setup_auto_router.py --auto-retry infinite
 
-# 切换免费版或会员版
+# 切换免费版或会员版，并可选控制计划获批后自动 Boost / 卡壳换视角 / Plan Mode 兜底
 python skills/agy-cmd/scripts/setup_auto_router.py --plan-tier free
 python skills/agy-cmd/scripts/setup_auto_router.py --plan-tier paid --boost on
+python skills/agy-cmd/scripts/setup_auto_router.py --boost-after-plan-approval on
+python skills/agy-cmd/scripts/setup_auto_router.py --free-fallback on --plan-fallback on
+
+# 清空累计自动重试统计（不改账号档位与 Boost）
+python skills/agy-cmd/scripts/setup_auto_router.py --reset-stats
 
 # 开关交付前强制测试门禁（默认关闭），可选配置自定义验证命令
 python skills/agy-cmd/scripts/setup_auto_router.py --delivery-test-gate on

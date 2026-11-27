@@ -34,25 +34,27 @@ Three patch attempts make the same bug worse, yet it keeps guessing in circles.
 
 ## Quick Install
 
-Requires **Google Antigravity Desktop**, **Node.js 20+**, and **Python 3**.
+Requires **Google Antigravity Desktop**, **Node.js 20+**, and **Python 3.8+**.
 
-Run the one-line installer for your OS, then restart or reload your Antigravity window.
+Run the pinned one-line installer for your OS (downloads the official release ZIP and verifies its `SHA256SUMS.txt` digest before unpacking), then restart or reload your Antigravity window.
 
 **Windows (PowerShell):**
 
 ```powershell
-irm https://raw.githubusercontent.com/zou172866/Antigravity-agy-cmd/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/zou172866/Antigravity-agy-cmd/v2.7.6/install.ps1 | iex
 ```
 
 **macOS / Linux:**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zou172866/Antigravity-agy-cmd/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/zou172866/Antigravity-agy-cmd/v2.7.6/install.sh | sh
 ```
 
 ### Other Install Options
 
-- **Offline stable ZIP**: download the archive from [GitHub Releases](https://github.com/zou172866/Antigravity-agy-cmd/releases/latest) and extract it. Run `.\install.ps1` on Windows or `sh ./install.sh` on macOS / Linux.
+- **Offline stable ZIP (with SHA-256 verification)**: download the official ZIP and `SHA256SUMS.txt` from [GitHub Releases](https://github.com/zou172866/Antigravity-agy-cmd/releases/latest):
+  - Verify and install directly: `.\install.ps1 --archive .\agy-cmd-v2.7.6.zip --checksums .\SHA256SUMS.txt` (Windows) or `sh ./install.sh --archive ./agy-cmd-v2.7.6.zip --checksums ./SHA256SUMS.txt` (macOS / Linux).
+  - Or extract and run `.\install.ps1` (Windows) / `sh ./install.sh` (macOS / Linux) inside the unpacked folder.
 - **Manual Git clone** (a `.git` checkout inside `plugins/agy-cmd` disables Sidecar self-update to protect your working tree; update with `git pull` or use the one-line installer above):
 
 ```powershell
@@ -136,9 +138,14 @@ python skills/agy-cmd/scripts/setup_auto_router.py --auto-retry off
 python skills/agy-cmd/scripts/setup_auto_router.py --auto-retry 5
 python skills/agy-cmd/scripts/setup_auto_router.py --auto-retry infinite
 
-# Switch account tier
+# Switch account tier and toggle post-plan Boost / fallbacks
 python skills/agy-cmd/scripts/setup_auto_router.py --plan-tier free
 python skills/agy-cmd/scripts/setup_auto_router.py --plan-tier paid --boost on
+python skills/agy-cmd/scripts/setup_auto_router.py --boost-after-plan-approval on
+python skills/agy-cmd/scripts/setup_auto_router.py --free-fallback on --plan-fallback on
+
+# Reset cumulative auto-retry statistics without altering tier or Boost
+python skills/agy-cmd/scripts/setup_auto_router.py --reset-stats
 
 # Toggle Delivery Test Gate (off by default) and optionally configure a custom command
 python skills/agy-cmd/scripts/setup_auto_router.py --delivery-test-gate on
