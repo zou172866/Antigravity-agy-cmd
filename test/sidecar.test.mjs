@@ -779,3 +779,161 @@ test("Sidecar UI index.html: Delivery Test Gate toggle, custom command save/clea
   await getEl("inp-delivery-cmd").trigger("input");
   assert.equal(getEl("btn-clear-delivery-cmd").hidden, false);
 });
+
+test("P1 Batch A panel API & UI: rejects invalid/9-segment deliveryTestCommand preserving old value, surfaces pre-existing invalid config, and supports /api/resume-normal-session", async (t) => {
+  const dir = makeTmpDir("agy-cmd-p1a-panel-");
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+  const valid8 = Array.from({ length: 8 }, (_, i) => `npm run check${i + 1}`).join(" && ");
+  const invalid9 = Array.from({ length: 9 }, (_, i) => `npm run check${i + 1}`).join(" && ");
+
+  // 1. Valid 8-segment command saves cleanly; 9-segment and unsupported syntax return 400 and preserve valid8
+  const ok8 = dispatchPanelApi(
+    "/api/settings",
+    { deliveryTestGateEnabled: true, deliveryTestCommand: valid8 },
+    { stateDir: dir }
+  );
+  assert.equal(ok8.status, 200);
+  assert.equal(ok8.body.settings.deliveryTestCommand, valid8);
+  assert.equal(ok8.body.deliveryCommandError, "");
+
+  for (const bad of [invalid9, "npm test | cat", "npm test || true", "npm test; echo ok", "cd backend", "npm test &&"]) {
+    const res = dispatchPanelApi("/api/settings", { deliveryTestCommand: bad }, { stateDir: dir });
+    assert.equal(res.status, 400, bad);
+    assert.equal(res.body.ok, false, bad);
+    assert.equal(readSettings(dir).deliveryTestCommand, valid8, `Old value changed on: ${bad}`);
+  }
+
+  // 2. Pre-existing invalid command on disk surfaces deliveryCommandError & 需修正 summary
+  const settingsPath = path.join(dir, "settings.json");
+  const raw = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
+  raw.deliveryTestCommand = invalid9;
+  fs.writeFileSync(settingsPath, JSON.stringify(raw, null, 2) + "\n", "utf8");
+
+  const invalidState = dispatchPanelApi("/api/state", {}, { stateDir: dir });
+  assert.equal(invalidState.status, 200);
+  assert.ok(invalidState.body.deliveryCommandError);
+  assert.match(invalidState.body.deliveryGateStatusZh, /自定义命令无效（需修正/);
+
+  // 3. Swarm active session exposes swarmActive and /api/resume-normal-session clears it with anti-reactivation watermark
+  const convId = "panel-swarm-conv";
+  const txPath = path.join(dir, "panel-swarm.jsonl");
+  fs.writeFileSync(
+    txPath,
+    JSON.stringify({ step_index: 0, type: "USER_INPUT", content: "<USER_REQUEST>\n/swarm 并行修改\n</USER_REQUEST>" }) + "\n",
+    "utf8"
+  );
+  const env = makeEnv(dir);
+  await runPreInvocation(
+    { conversationId: convId, transcriptPath: txPath, invocationNum: 0, initialNumSteps: 2, lastUserInput: "/swarm 并行修改" },
+    env,
+    1000
+  );
+
+  const beforeResume = dispatchPanelApi("/api/state", { conversationId: convId }, { stateDir: dir });
+  assert.equal(beforeResume.status, 200);
+  assert.equal(beforeResume.body.activeSession?.swarmActive, true);
+
+  const badResume = dispatchPanelApi("/api/resume-normal-session", { conversationId: convId, extra: 1 }, { stateDir: dir });
+  assert.equal(badResume.status, 400);
+
+  const resumed = dispatchPanelApi("/api/resume-normal-session", { conversationId: convId }, { stateDir: dir });
+  assert.equal(resumed.status, 200);
+  assert.equal(resumed.body.activeSession?.swarmActive, false);
+
+  // Subsequent PreInvocation reading the same transcript tail must NOT re-activate swarmActive!
+  fs.appendFileSync(
+    txPath,
+    JSON.stringify({ step_index: 5, type: "USER_INPUT", content: "<USER_REQUEST>\n普通任务\n</USER_REQUEST>" }) + "\n",
+    "utf8"
+  );
+  await runPreInvocation(
+    { conversationId: convId, transcriptPath: txPath, invocationNum: 0, initialNumSteps: 6, lastUserInput: "普通任务" },
+    env,
+    2000
+  );
+  const afterNormal = dispatchPanelApi("/api/state", { conversationId: convId }, { stateDir: dir });
+  assert.equal(afterNormal.body.activeSession?.swarmActive, false);
+
+  // 4. Panel inline script renders #delivery-cmd-error and wires #btn-resume-normal button
+  const html = renderPanelHtml("tok");
+  const scriptBlocks = [...html.matchAll(/<script>([\s\S]*?)<\/script>/gi)];
+  assert.ok(scriptBlocks.length >= 1);
+  const mainScript = scriptBlocks[scriptBlocks.length - 1][1];
+  const elements = new Map();
+  const makeEl = (id = "") => ({
+    id,
+    value: "",
+    checked: false,
+    hidden: false,
+    disabled: false,
+    textContent: "",
+    href: "",
+    dataset: {},
+    listeners: {},
+    style: { getPropertyValue: () => "" },
+    setAttribute() {},
+    classList: {
+      set: new Set(),
+      add(c) { this.set.add(c); },
+      remove(c) { this.set.delete(c); },
+      toggle(c, force) { if (force) this.set.add(c); else this.set.delete(c); },
+      contains(c) { return this.set.has(c); }
+    },
+    addEventListener(ev, fn) { (this.listeners[ev] ||= []).push(fn); },
+    async trigger(ev, arg = {}) { for (const fn of this.listeners[ev] || []) await fn(arg); }
+  });
+  const getEl = (id) => {
+    if (!elements.has(id)) elements.set(id, makeEl(id));
+    return elements.get(id);
+  };
+  // Put convId back in Swarm mode for UI button test
+  fs.appendFileSync(
+    txPath,
+    JSON.stringify({ step_index: 10, type: "USER_INPUT", content: "<USER_REQUEST>\n/swarm 再次并行\n</USER_REQUEST>" }) + "\n",
+    "utf8"
+  );
+  await runPreInvocation(
+    { conversationId: convId, transcriptPath: txPath, invocationNum: 0, initialNumSteps: 11, lastUserInput: "/swarm 再次并行" },
+    env,
+    3000
+  );
+
+  const ctx = {
+    document: {
+      hidden: false,
+      activeElement: null,
+      documentElement: { style: { getPropertyValue: () => "" }, setAttribute() {} },
+      getElementById: (id) => getEl(id),
+      querySelectorAll: () => []
+    },
+    window: {
+      addEventListener() {},
+      sidecar: {
+        conversationId: convId,
+        async fetch(url, init = {}) {
+          const out = dispatchPanelApi(url, init.body ? JSON.parse(init.body) : {}, { stateDir: dir, defaultConvId: convId });
+          return { ok: out.status >= 200 && out.status < 300, status: out.status, async json() { return structuredClone(out.body); } };
+        }
+      }
+    },
+    navigator: {},
+    requestAnimationFrame: (fn) => fn(),
+    setTimeout: () => 1,
+    clearTimeout: () => {},
+    setInterval: () => 1,
+    clearInterval: () => {}
+  };
+  ctx.window.window = ctx.window;
+  vm.runInNewContext(mainScript, ctx);
+  await new Promise((r) => setTimeout(r, 30));
+
+  assert.equal(getEl("delivery-cmd-error").hidden, false);
+  assert.match(getEl("delivery-cmd-error").textContent, /已保存的自定义命令无效/);
+  assert.equal(getEl("row-swarm-resume").hidden, false);
+
+  await getEl("btn-resume-normal").trigger("click");
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(getEl("row-swarm-resume").hidden, true);
+  assert.equal(dispatchPanelApi("/api/state", { conversationId: convId }, { stateDir: dir }).body.activeSession?.swarmActive, false);
+});

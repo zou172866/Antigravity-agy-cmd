@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { inspectCustomCheckCommand } from "./plan-verification.mjs";
 
 export const MIN_RETRY_MAX = 1;
 export const MAX_RETRY_MAX = 50;
@@ -266,23 +267,14 @@ export function clampRetryMax(val, fallback = DEFAULT_RETRY_MAX) {
 
 export function sanitizeDeliveryTestCommand(raw, { strict = false } = {}) {
   if (strict) {
-    if (typeof raw !== "string") {
-      const err = new Error("deliveryTestCommand must be a string");
+    const check = inspectCustomCheckCommand(raw, { maxLen: MAX_DELIVERY_CMD_LEN });
+    if (!check.ok) {
+      const err = new Error(check.error || "Invalid deliveryTestCommand");
       err.statusCode = 400;
+      if (check.errorCode) err.code = check.errorCode;
       throw err;
     }
-    if (/[\x00-\x08\x0a-\x1f\x7f]/.test(raw)) {
-      const err = new Error("deliveryTestCommand must be a single-line command without control characters");
-      err.statusCode = 400;
-      throw err;
-    }
-    const normalized = raw.trim().replace(/[ \t]+/g, " ");
-    if (normalized.length > MAX_DELIVERY_CMD_LEN) {
-      const err = new Error(`deliveryTestCommand must be at most ${MAX_DELIVERY_CMD_LEN} characters`);
-      err.statusCode = 400;
-      throw err;
-    }
-    return normalized;
+    return check.normalized;
   }
   if (typeof raw !== "string") return "";
   return raw
@@ -290,6 +282,13 @@ export function sanitizeDeliveryTestCommand(raw, { strict = false } = {}) {
     .trim()
     .replace(/[ \t]+/g, " ")
     .slice(0, MAX_DELIVERY_CMD_LEN);
+}
+
+export function getDeliveryCommandValidationError(settings = {}) {
+  const s = normalizeSettings(settings);
+  if (!s.deliveryTestCommand) return "";
+  const check = inspectCustomCheckCommand(s.deliveryTestCommand, { maxLen: MAX_DELIVERY_CMD_LEN });
+  return check.ok ? "" : check.error || "自定义验证命令无效";
 }
 
 export function normalizeSettings(raw = {}) {
@@ -822,6 +821,10 @@ export function formatDeliveryGateSummaryZh(settings = {}) {
     return "交付测试门禁：关闭（按默认防停机策略运行）";
   }
   if (s.deliveryTestCommand) {
+    const err = getDeliveryCommandValidationError(s);
+    if (err) {
+      return `交付测试门禁：已开启 · 自定义命令无效（需修正：${err}）`;
+    }
     return `交付测试门禁：已开启 · 自定义命令：${s.deliveryTestCommand}`;
   }
   return "交付测试门禁：已开启 · 自动探测项目测试（无测项保守放行并说明）";

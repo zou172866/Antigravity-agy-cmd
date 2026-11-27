@@ -148,9 +148,57 @@ export function resolveStateDir(env = process.env) {
   return path.join(os.tmpdir(), "agy-cmd-state");
 }
 
+const VALID_HOST_SURFACES = new Set(["app", "ide", "cli"]);
+
+const RESUME_NORMAL_SESSION_ZH_RE =
+  /(?:恢复(?:普通|正常)(?:会话|模式|护栏)|退出\s*(?:\/?swarm|协作模式|协调器模式)|结束\s*(?:\/?swarm|协作模式|协调器模式)|关闭\s*(?:\/?swarm|协作模式)\s*豁免)/i;
+const RESUME_NORMAL_SESSION_EN_RE =
+  /\b(?:resume\s+normal\s+(?:session|mode|guardrails?)|(?:exit|end|leave)\s+\/?swarm(?:\s+(?:session|mode))?)\b/i;
+const RESUME_NEGATION_RE =
+  /(?:别|不要|不用|不必|勿|请勿|暂不|先不|不(?:想|要))(?:\s*(?:现在|立刻|马上))?\s*$|(?:\b(?:do\s+not|don['’]t|never|avoid|not)\s+(?:want\s+to\s+)?)$/i;
+const RESUME_INQUIRY_RE =
+  /^(?:请问|什么是|(?:请|帮我)?(?:解释|介绍|说明)|如何|怎么|为什么|(?:what\s+is|how\s+(?:do|can|to)|explain)\b)|(?:是什么意思|什么意思)/i;
+const BARE_RESUME_NORMAL_RE =
+  /^(?:(?:请|帮我|麻烦|现在|直接|先|立即|马上|please|now)\s*)*(?:恢复(?:普通|正常)(?:会话|模式|护栏)|退出\s*(?:\/?swarm|协作模式|协调器模式)|结束\s*(?:\/?swarm|协作模式|协调器模式)|关闭\s*(?:\/?swarm|协作模式)\s*豁免|resume\s+normal\s+(?:session|mode|guardrails?)|(?:exit|end|leave)\s+\/?swarm(?:\s+(?:session|mode))?)(?:\s*(?:吧|一下|了))?[。.!！\s]*$/i;
+
+export function isResumeNormalSessionRequest(rawText) {
+  const s = nonEmptyString(rawText);
+  if (!s) return false;
+  const stripped = s.replace(/```[\s\S]*?```/g, " ");
+  for (const rawClause of stripped.split(/[。.!！?？;\n,，]+/)) {
+    const clause = rawClause.trim();
+    if (!clause || RESUME_INQUIRY_RE.test(clause)) continue;
+    const match = RESUME_NORMAL_SESSION_ZH_RE.exec(clause) || RESUME_NORMAL_SESSION_EN_RE.exec(clause);
+    if (!match) continue;
+    const prefix = clause.slice(0, match.index);
+    if (RESUME_NEGATION_RE.test(prefix)) continue;
+    return true;
+  }
+  return false;
+}
+
+export function isBareResumeNormalSessionRequest(rawText) {
+  const s = nonEmptyString(rawText);
+  if (!s) return false;
+  const stripped = s.replace(/```[\s\S]*?```/g, " ").trim();
+  return BARE_RESUME_NORMAL_RE.test(stripped);
+}
+
 export function detectHostSurface(payload = {}) {
   const p = parseHookPayload(payload);
   if (!p) return "unknown";
+  const explicitCandidates = [
+    p.hostSurface,
+    p.host_surface,
+    p.surface,
+    p.metadata?.hostSurface,
+    p.metadata?.host_surface,
+    p.metadata?.surface
+  ];
+  for (const raw of explicitCandidates) {
+    const norm = nonEmptyString(raw).toLowerCase();
+    if (VALID_HOST_SURFACES.has(norm)) return norm;
+  }
   const candidates = [
     p.transcriptPath,
     p.transcript_path,
@@ -165,6 +213,80 @@ export function detectHostSurface(payload = {}) {
     if (/\/\.gemini\/antigravity-cli(?:\/|$)/.test(norm)) return "cli";
     if (/\/\.gemini\/antigravity(?:\/|$)/.test(norm)) return "app";
   }
+  return "unknown";
+}
+
+function normalizeSlashList(val) {
+  if (!Array.isArray(val)) return null;
+  const out = new Set();
+  for (const item of val) {
+    const raw = typeof item === "string" ? item : item?.name ?? item?.command;
+    const norm = nonEmptyString(raw).replace(/^\/+/, "").toLowerCase();
+    if (norm) out.add(norm);
+  }
+  return out;
+}
+
+/**
+ * Inspect structured host capability / available slash command fields if provided
+ * in the hook payload. Returns "available", "unavailable", or "unknown".
+ */
+export function resolveHostSlashCapability(payload = {}, commandName = "") {
+  const cmd = nonEmptyString(commandName).replace(/^\/+/, "").toLowerCase();
+  if (!cmd) return "unknown";
+  const p = parseHookPayload(payload);
+  if (!p) return "unknown";
+
+  const containers = [p, p.metadata, p.capabilities, p.metadata?.capabilities].filter(
+    (c) => c && typeof c === "object" && !Array.isArray(c)
+  );
+
+  for (const c of containers) {
+    for (const key of ["disabledSlashCommands", "disabled_slash_commands", "disabledCommands", "disabled_commands"]) {
+      const list = normalizeSlashList(c[key]);
+      if (list && list.has(cmd)) return "unavailable";
+    }
+  }
+
+  const capMaps = [
+    p.capabilities,
+    p.slashCapabilities,
+    p.slash_capabilities,
+    p.capabilities?.slashCommands,
+    p.capabilities?.commands,
+    p.metadata?.capabilities,
+    p.metadata?.slashCapabilities,
+    p.metadata?.slash_capabilities,
+    p.metadata?.capabilities?.slashCommands,
+    p.metadata?.capabilities?.commands
+  ].filter((m) => m && typeof m === "object" && !Array.isArray(m));
+
+  for (const m of capMaps) {
+    const val = Object.prototype.hasOwnProperty.call(m, cmd)
+      ? m[cmd]
+      : Object.prototype.hasOwnProperty.call(m, `/${cmd}`)
+        ? m[`/${cmd}`]
+        : undefined;
+    if (val === true) return "available";
+    if (val === false) return "unavailable";
+  }
+
+  for (const c of containers) {
+    for (const key of [
+      "availableSlashCommands",
+      "available_slash_commands",
+      "slashCommands",
+      "slash_commands",
+      "availableCommands",
+      "available_commands"
+    ]) {
+      const list = normalizeSlashList(c[key]);
+      if (list !== null) {
+        return list.has(cmd) ? "available" : "unavailable";
+      }
+    }
+  }
+
   return "unknown";
 }
 

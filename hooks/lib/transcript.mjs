@@ -1,5 +1,10 @@
 import fs from "node:fs";
-import { extractActiveSlashCommands, nonEmptyString, unwrapUserRequestText } from "./common.mjs";
+import {
+  extractActiveSlashCommands,
+  isResumeNormalSessionRequest,
+  nonEmptyString,
+  unwrapUserRequestText
+} from "./common.mjs";
 
 const HEAD_READ_BYTES = 64 * 1024;
 const TAIL_READ_BYTES = 256 * 1024;
@@ -7,6 +12,8 @@ const TAIL_READ_BYTES = 256 * 1024;
 const SUBAGENT_MSG_RE = /\[Message\]\s+timestamp=[^\n]*\bsender=/;
 const SWARM_WORKER_SYS_RE =
   /<swarm_worker\b|<\/swarm_worker>|You are the swarm's stall monitor|\[Swarm Worker\]/i;
+const SWARM_END_SYS_RE =
+  /<swarm_ended\b|<\/swarm_ended>|^\s*(?:\[Swarm\]\s*)?(?:Swarm(?:\s+session)?\s+(?:ended|completed|stopped|closed)|All\s+swarm\s+workers\s+(?:have\s+been\s+)?killed)\b/im;
 const SWARM_TOOL_NAME_RE = /^(?:swarm|post_board|read_board|swarm_wait)$/i;
 const SWARM_PLAN_FILE_RE = /[\\/]\.system_generated[\\/]swarm[\\/]plan\.json$/i;
 const LEADING_SWARM_SLASH_RE = /^\s*\/swarm(?=$|\s)/i;
@@ -17,6 +24,61 @@ const PLAN_MODE_OFF_RE = /^Plan mode is off\.?$/i;
 const PLAN_WRITE_TOOL_RE = /\b(?:write_file|write_to_file)\b/i;
 const PLAN_ARTIFACT_PATH_RE = /(?:implementation[_ -]?plan|plan\.md|[\\/]brain[\\/])/i;
 const IMPLEMENTATION_PLAN_FILE_RE = /(?:^|[\\/])(?:implementation[_ -]plan(?:[_ -][^\\/]*)?|plan)\.md$/i;
+
+function isSwarmTeardownToolOutput(body) {
+  if (typeof body !== "string" || !body.trim()) return false;
+  const trimmed = body.trim();
+  if (
+    /\b(?:no\s+active\s+(?:swarm\s+)?workers|0\s+active\s+(?:swarm\s+)?workers|all\s+(?:swarm\s+)?workers\s+(?:are\s+|have\s+been\s+)?killed|swarm(?:\s+session)?\s+(?:ended|closed))\b/i.test(
+      trimmed
+    )
+  ) {
+    return true;
+  }
+  if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        if (parsed.swarmEnded === true || parsed.swarm_ended === true || parsed.activeWorkers === 0) {
+          return true;
+        }
+        const rawMembers = Array.isArray(parsed.members)
+          ? parsed.members
+          : Array.isArray(parsed.workers)
+            ? parsed.workers
+            : null;
+        if (rawMembers) {
+          const workers = rawMembers.filter(
+            (m) =>
+              m &&
+              typeof m === "object" &&
+              String(m.name || "").toLowerCase() !== "coordinator" &&
+              String(m.role || "").toLowerCase() !== "coordinator"
+          );
+          if (
+            workers.length > 0 &&
+            workers.every((w) => String(w.state || w.status || "").toLowerCase() === "killed")
+          ) {
+            return true;
+          }
+        }
+      }
+    } catch {}
+  }
+  // Plain-text member status listing: require at least one killed member line and zero live states.
+  const lines = trimmed.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  let killedLines = 0;
+  let liveLines = 0;
+  for (const line of lines) {
+    if (/^\s*coordinator\b/i.test(line)) continue;
+    if (/\b(?:working|waiting|stopped|running)\b/i.test(line)) {
+      liveLines += 1;
+    } else if (/\bkilled\b/i.test(line)) {
+      killedLines += 1;
+    }
+  }
+  return killedLines > 0 && liveLines === 0 && /\b(?:status|members?|workers?|swarm)\b/i.test(trimmed);
+}
 
 // The desktop approval button sends a preamble outside the (usually empty) USER_REQUEST.
 export function isPlanApprovalNotice(input) {
@@ -316,6 +378,11 @@ export function inspectTranscriptTail(transcriptPath) {
     hasPlannerResponseSinceUserInput: false,
     hasBgTaskCompletionSinceUserInput: false,
     hasSwarmActivity: false,
+    swarmLifecycle: "none",
+    latestSwarmActivityKey: "",
+    latestSwarmActivityStep: null,
+    latestSwarmEndKey: "",
+    latestSwarmEndStep: null,
     tailRolledOverWithoutUserInput: false,
     awaitingUserApprovalOrQuestion: false
   };
@@ -343,14 +410,21 @@ export function inspectTranscriptTail(transcriptPath) {
   let latestInputFollowsPlan = false;
   let hasPlannerResponseSinceUserInput = false;
   let hasBgTaskCompletionSinceUserInput = false;
-  let hasSwarmActivity = false;
+  let swarmLifecycle = "none";
+  let latestSwarmActivityKey = "";
+  let latestSwarmActivityStep = null;
+  let latestSwarmEndKey = "";
+  let latestSwarmEndStep = null;
+  let pendingSwarmTeardownCheck = false;
 
   for (const { step, byteOffset } of entries) {
     const idx = parseNonNegStepIdx(step.step_index);
+    const stepKey = idx !== null ? `step:${idx}` : `byte:${byteOffset}`;
 
     if (step.type === "USER_INPUT") {
       latestInputFollowsPlan = waitingForPlanReply;
       waitingForPlanReply = false;
+      pendingSwarmTeardownCheck = false;
       const createdAt = nonEmptyString(step.created_at);
       latestUserInputKey =
         idx !== null
@@ -364,9 +438,17 @@ export function inspectTranscriptTail(transcriptPath) {
         latestUserInput = step.content;
         const unwrapped = unwrapUserRequestText(step.content);
         if (extractActiveSlashCommands(unwrapped).has("compact")) {
-          hasSwarmActivity = false;
+          swarmLifecycle = "none";
+          latestSwarmEndKey = stepKey;
+          latestSwarmEndStep = idx;
         } else if (LEADING_SWARM_SLASH_RE.test(unwrapped)) {
-          hasSwarmActivity = true;
+          swarmLifecycle = "active";
+          latestSwarmActivityKey = stepKey;
+          latestSwarmActivityStep = idx;
+        } else if (isResumeNormalSessionRequest(unwrapped)) {
+          swarmLifecycle = "ended";
+          latestSwarmEndKey = stepKey;
+          latestSwarmEndStep = idx;
         }
       }
       // A new user turn supersedes any prior turn's Plan Mode denial or approval wait
@@ -379,34 +461,50 @@ export function inspectTranscriptTail(transcriptPath) {
     if (step.type === "PLANNER_RESPONSE") {
       lastPlannerStep = step;
       hasPlannerResponseSinceUserInput = true;
+      pendingSwarmTeardownCheck = false;
       const pContent = typeof step.content === "string" ? step.content : "";
       const pCalls = Array.isArray(step.tool_calls)
         ? step.tool_calls
         : Array.isArray(step.toolCalls)
           ? step.toolCalls
           : [];
-      if (
-        pCalls.some((c) => {
-          const name = nonEmptyString(c?.name);
-          if (SWARM_TOOL_NAME_RE.test(name)) return true;
-          if (PLAN_WRITE_TOOL_RE.test(name)) {
-            const args = parseToolCallArgs(c?.args);
-            const rawPath = String(
-              args.Path ?? args.path ?? args.TargetFile ?? args.targetFile ?? args.filePath ?? ""
-            ).replace(/^["']|["']$/g, "");
-            if (SWARM_PLAN_FILE_RE.test(rawPath)) return true;
+      let sawSwarmCall = false;
+      let sawTeardownProbeCall = false;
+      for (const c of pCalls) {
+        const name = nonEmptyString(c?.name);
+        if (SWARM_TOOL_NAME_RE.test(name)) {
+          sawSwarmCall = true;
+          if (name.toLowerCase() === "swarm") {
+            const cArgs = parseToolCallArgs(c?.args);
+            const action = nonEmptyString(cArgs.action).toLowerCase();
+            if (action === "kill" || action === "status") {
+              sawTeardownProbeCall = true;
+            }
           }
-          return false;
-        })
-      ) {
-        hasSwarmActivity = true;
+          continue;
+        }
+        if (PLAN_WRITE_TOOL_RE.test(name)) {
+          const args = parseToolCallArgs(c?.args);
+          const rawPath = String(
+            args.Path ?? args.path ?? args.TargetFile ?? args.targetFile ?? args.filePath ?? ""
+          ).replace(/^["']|["']$/g, "");
+          if (SWARM_PLAN_FILE_RE.test(rawPath)) {
+            sawSwarmCall = true;
+          }
+        }
+      }
+      if (sawSwarmCall) {
+        swarmLifecycle = "active";
+        latestSwarmActivityKey = stepKey;
+        latestSwarmActivityStep = idx;
+        pendingSwarmTeardownCheck = sawTeardownProbeCall;
       }
       const calledAskQuestion = pCalls.some((c) => nonEmptyString(c?.name) === "ask_question");
       const showsPlan = /^\s*(?:\*\*)?\[agy-cmd\s*→\s*\/plan\s*审批\]/.test(pContent);
       if (calledAskQuestion || pCalls.length > 0 || showsPlan) {
         waitingForPlanReply = !calledAskQuestion && (showsPlan || pCalls.some(requestsPlanFeedback));
         if (waitingForPlanReply) {
-          latestPlanPromptKey = idx !== null ? `step:${idx}` : `byte:${byteOffset}`;
+          latestPlanPromptKey = stepKey;
           planRequest = latestUserInput;
           const artifact = pCalls.find(requestsPlanFeedback);
           const args = parseToolCallArgs(artifact?.args);
@@ -430,6 +528,12 @@ export function inspectTranscriptTail(transcriptPath) {
 
     if (step.type === "SYSTEM_MESSAGE") {
       const content = typeof step.content === "string" ? step.content : "";
+      if (SWARM_END_SYS_RE.test(content)) {
+        swarmLifecycle = "ended";
+        latestSwarmEndKey = stepKey;
+        latestSwarmEndStep = idx;
+        pendingSwarmTeardownCheck = false;
+      }
       const taskMatch = content.match(BG_TASK_SENDER_RE);
       if (taskMatch && /finished with result:/i.test(content)) {
         hasBgTaskCompletionSinceUserInput = true;
@@ -456,6 +560,15 @@ export function inspectTranscriptTail(transcriptPath) {
       const rawContent = typeof step.content === "string" ? step.content : "";
       const body = stripTranscriptStepHeaders(rawContent);
       const errText = nonEmptyString(step.error);
+
+      if (pendingSwarmTeardownCheck && step.status !== "ERROR" && !errText) {
+        pendingSwarmTeardownCheck = false;
+        if (isSwarmTeardownToolOutput(body)) {
+          swarmLifecycle = "ended";
+          latestSwarmEndKey = stepKey;
+          latestSwarmEndStep = idx;
+        }
+      }
 
       // If Plan Mode was explicitly exited after an earlier denial, clear the denial
       if (step.status !== "ERROR" && PLAN_MODE_OFF_RE.test(body)) {
@@ -501,7 +614,12 @@ export function inspectTranscriptTail(transcriptPath) {
     latestInputFollowsPlan,
     hasPlannerResponseSinceUserInput,
     hasBgTaskCompletionSinceUserInput,
-    hasSwarmActivity,
+    hasSwarmActivity: swarmLifecycle === "active",
+    swarmLifecycle,
+    latestSwarmActivityKey,
+    latestSwarmActivityStep,
+    latestSwarmEndKey,
+    latestSwarmEndStep,
     tailRolledOverWithoutUserInput: Boolean(truncated && !latestUserInputKey && fileSize > 0),
     awaitingUserApprovalOrQuestion
   };

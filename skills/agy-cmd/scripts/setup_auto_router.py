@@ -23,7 +23,10 @@ MIN_RETRY_MAX = 1
 MAX_RETRY_MAX = 50
 DEFAULT_RETRY_MAX = 3
 MAX_DELIVERY_CMD_LEN = 240
+MAX_CUSTOM_SEGMENTS = 8
+MAX_CHAIN_PARTS = 32
 SETTINGS_VERSION = 3
+CD_SEGMENT_RE = re.compile(r"^(?:cd(?:\s+/d)?|pushd|Set-Location(?:\s+-Path)?)\s+(.+)$", re.IGNORECASE)
 
 GITHUB_REPO_URL = "https://github.com/zou172866/Antigravity-agy-cmd"
 GH_STAR_COMMAND = "gh api -X PUT /user/starred/zou172866/Antigravity-agy-cmd"
@@ -300,17 +303,115 @@ def normalize_star_prompt_state(raw: object) -> dict:
     }
 
 
+def _parse_strict_and_chain(raw_cmd: str) -> tuple[list[str] | None, str]:
+    s = raw_cmd.strip()
+    if not s:
+        return [], ""
+    parts: list[str] = []
+    cur: list[str] = []
+    quote = ""
+    last_sep = ""
+    i = 0
+    n = len(s)
+    while i < n:
+        ch = s[i]
+        if quote:
+            cur.append(ch)
+            if ch == quote and (quote == "'" or (i > 0 and s[i - 1] != "\\")):
+                quote = ""
+            i += 1
+            continue
+        if ch in ('"', "'"):
+            quote = ch
+            cur.append(ch)
+            i += 1
+            continue
+        if ch == "`" or (ch == "$" and i + 1 < n and s[i + 1] == "("):
+            return None, "自定义验证命令不支持命令替换语法（反引号或 $()）"
+        if ch == "|":
+            return None, "自定义验证命令不支持管道（|）或逻辑或（||）"
+        if ch == ";":
+            seg = "".join(cur).strip()
+            if not seg:
+                return None, "自定义验证命令包含空的分号命令段"
+            if not CD_SEGMENT_RE.match(seg):
+                return None, "自定义验证命令仅允许在 cd/pushd/Set-Location 后使用分号（;），其余多段请使用 && 连接"
+            parts.append(seg)
+            cur = []
+            last_sep = ";"
+            if len(parts) > MAX_CHAIN_PARTS:
+                return None, f"自定义验证命令分段过多（最多支持 {MAX_CUSTOM_SEGMENTS} 个执行段）"
+            i += 1
+            continue
+        if ch == "&":
+            if i + 1 < n and s[i + 1] == "&":
+                seg = "".join(cur).strip()
+                if not seg:
+                    return None, "自定义验证命令包含空的 && 命令段"
+                parts.append(seg)
+                cur = []
+                last_sep = "&&"
+                if len(parts) > MAX_CHAIN_PARTS:
+                    return None, f"自定义验证命令分段过多（最多支持 {MAX_CUSTOM_SEGMENTS} 个执行段）"
+                i += 2
+                continue
+            if (i > 0 and s[i - 1] == ">") or (i + 1 < n and s[i + 1] == ">"):
+                cur.append(ch)
+                i += 1
+                continue
+            return None, "自定义验证命令不支持后台操作符（&）"
+        cur.append(ch)
+        i += 1
+    if quote:
+        return None, "自定义验证命令存在未闭合的引号"
+    tail = "".join(cur).strip()
+    if not tail:
+        if last_sep:
+            return None, f"自定义验证命令末尾存在悬空的 {last_sep}"
+    else:
+        parts.append(tail)
+        if len(parts) > MAX_CHAIN_PARTS:
+            return None, f"自定义验证命令分段过多（最多支持 {MAX_CUSTOM_SEGMENTS} 个执行段）"
+    return parts, ""
+
+
+def inspect_delivery_test_command(raw: object) -> tuple[bool, str, str]:
+    if not isinstance(raw, str):
+        return False, "", "--delivery-test-cmd 必须是字符串。"
+    if re.search(r"[\x00-\x08\x0a-\x1f\x7f]", raw):
+        return False, "", "--delivery-test-cmd 仅支持单行命令，不能包含换行或控制字符。"
+    cleaned = re.sub(r"[ \t]+", " ", raw.strip())
+    if not cleaned:
+        return True, "", ""
+    if len(cleaned) > MAX_DELIVERY_CMD_LEN:
+        return False, cleaned, f"--delivery-test-cmd 长度不能超过 {MAX_DELIVERY_CMD_LEN} 字符（收到：{len(cleaned)}）。"
+    parts, err = _parse_strict_and_chain(cleaned)
+    if parts is None:
+        return False, cleaned, err
+    exec_count = 0
+    for part in parts:
+        m = CD_SEGMENT_RE.match(part.strip())
+        if m:
+            raw_target = m.group(1).strip()
+            if not raw_target or raw_target == "-" or re.search(r"[$%`*?<>|;]", raw_target):
+                return False, cleaned, "自定义验证命令包含不支持的目录切换目标（不支持 -、环境变量或通配符）"
+            continue
+        seg = re.sub(r"\s+2>&1\s*$", "", part.strip()).strip()
+        if not seg:
+            return False, cleaned, "自定义验证命令包含空执行段"
+        exec_count += 1
+        if exec_count > MAX_CUSTOM_SEGMENTS:
+            return False, cleaned, f"自定义验证命令最多支持 {MAX_CUSTOM_SEGMENTS} 个执行段（当前超出上限）"
+    if exec_count == 0:
+        return False, cleaned, "自定义验证命令未包含可执行验证段"
+    return True, cleaned, ""
+
+
 def sanitize_delivery_test_command(raw: object, *, strict: bool = False) -> str:
     if strict:
-        if not isinstance(raw, str):
-            raise SystemExit("ERROR：--delivery-test-cmd 必须是字符串。")
-        if re.search(r"[\x00-\x08\x0a-\x1f\x7f]", raw):
-            raise SystemExit("ERROR：--delivery-test-cmd 仅支持单行命令，不能包含换行或控制字符。")
-        cleaned = re.sub(r"[ \t]+", " ", raw.strip())
-        if len(cleaned) > MAX_DELIVERY_CMD_LEN:
-            raise SystemExit(
-                f"ERROR：--delivery-test-cmd 长度不能超过 {MAX_DELIVERY_CMD_LEN} 字符（收到：{len(cleaned)}）。"
-            )
+        ok, cleaned, err = inspect_delivery_test_command(raw)
+        if not ok:
+            raise SystemExit(f"ERROR：{err}")
         return cleaned
     if not isinstance(raw, str):
         return ""
@@ -471,7 +572,11 @@ def format_settings_summary(settings: dict) -> str:
         tier_str = f"免费版默认（独立复核{review}）"
     if settings.get("deliveryTestGateEnabled") is True:
         custom_cmd = sanitize_delivery_test_command(settings.get("deliveryTestCommand"), strict=False)
-        gate_str = f"开启（自定义：{custom_cmd}）" if custom_cmd else "开启（自动探测）"
+        if custom_cmd:
+            cmd_ok, _, cmd_err = inspect_delivery_test_command(custom_cmd)
+            gate_str = f"开启（自定义：{custom_cmd}）" if cmd_ok else f"开启（自定义命令无效，需修正：{cmd_err}）"
+        else:
+            gate_str = "开启（自动探测）"
     else:
         gate_str = "关闭"
     return f"自动重试={retry_str} | 交付门禁={gate_str} | 套餐档位={tier_str}"

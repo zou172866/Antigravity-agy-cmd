@@ -20,6 +20,9 @@ const LEADING_CD_CMD_RE = /^(?:(?:cd\s+(?:\/d\s+)?|pushd\s+|Set-Location\s+)(?:"
 const CD_SEGMENT_RE = /^(?:cd(?:\s+\/d)?|pushd|Set-Location(?:\s+-Path)?)\s+(.+)$/i;
 const PURE_COMMENT_LINE_RE = /^\s*(?:$|\/\/|\/\*|\*\/|\*(?:\s|$)|<!--|-->|'''|"""|#(?!\[|(?:include|define|ifdef|ifndef|endif|pragma|else|elif|undef)\b|[A-Za-z_$][\w$]*\s*(?:[=;(])))/;
 const MAX_CUSTOM_SEGMENTS = 8;
+const MAX_CHAIN_PARTS = 32;
+const MAX_AUTO_CHAIN_SEGMENTS = 16;
+const MAX_CUSTOM_CMD_LEN = 240;
 const MAX_CUSTOM_RECEIPTS = 32;
 
 export function pathKey(p) {
@@ -381,31 +384,74 @@ export function planToolEvidence(plan, tool, args, payload, command) {
     if (tool === "apply_edits") recordEditedFile(files, file, edit.file, pkg?.scope || root, edit.canRequireCheck ? pkg : null);
   }
 
-  let commands = [];
-  let runDir = cwd;
-  if (tool === "run_command") commands = [command];
+  const rawEntries = [];
+  if (tool === "run_command" && command) {
+    rawEntries.push({ raw: command, runDir: cwd });
+  }
   const items = decoded(args.commands);
   if (tool === "run_checks" && Array.isArray(items)) {
-    // Each item can override the cwd. Only a single, unambiguous aggregate
-    // check can supply this receipt.
-    if (items.length === 1) {
-      const item = items[0];
-      commands = [typeof item === "string" ? item : item?.command];
-      if (item?.cwd) runDir = location(item.cwd, cwd);
+    for (const item of items) {
+      const itemCmd = typeof item === "string" ? item : item?.command;
+      if (!itemCmd) continue;
+      const itemDir = item?.cwd ? location(item.cwd, cwd) : cwd;
+      rawEntries.push({ raw: itemCmd, runDir: itemDir });
     }
   }
   if (tool === "apply_edits" && args.verify) {
-    commands = [typeof args.verify === "string" ? args.verify : args.verify.command];
-    if (args.verify.cwd) runDir = location(args.verify.cwd, cwd);
+    const verifyCmd = typeof args.verify === "string" ? args.verify : args.verify.command;
+    if (verifyCmd) {
+      const verifyDir = args.verify.cwd ? location(args.verify.cwd, cwd) : cwd;
+      rawEntries.push({ raw: verifyCmd, runDir: verifyDir });
+    }
   }
-  const check = checkCommand(commands[0]);
-  const checkRoot = check && runDir && findRoot(runDir);
-  const pkg = checkRoot && (projectFor(runDir, checkRoot, packages) ??
-    (runDir === plan.requested?.scope ? plan.requested : null));
-  const checked = pkg && pkg.scope === runDir ? { scope: pkg.scope, command: check } : null;
+
+  let checked = null;
+  const checkedSegments = [];
+  const multiEntry = rawEntries.length > 1;
+  if (rawEntries.length === 1) {
+    const singleEntry = rawEntries[0];
+    const check = checkCommand(singleEntry.raw);
+    const checkRoot = check && singleEntry.runDir && findRoot(singleEntry.runDir);
+    const pkg = checkRoot && (projectFor(singleEntry.runDir, checkRoot, packages) ??
+      (singleEntry.runDir === plan.requested?.scope ? plan.requested : null));
+    if (pkg && pkg.scope === singleEntry.runDir) {
+      checked = { scope: pkg.scope, command: check };
+    }
+  }
+
+  const seenPlanSegs = new Set();
+  for (const entry of rawEntries) {
+    const resolvedSegs = resolveExecutedSegments(entry.raw, entry.runDir);
+    if (!resolvedSegs.length) continue;
+    const isChain = multiEntry || resolvedSegs.length > 1;
+    for (const seg of resolvedSegs) {
+      const norm = normalizeSingleCheckCommand(seg.raw);
+      if (!norm || !seg.runDir) continue;
+      const checkRoot = findRoot(seg.runDir);
+      if (!checkRoot) continue;
+      const pkg = projectFor(seg.runDir, checkRoot, packages) ??
+        (seg.runDir === plan.requested?.scope ? plan.requested : null);
+      if (!pkg || pkg.scope !== seg.runDir) continue;
+      const dedupKey = `${pathKey(pkg.scope)}\0${norm}\0${isChain ? 1 : 0}`;
+      if (seenPlanSegs.has(dedupKey)) continue;
+      seenPlanSegs.add(dedupKey);
+      checkedSegments.push({ scope: pkg.scope, command: norm, ...(isChain ? { isChain: true } : {}) });
+    }
+  }
+  if (!checked && checkedSegments.length === 1 && !checkedSegments[0].isChain) {
+    checked = { scope: checkedSegments[0].scope, command: checkedSegments[0].command };
+  }
+
   const ignored = tool === "apply_edits" && wroteSource ? collectIgnoredSourceFiles(args, cwd, findRoot, files) : [];
-  return wroteSource || checked
-    ? { key: plan.key, wroteSource, edited: [...edited.values()], ...fileEvidence(tool, files, ignored), checked }
+  return wroteSource || checked || checkedSegments.length > 0
+    ? {
+        key: plan.key,
+        wroteSource,
+        edited: [...edited.values()],
+        ...fileEvidence(tool, files, ignored),
+        checked,
+        ...(checkedSegments.length > 0 ? { checkedSegments } : {})
+      }
     : null;
 }
 
@@ -414,6 +460,15 @@ export function planToolEvidence(plan, tool, args, payload, command) {
 export function advancePlan(plan, events) {
   if (!plan) return plan;
   const next = { ...plan, scopes: { ...plan.scopes } };
+  const recordPlanCheck = (dir, command, step, failed) => {
+    const scope = { ...next.scopes[dir] };
+    // Project-wide npm test from multiple managers has one semantic key.
+    const receipt = scope.checks?.[command];
+    if (!receipt || step >= receipt.step) {
+      scope.checks = { ...scope.checks, [command]: { step, passed: !failed, known: !failed || receipt?.known === true } };
+      next.scopes[dir] = scope;
+    }
+  };
   for (const ev of events) {
     const data = ev.planEvidence;
     if (data?.key !== plan.key || ev.pending || ev.backgroundRunning) continue;
@@ -431,14 +486,18 @@ export function advancePlan(plan, events) {
         }
       }
     }
-    if (ev.kind === "cmd" && ev.terminal && data.checked) {
-      const { scope: dir, command } = data.checked;
-      const scope = { ...next.scopes[dir] };
-      // Project-wide npm test from multiple managers has one semantic key.
-      const receipt = scope.checks?.[command];
-      if (!receipt || step >= receipt.step) {
-        scope.checks = { ...scope.checks, [command]: { step, passed: !ev.failed, known: !ev.failed || receipt?.known === true } };
-        next.scopes[dir] = scope;
+    if (ev.kind === "cmd" && ev.terminal) {
+      if (data.checked) {
+        const { scope: dir, command } = data.checked;
+        recordPlanCheck(dir, command, step, ev.failed);
+      }
+      if (Array.isArray(data.checkedSegments)) {
+        for (const seg of data.checkedSegments) {
+          if (!seg?.scope || !seg?.command) continue;
+          // Failure short-circuit in a multi-segment chain cannot prove which segment passed.
+          if (seg.isChain && ev.failed) continue;
+          recordPlanCheck(seg.scope, seg.command, step, ev.failed);
+        }
       }
     }
   }
@@ -511,15 +570,18 @@ function stripTrailingStderrRedirect(cmd) {
 /**
  * Safely split a shell command string on `&&` (and `;` ONLY immediately after a
  * `cd`/`pushd`/`Set-Location` segment), while rejecting unquoted operators that
- * can mask a test failure (`||`, `|`, non-cd `;`, standalone `&`, backticks, `$(`).
- * Returns `null` if any masking operator is detected.
+ * can mask a test failure (`||`, `|`, non-cd `;`, standalone `&`, backticks, `$(`),
+ * empty chain segments, and unclosed quotes.
  */
-function splitStrictAndChain(rawCmd) {
-  if (typeof rawCmd !== "string" || !rawCmd.trim()) return [];
+function parseStrictAndChain(rawCmd, { maxParts = MAX_CHAIN_PARTS } = {}) {
+  if (typeof rawCmd !== "string" || !rawCmd.trim()) {
+    return { ok: true, parts: [], errorCode: "", error: "" };
+  }
   const s = rawCmd.trim();
   const parts = [];
   let cur = "";
   let quote = "";
+  let lastSep = "";
   for (let i = 0; i < s.length; i++) {
     const ch = s[i];
     if (quote) {
@@ -533,27 +595,76 @@ function splitStrictAndChain(rawCmd) {
       continue;
     }
     if (ch === "`" || (ch === "$" && s[i + 1] === "(")) {
-      return null;
+      return {
+        ok: false,
+        parts: null,
+        errorCode: "unsupported_syntax",
+        error: "自定义验证命令不支持命令替换语法（反引号或 $()）"
+      };
     }
     if (ch === "|") {
       // Both `||` and pipe `|` can mask non-zero exit codes
-      return null;
+      return {
+        ok: false,
+        parts: null,
+        errorCode: "unsupported_syntax",
+        error: "自定义验证命令不支持管道（|）或逻辑或（||）"
+      };
     }
     if (ch === ";") {
       const seg = cur.trim();
-      if (!seg || !CD_SEGMENT_RE.test(seg)) return null;
+      if (!seg) {
+        return {
+          ok: false,
+          parts: null,
+          errorCode: "empty_segment",
+          error: "自定义验证命令包含空的分号命令段"
+        };
+      }
+      if (!CD_SEGMENT_RE.test(seg)) {
+        return {
+          ok: false,
+          parts: null,
+          errorCode: "unsupported_syntax",
+          error: "自定义验证命令仅允许在 cd/pushd/Set-Location 后使用分号（;），其余多段请使用 && 连接"
+        };
+      }
       parts.push(seg);
       cur = "";
-      if (parts.length >= MAX_CUSTOM_SEGMENTS + 4) return null;
+      lastSep = ";";
+      if (parts.length > maxParts) {
+        return {
+          ok: false,
+          parts: null,
+          errorCode: "too_many_segments",
+          error: `自定义验证命令分段过多（最多支持 ${MAX_CUSTOM_SEGMENTS} 个执行段）`
+        };
+      }
       continue;
     }
     if (ch === "&") {
       if (s[i + 1] === "&") {
         const seg = cur.trim();
-        if (seg) parts.push(seg);
+        if (!seg) {
+          return {
+            ok: false,
+            parts: null,
+            errorCode: "empty_segment",
+            error: "自定义验证命令包含空的 && 命令段"
+          };
+        }
+        parts.push(seg);
         cur = "";
+        lastSep = "&&";
         i++;
-        if (parts.length >= MAX_CUSTOM_SEGMENTS + 4) return null;
+        if (parts.length > maxParts) {
+          return {
+            ok: false,
+            parts: null,
+            errorCode: "too_many_segments",
+            error: `自定义验证命令分段过多（最多支持 ${MAX_CUSTOM_SEGMENTS} 个执行段）`
+          };
+        }
         continue;
       }
       // Allow fd redirection like `2>&1` or `>&2`, reject background `&`
@@ -561,14 +672,50 @@ function splitStrictAndChain(rawCmd) {
         cur += ch;
         continue;
       }
-      return null;
+      return {
+        ok: false,
+        parts: null,
+        errorCode: "unsupported_syntax",
+        error: "自定义验证命令不支持后台操作符（&）"
+      };
     }
     cur += ch;
   }
-  if (quote) return null;
+  if (quote) {
+    return {
+      ok: false,
+      parts: null,
+      errorCode: "unclosed_quote",
+      error: "自定义验证命令存在未闭合的引号"
+    };
+  }
   const tail = cur.trim();
-  if (tail) parts.push(tail);
-  return parts;
+  if (!tail) {
+    if (lastSep) {
+      return {
+        ok: false,
+        parts: null,
+        errorCode: "empty_segment",
+        error: `自定义验证命令末尾存在悬空的 ${lastSep}`
+      };
+    }
+  } else {
+    parts.push(tail);
+    if (parts.length > maxParts) {
+      return {
+        ok: false,
+        parts: null,
+        errorCode: "too_many_segments",
+        error: `自定义验证命令分段过多（最多支持 ${MAX_CUSTOM_SEGMENTS} 个执行段）`
+      };
+    }
+  }
+  return { ok: true, parts, errorCode: "", error: "" };
+}
+
+function splitStrictAndChain(rawCmd) {
+  const res = parseStrictAndChain(rawCmd);
+  return res.ok ? res.parts : null;
 }
 
 function parseCdTarget(segment) {
@@ -589,7 +736,7 @@ export function splitChainedCommands(rawCmd) {
     if (cdTarget !== null) continue;
     const cleaned = stripTrailingStderrRedirect(part);
     if (cleaned) out.push(cleaned);
-    if (out.length >= MAX_CUSTOM_SEGMENTS) break;
+    if (out.length > MAX_AUTO_CHAIN_SEGMENTS) return [];
   }
   return out;
 }
@@ -616,7 +763,7 @@ function resolveExecutedSegments(rawCmd, initialDir) {
     const cleanSeg = stripTrailingStderrRedirect(part);
     if (!cleanSeg) continue;
     resolved.push({ raw: cleanSeg, runDir: curDir });
-    if (resolved.length >= MAX_CUSTOM_SEGMENTS) break;
+    if (resolved.length > MAX_AUTO_CHAIN_SEGMENTS) return [];
   }
   return resolved;
 }
@@ -632,35 +779,132 @@ export function normalizeCustomSegment(segment) {
   return redactBasicSecrets(norm).slice(0, 240);
 }
 
-export function parseCustomCheckSpec(customCommand) {
-  if (typeof customCommand !== "string" || !customCommand.trim()) return null;
-  const cleaned = customCommand.trim().replace(/[ \t]+/g, " ");
-  const parts = splitStrictAndChain(cleaned);
-  if (!parts || !parts.length) return null;
+/**
+ * Single authoritative parser/validator shared by settings save (API/CLI) and
+ * execution-time delivery gate evaluation. Rejects >8 executable segments and
+ * unsupported shell syntax explicitly without silent truncation or fallback.
+ */
+export function inspectCustomCheckCommand(raw, { maxLen = MAX_CUSTOM_CMD_LEN } = {}) {
+  if (typeof raw !== "string") {
+    return {
+      ok: false,
+      empty: false,
+      normalized: "",
+      spec: null,
+      errorCode: "invalid_type",
+      error: "deliveryTestCommand must be a string"
+    };
+  }
+  if (/[\x00-\x08\x0a-\x1f\x7f]/.test(raw)) {
+    return {
+      ok: false,
+      empty: false,
+      normalized: "",
+      spec: null,
+      errorCode: "control_chars",
+      error: "deliveryTestCommand must be a single-line command without control characters"
+    };
+  }
+  const normalized = raw.trim().replace(/[ \t]+/g, " ");
+  if (!normalized) {
+    return { ok: true, empty: true, normalized: "", spec: null, errorCode: "", error: "" };
+  }
+  if (normalized.length > maxLen) {
+    return {
+      ok: false,
+      empty: false,
+      normalized,
+      spec: null,
+      errorCode: "too_long",
+      error: `deliveryTestCommand must be at most ${maxLen} characters`
+    };
+  }
+  const parsed = parseStrictAndChain(normalized);
+  if (!parsed.ok) {
+    return {
+      ok: false,
+      empty: false,
+      normalized,
+      spec: null,
+      errorCode: parsed.errorCode,
+      error: parsed.error
+    };
+  }
   let curSubDir = "";
+  let execCount = 0;
   const seen = new Set();
   const segments = [];
-  for (const part of parts) {
+  for (const part of parsed.parts) {
     const cdTarget = parseCdTarget(part);
-    if (cdTarget === undefined) return null;
+    if (cdTarget === undefined) {
+      return {
+        ok: false,
+        empty: false,
+        normalized,
+        spec: null,
+        errorCode: "unsupported_cd",
+        error: "自定义验证命令包含不支持的目录切换目标（不支持 -、环境变量或通配符）"
+      };
+    }
     if (cdTarget !== null) {
       curSubDir = curSubDir && !path.isAbsolute(cdTarget) ? path.join(curSubDir, cdTarget) : cdTarget;
       continue;
     }
     const rawSeg = stripTrailingStderrRedirect(part);
     const key = normalizeCustomSegment(rawSeg);
+    if (!key) {
+      return {
+        ok: false,
+        empty: false,
+        normalized,
+        spec: null,
+        errorCode: "empty_segment",
+        error: "自定义验证命令包含空执行段"
+      };
+    }
+    execCount += 1;
+    if (execCount > MAX_CUSTOM_SEGMENTS) {
+      return {
+        ok: false,
+        empty: false,
+        normalized,
+        spec: null,
+        errorCode: "too_many_segments",
+        error: `自定义验证命令最多支持 ${MAX_CUSTOM_SEGMENTS} 个执行段（当前超出上限）`
+      };
+    }
     const dedupKey = `${pathKey(curSubDir)}\0${key}`;
-    if (!key || seen.has(dedupKey)) continue;
+    if (seen.has(dedupKey)) continue;
     seen.add(dedupKey);
     segments.push({ raw: curSubDir ? `cd ${curSubDir} && ${rawSeg}` : rawSeg, key, subDir: curSubDir });
-    if (segments.length >= MAX_CUSTOM_SEGMENTS) break;
   }
-  if (!segments.length) return null;
+  if (!segments.length) {
+    return {
+      ok: false,
+      empty: false,
+      normalized,
+      spec: null,
+      errorCode: "no_command_segment",
+      error: "自定义验证命令未包含可执行验证段"
+    };
+  }
   return {
-    raw: cleaned,
-    fullKey: segments.map(s => s.key).join(" && "),
-    segments
+    ok: true,
+    empty: false,
+    normalized,
+    spec: {
+      raw: normalized,
+      fullKey: segments.map(s => s.key).join(" && "),
+      segments
+    },
+    errorCode: "",
+    error: ""
   };
+}
+
+export function parseCustomCheckSpec(customCommand) {
+  const res = inspectCustomCheckCommand(customCommand);
+  return res.ok && !res.empty ? res.spec : null;
 }
 
 export function autoCheckCanonicalKey(cmd) {
@@ -687,11 +931,21 @@ function detectNodePackageManager(dir, json) {
 
 function familyForEditedFile(filePath) {
   if (typeof filePath !== "string" || !filePath) return "";
+  const base = path.basename(filePath).toLowerCase();
+  if (base === "package.json" || /^tsconfig(?:\.[\w-]+)?\.json$/i.test(base)) return "node";
+  if (base === "pyproject.toml" || base === "setup.cfg" || base === "pytest.ini") return "python";
+  if (base === "go.mod") return "go";
+  if (base === "cargo.toml") return "rust";
   if (/\.py$/i.test(filePath)) return "python";
   if (/\.go$/i.test(filePath)) return "go";
   if (/\.rs$/i.test(filePath)) return "rust";
   if (/\.(?:[cm]?[jt]sx?|vue|svelte)$/i.test(filePath)) return "node";
   return "";
+}
+
+function deliveryObligationKey(ed) {
+  const cmdKey = ed?.command ? autoCheckCanonicalKey(ed.command) : "";
+  return cmdKey || ed?.family || "default";
 }
 
 function inspectManifestsInDir(current, fileDir, root) {
@@ -789,9 +1043,11 @@ export function deliveryGateToolEvidence(gate, tool, args, payload, command, cus
   const cwd = location(args.Cwd ?? args.cwd ?? fallbackCwd, fallbackCwd);
   const findRoot = f => workspace.filter(r => inside(r, f)).sort((a, b) => b.length - a.length)[0];
   const packages = new Map();
-  const hasCustom = Boolean(parseCustomCheckSpec(customCommand));
-  const hasChainedRequest = Boolean(!hasCustom && gate.requested?.command?.includes("&&"));
-  const trackCustomSegments = hasCustom || hasChainedRequest;
+  const customCheck = inspectCustomCheckCommand(customCommand);
+  const hasValidCustom = customCheck.ok && !customCheck.empty;
+  const hasInvalidCustom = !customCheck.ok && !customCheck.empty;
+  const hasChainedRequest = Boolean(!hasValidCustom && !hasInvalidCustom && gate.requested?.command?.includes("&&"));
+  const trackCustomSegments = hasValidCustom || hasChainedRequest;
 
   let wroteSource = false;
   const edited = new Map();
@@ -801,11 +1057,11 @@ export function deliveryGateToolEvidence(gate, tool, args, payload, command, cus
     const root = file && findRoot(file);
     if (!root || EXAMPLE.test(path.relative(root, file))) continue;
     const pkg = detectDeliveryProject(path.dirname(file), root, packages, file);
-    const hasConfiguredCheck = hasCustom || Boolean(pkg.command) ||
+    const hasConfiguredCheck = hasValidCustom || hasInvalidCustom || Boolean(pkg.command) ||
       Boolean(gate.requested && pathKey(gate.requested.scope) === pathKey(pkg.scope));
     if (RUNTIME_CONFIG.test(file) && !hasConfiguredCheck) continue;
     wroteSource = true;
-    edited.set(pathKey(pkg.scope), pkg);
+    edited.set(`${pathKey(pkg.scope)}\0${deliveryObligationKey(pkg)}`, pkg);
     if (tool === "apply_edits") recordEditedFile(files, file, edit.file, pkg.scope, pkg);
   }
 
@@ -831,9 +1087,11 @@ export function deliveryGateToolEvidence(gate, tool, args, payload, command, cus
   }
 
   const checked = [];
+  const multiEntry = rawEntries.length > 1;
   for (const entry of rawEntries) {
     const resolvedSegs = resolveExecutedSegments(entry.raw, entry.runDir);
     if (!resolvedSegs.length) continue;
+    const isChain = multiEntry || resolvedSegs.length > 1;
     // Group segments by resolved runDir (handles `cd pkg-a && npm test` and mid-chain `cd`)
     const byDir = new Map();
     for (const seg of resolvedSegs) {
@@ -847,19 +1105,21 @@ export function deliveryGateToolEvidence(gate, tool, args, payload, command, cus
     }
     for (const group of byDir.values()) {
       const pkg = detectDeliveryProject(group.runDir, group.root, packages);
-      // Auto-detect only recognizes an unambiguous single project-wide check in the package root
-      let autoKey = "";
-      if (pathKey(pkg.scope) === pathKey(group.runDir) && resolvedSegs.length === 1) {
-        autoKey = autoCheckCanonicalKey(group.rawSegs[0]);
+      let autoKeys = [];
+      if (pathKey(pkg.scope) === pathKey(group.runDir)) {
+        autoKeys = [...new Set(group.rawSegs.map(autoCheckCanonicalKey).filter(Boolean))];
       }
+      const autoKey = autoKeys.length === 1 ? autoKeys[0] : "";
       const segments = trackCustomSegments
         ? group.rawSegs.map(normalizeCustomSegment).filter(Boolean)
         : [];
-      if (!autoKey && !segments.length) continue;
+      if (!autoKeys.length && !segments.length) continue;
       checked.push({
         runDir: group.runDir,
         root: group.root,
         autoKey,
+        ...(autoKeys.length > 0 ? { autoKeys } : {}),
+        ...(isChain ? { isChain: true } : {}),
         segments
       });
     }
@@ -878,13 +1138,15 @@ export function deliveryGateToolEvidence(gate, tool, args, payload, command, cus
 
 export function advanceDeliveryGate(gate, events, customCommand = "") {
   if (!gate) return gate;
-  const effectiveCustomCmd =
-    parseCustomCheckSpec(customCommand)
-      ? customCommand
-      : gate.requested?.command?.includes("&&")
-        ? gate.requested.command
-        : "";
-  const customSpec = parseCustomCheckSpec(effectiveCustomCmd);
+  const customCheck = inspectCustomCheckCommand(customCommand);
+  const hasValidCustom = customCheck.ok && !customCheck.empty;
+  const hasInvalidCustom = !customCheck.ok && !customCheck.empty;
+  const effectiveCustomCmd = hasValidCustom
+    ? customCheck.normalized
+    : !hasInvalidCustom && gate.requested?.command?.includes("&&")
+      ? gate.requested.command
+      : "";
+  const customSpec = effectiveCustomCmd ? parseCustomCheckSpec(effectiveCustomCmd) : null;
   const customKeySet = customSpec ? new Set(customSpec.segments.map(s => s.key)) : null;
 
   const next = {
@@ -918,16 +1180,38 @@ export function advanceDeliveryGate(gate, events, customCommand = "") {
         const prev = next.scopes[sKey] || {};
         const existing = deliveryEditOrders(prev);
         const boundaries = addEditBoundary(existing, order);
-        if (boundaries !== existing) {
-          const scope = { ...prev };
+        const obKey = deliveryObligationKey(ed);
+        const prevObs = prev.obligations && typeof prev.obligations === "object" ? prev.obligations : {};
+        const prevOb = prevObs[obKey] || {};
+        const existingOb = deliveryEditOrders(prevOb);
+        const obBoundaries = addEditBoundary(existingOb, order);
+        const obChanged = obBoundaries !== existingOb || !prevObs[obKey] ||
+          (prevOb.declared || "") !== (ed.command || "") || (prevOb.family || "") !== (ed.family || "");
+
+        if (boundaries !== existing || obChanged) {
+          const scope = { ...prev, obligations: { ...prevObs } };
           scope.dir = ed.scope;
-          delete scope.editStep;
-          scope.editOrder = order;
-          if (boundaries.length > 1) scope.editOrders = boundaries;
-          else delete scope.editOrders;
           scope.root = ed.root;
-          scope.declared = ed.command || "";
-          scope.family = ed.family || "";
+          if (boundaries !== existing) {
+            delete scope.editStep;
+            scope.editOrder = order;
+            if (boundaries.length > 1) scope.editOrders = boundaries;
+            else delete scope.editOrders;
+            scope.declared = ed.command || "";
+            scope.family = ed.family || "";
+          }
+          if (obChanged) {
+            const nextOb = {
+              ...prevOb,
+              family: ed.family || "",
+              declared: ed.command || "",
+              editOrder: obBoundaries !== existingOb ? order : prevOb.editOrder || order
+            };
+            delete nextOb.editStep;
+            if (obBoundaries.length > 1) nextOb.editOrders = obBoundaries;
+            else delete nextOb.editOrders;
+            scope.obligations[obKey] = nextOb;
+          }
           next.scopes[sKey] = scope;
         }
       }
@@ -937,25 +1221,39 @@ export function advanceDeliveryGate(gate, events, customCommand = "") {
       for (const entry of data.checked) {
         if (!entry?.runDir) continue;
         const dKey = pathKey(entry.runDir);
-        if (entry.autoKey) {
-          const prevScope = next.scopes[dKey] || {};
-          const autoChecks = { ...(prevScope.autoChecks || {}) };
-          autoChecks[entry.autoKey] = mergeReceipt(autoChecks[entry.autoKey], { order, passed: !ev.failed });
-          next.scopes[dKey] = { ...prevScope, dir: prevScope.dir || entry.runDir, autoChecks };
+        const autoKeys =
+          Array.isArray(entry.autoKeys) && entry.autoKeys.length > 0
+            ? entry.autoKeys
+            : entry.autoKey
+              ? [entry.autoKey]
+              : [];
+        if (autoKeys.length > 0) {
           progress = addEditBoundary(progress, order);
+          // Multi-segment chains only credit individual segments on trusted terminal success;
+          // failure short-circuit cannot prove which segment passed and must not pollute untouched scopes.
+          if (!entry.isChain || !ev.failed) {
+            const prevScope = next.scopes[dKey] || {};
+            const autoChecks = { ...(prevScope.autoChecks || {}) };
+            for (const ak of autoKeys) {
+              if (!ak) continue;
+              autoChecks[ak] = mergeReceipt(autoChecks[ak], { order, passed: !ev.failed });
+            }
+            next.scopes[dKey] = { ...prevScope, dir: prevScope.dir || entry.runDir, autoChecks };
+          }
         }
         if (customSpec && Array.isArray(entry.segments) && entry.segments.length > 0) {
           for (const segKey of entry.segments) {
             if (!segKey) continue;
+            if (customKeySet?.has(segKey)) progress = addEditBoundary(progress, order);
+            if (entry.isChain && ev.failed) continue;
             const rKey = `${dKey}\0${segKey}`;
             next.customReceipts[rKey] = mergeReceipt(next.customReceipts[rKey], {
-                runDir: entry.runDir,
-                root: entry.root || "",
-                segKey,
-                order,
-                passed: !ev.failed
+              runDir: entry.runDir,
+              root: entry.root || "",
+              segKey,
+              order,
+              passed: !ev.failed
             });
-            if (customKeySet?.has(segKey)) progress = addEditBoundary(progress, order);
           }
         }
       }
@@ -988,11 +1286,40 @@ export function evaluateDeliveryGateStatus(gate, customCommand = "") {
   const failedChecks = [];
   const untestedScopes = [];
   const unattributedWrites = gate?.unattributedWrites || [];
+  const customCheck = inspectCustomCheckCommand(customCommand);
+  const invalidCustomCommand =
+    !customCheck.ok && !customCheck.empty
+      ? {
+          raw: customCheck.normalized || String(customCommand || "").trim(),
+          errorCode: customCheck.errorCode,
+          error: customCheck.error
+        }
+      : null;
+
   if (!gate || !gate.wroteSource) {
-    return { pendingChecks, failedChecks, untestedScopes, unattributedWrites, allPassed: !unattributedWrites.length };
+    return {
+      pendingChecks,
+      failedChecks,
+      untestedScopes,
+      unattributedWrites,
+      invalidCustomCommand,
+      allPassed: !unattributedWrites.length && !invalidCustomCommand
+    };
   }
 
-  const customSpec = parseCustomCheckSpec(customCommand);
+  // Never silently fall back to auto-detect when a non-empty custom command is invalid.
+  if (invalidCustomCommand) {
+    return {
+      pendingChecks,
+      failedChecks,
+      untestedScopes,
+      unattributedWrites,
+      invalidCustomCommand,
+      allPassed: false
+    };
+  }
+
+  const customSpec = customCheck.ok && !customCheck.empty ? customCheck.spec : null;
   const receipts = Object.values(gate.customReceipts || {});
 
   for (const [sKey, scope] of Object.entries(gate.scopes || {})) {
@@ -1036,11 +1363,6 @@ export function evaluateDeliveryGateStatus(gate, customCommand = "") {
 
     const requestedForDir =
       gate.requested && pathKey(gate.requested.scope) === scopeDirKey ? gate.requested.command : "";
-    const expectedCmd = requestedForDir || scope.declared || "";
-    if (!expectedCmd) {
-      untestedScopes.push({ dir, family: scope.family || "" });
-      continue;
-    }
 
     if (requestedForDir && requestedForDir.includes("&&")) {
       const reqSpec = parseCustomCheckSpec(requestedForDir);
@@ -1079,6 +1401,54 @@ export function evaluateDeliveryGateStatus(gate, customCommand = "") {
       }
     }
 
+    if (requestedForDir) {
+      const expectedKey = autoCheckCanonicalKey(requestedForDir);
+      const receipt = expectedKey ? scope.autoChecks?.[expectedKey] : null;
+      const status = receiptStatus(receipt, edits);
+      if (status === "failed") {
+        failedChecks.push({ dir, command: requestedForDir, failed: true, isCustom: false });
+      } else if (status === "pending") {
+        pendingChecks.push({ dir, command: requestedForDir, failed: false, isCustom: false });
+      }
+      continue;
+    }
+
+    const obligations =
+      scope.obligations && typeof scope.obligations === "object"
+        ? Object.values(scope.obligations)
+        : [];
+    if (obligations.length > 0) {
+      let hasDeclaredInDir = false;
+      const dirUntested = [];
+      for (const ob of obligations) {
+        const obEdits = deliveryEditOrders(ob);
+        if (!obEdits.length) continue;
+        const expectedCmd = ob.declared || "";
+        if (!expectedCmd) {
+          dirUntested.push({ dir, family: ob.family || "" });
+          continue;
+        }
+        hasDeclaredInDir = true;
+        const expectedKey = autoCheckCanonicalKey(expectedCmd);
+        const receipt = expectedKey ? scope.autoChecks?.[expectedKey] : null;
+        const status = receiptStatus(receipt, obEdits);
+        if (status === "failed") {
+          failedChecks.push({ dir, command: expectedCmd, family: ob.family || "", failed: true, isCustom: false });
+        } else if (status === "pending") {
+          pendingChecks.push({ dir, command: expectedCmd, family: ob.family || "", failed: false, isCustom: false });
+        }
+      }
+      if (!hasDeclaredInDir && dirUntested.length > 0) {
+        untestedScopes.push(...dirUntested);
+      }
+      continue;
+    }
+
+    const expectedCmd = scope.declared || "";
+    if (!expectedCmd) {
+      untestedScopes.push({ dir, family: scope.family || "" });
+      continue;
+    }
     const expectedKey = autoCheckCanonicalKey(expectedCmd);
     const receipt = expectedKey ? scope.autoChecks?.[expectedKey] : null;
     const status = receiptStatus(receipt, edits);
@@ -1094,6 +1464,7 @@ export function evaluateDeliveryGateStatus(gate, customCommand = "") {
     failedChecks,
     untestedScopes,
     unattributedWrites,
+    invalidCustomCommand,
     allPassed: pendingChecks.length === 0 && failedChecks.length === 0 && unattributedWrites.length === 0
   };
 }
@@ -1655,7 +2026,11 @@ function partialEvidence(data, partial, cwd, order) {
     ? matchAppliedFileEntries(data.ignoredFiles, unmatched, cwd, data.filesTruncated).unmatched
     : unmatched;
   const confirmed = [...matched].map(index => entries[index]);
-  const edited = new Map(confirmed.filter(item => item.pkg).map(item => [pathKey(item.pkg.scope), item.pkg]));
+  const edited = new Map(
+    confirmed
+      .filter(item => item.pkg)
+      .map(item => [`${pathKey(item.pkg.scope)}\0${deliveryObligationKey(item.pkg)}`, item.pkg])
+  );
   const scopes = new Set([...entries.map(item => item.scope), ...(data.edited || []).map(item => item.scope)]);
   const unresolved = partial.writtenCount !== 0 && (data.wroteSource || entries.length > 0) && (
     (partial.writtenCount == null ? paths.length === 0 : partial.writtenCount > paths.length) ||

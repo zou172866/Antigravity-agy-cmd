@@ -691,6 +691,47 @@ class TestStarFollowupCliAndState(unittest.TestCase):
                     else:
                         os.environ[k] = v
 
+    def test_p1_batch_a_delivery_test_cmd_strict_validation_and_invalid_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            st_dir = Path(tmp) / "state"
+            valid_8 = " && ".join(f"npm run check{i}" for i in range(1, 9))
+            valid_8_cd = " && ".join(f"cd p{i} && pytest" for i in range(1, 9))
+            invalid_9 = " && ".join(f"npm run check{i}" for i in range(1, 10))
+
+            # 8 segments (plain and with cd prefixes) succeed
+            ok8 = run_cli("--delivery-test-gate", "on", "--delivery-test-cmd", valid_8, "--state-dir", str(st_dir), "--json")
+            self.assertEqual(ok8.returncode, 0, ok8.stderr)
+            self.assertEqual(json.loads(ok8.stdout)["settings"]["deliveryTestCommand"], valid_8)
+
+            ok8_cd = run_cli("--delivery-test-cmd", valid_8_cd, "--state-dir", str(st_dir), "--json")
+            self.assertEqual(ok8_cd.returncode, 0, ok8_cd.stderr)
+            self.assertEqual(json.loads(ok8_cd.stdout)["settings"]["deliveryTestCommand"], valid_8_cd)
+
+            # 9 segments and unsupported shell syntax are rejected and preserve prior saved value
+            for bad in (
+                invalid_9,
+                "npm test | cat",
+                "npm test || true",
+                "npm test; echo ok",
+                "npm test & echo bg",
+                "npm test && $(echo ok)",
+                "npm test &&",
+                "cd backend",
+                "cd - && npm test",
+                'npm test "unclosed',
+            ):
+                res = run_cli("--delivery-test-cmd", bad, "--state-dir", str(st_dir))
+                self.assertNotEqual(res.returncode, 0, f"Expected failure for: {bad}")
+                saved = json.loads((st_dir / "settings.json").read_text(encoding="utf-8"))
+                self.assertEqual(saved["deliveryTestCommand"], valid_8_cd, f"Previous value changed on: {bad}")
+
+            # Pre-existing invalid command on disk displays 需修正 in summary
+            raw = json.loads((st_dir / "settings.json").read_text(encoding="utf-8"))
+            raw["deliveryTestCommand"] = invalid_9
+            (st_dir / "settings.json").write_text(json.dumps(raw, indent=2) + "\n", encoding="utf-8")
+            summary = router.format_settings_summary(router.load_settings(st_dir))
+            self.assertIn("自定义命令无效，需修正", summary)
+
 
 if __name__ == "__main__":
     unittest.main()

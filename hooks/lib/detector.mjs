@@ -3,9 +3,12 @@ import { stripVTControlCharacters } from "node:util";
 import {
   detectHostSurface,
   extractActiveSlashCommands,
+  isBareResumeNormalSessionRequest,
+  isResumeNormalSessionRequest,
   isSubagentPayload,
   nonEmptyString,
   parseMaybeJson,
+  resolveHostSlashCapability,
   sanitizeSnippet,
   shortFileLabel,
   unwrapUserRequestText
@@ -18,6 +21,7 @@ import {
   advancePlan,
   allowsTestWeakening,
   applyEditReceipt,
+  autoCheckCanonicalKey,
   compareDeliveryOrder,
   deliveryEditOrders,
   deliveryEventOrder,
@@ -138,6 +142,72 @@ const TEAMWORK_MIGRATION_RE =
 
 const LEADING_SWARM_SLASH_RE = /^\s*\/swarm(?=$|\s)/i;
 const LEADING_AUTONOMY_SLASH_RE = /^\s*\/(swarm|teamwork|boost|run-workflow)(?=$|\s)/i;
+
+function isHostSwarmEndedPayload(payload) {
+  if (!payload || typeof payload !== "object") return false;
+  return (
+    payload.swarmEnded === true ||
+    payload.swarm_ended === true ||
+    payload.swarmActive === false ||
+    payload.swarm_active === false ||
+    payload.metadata?.swarmEnded === true ||
+    payload.metadata?.swarm_ended === true ||
+    payload.metadata?.swarmActive === false ||
+    payload.metadata?.swarm_active === false
+  );
+}
+
+function parseStepKeyPosition(key) {
+  if (typeof key !== "string" || !key) return null;
+  const stepMatch = /^step:(\d+)$/.exec(key);
+  if (stepMatch) return { kind: "step", value: Number(stepMatch[1]) };
+  const byteMatch = /^byte:(\d+)$/.exec(key);
+  if (byteMatch) return { kind: "byte", value: Number(byteMatch[1]) };
+  return null;
+}
+
+function isSwarmActivitySuperseded(txKey, txStep, clearedKey, clearedStep) {
+  if (txKey && clearedKey && txKey === clearedKey) return true;
+  if (Number.isSafeInteger(txStep) && Number.isSafeInteger(clearedStep) && txStep <= clearedStep) {
+    return true;
+  }
+  const txPos = parseStepKeyPosition(txKey);
+  const clPos = parseStepKeyPosition(clearedKey);
+  if (txPos && clPos && txPos.kind === clPos.kind && txPos.value <= clPos.value) {
+    return true;
+  }
+  return false;
+}
+
+function hasFreshTranscriptSwarmActivity(transcriptTail, state) {
+  if (!transcriptTail?.hasSwarmActivity) return false;
+  const txKey = nonEmptyString(transcriptTail.latestSwarmActivityKey);
+  const txStep = Number.isSafeInteger(transcriptTail.latestSwarmActivityStep)
+    ? transcriptTail.latestSwarmActivityStep
+    : null;
+  if (!txKey && txStep === null) {
+    return !(state?.swarmClearedAfterKey || Number.isSafeInteger(state?.swarmClearedAtStep));
+  }
+  return !isSwarmActivitySuperseded(
+    txKey,
+    txStep,
+    nonEmptyString(state?.swarmClearedAfterKey),
+    Number.isSafeInteger(state?.swarmClearedAtStep) ? state.swarmClearedAtStep : null
+  );
+}
+
+function isTranscriptUserTurnAfterSwarmEnd(transcriptTail) {
+  if (transcriptTail?.swarmLifecycle !== "ended") return false;
+  const userPos = parseStepKeyPosition(nonEmptyString(transcriptTail.latestUserInputKey));
+  const endPos = parseStepKeyPosition(nonEmptyString(transcriptTail.latestSwarmEndKey));
+  if (userPos && endPos && userPos.kind === endPos.kind) {
+    return userPos.value > endPos.value;
+  }
+  if (Number.isSafeInteger(transcriptTail.latestSwarmEndStep) && userPos?.kind === "step") {
+    return userPos.value > transcriptTail.latestSwarmEndStep;
+  }
+  return false;
+}
 
 function requestsMigration(text) {
   const migration = TEAMWORK_MIGRATION_RE.exec(text);
@@ -1372,15 +1442,16 @@ export function evaluatePreInvocation(payload, events = [], prevStateInput = nul
   // Compute current event metrics BEFORE updating debugTurnStreak so soft-continuation check sees unresolved failures
   const metrics = analyzeEventMetrics(effectiveEvents);
 
-  // Reset boost alert flag once a post-alert command/verify passes cleanly (invariant to log compaction)
+  // Reset boost alert & detection flags once a post-alert command/verify passes cleanly (invariant to log compaction)
   if (
     metrics.latestPassTs > (nextState.lastBoostPassTs || 0) &&
-    metrics.latestPassTs >= (nextState.lastBoostAlertEventTs || 0) &&
+    metrics.latestPassTs >= Math.max(nextState.lastBoostAlertEventTs || 0, nextState.lastBoostDetectedEventTs || 0) &&
     metrics.consecutiveCmdFailures === 0 &&
     metrics.editFailOscillations === 0
   ) {
-    if (nextState.boostAlerted || nextState.lastBoostPassTs !== metrics.latestPassTs) {
+    if (nextState.boostAlerted || nextState.boostDetected || nextState.lastBoostPassTs !== metrics.latestPassTs) {
       nextState.boostAlerted = false;
+      nextState.boostDetected = false;
       nextState.lastBoostPassTs = metrics.latestPassTs;
       stateChanged = true;
     }
@@ -1473,7 +1544,14 @@ export function evaluatePreInvocation(payload, events = [], prevStateInput = nul
       nextState.freePlan = null;
       nextState.deliveryGate = null;
       nextState.swarmActive = false;
+      nextState.swarmLastActivityKey = "";
+      nextState.swarmLastActivityStep = null;
+      nextState.swarmClearedAfterKey = "";
+      nextState.swarmClearedAtStep = null;
       nextState.debugTurnStreak = 0;
+      nextState.boostDetected = false;
+      nextState.lastBoostDetectedTurn = 0;
+      nextState.lastBoostDetectedEventTs = 0;
       nextState.boostAlerted = false;
       nextState.lastBoostPassTs = 0;
       nextState.lastPaidBoostTurn = null;
@@ -1522,8 +1600,9 @@ export function evaluatePreInvocation(payload, events = [], prevStateInput = nul
     } else {
       nextState.debugTurnStreak = 0;
       // Clean pivot to a non-debug task with zero active failures re-arms /boost for future episodes
-      if (!hadPriorUnresolvedFailure && nextState.boostAlerted) {
+      if (!hadPriorUnresolvedFailure && (nextState.boostAlerted || nextState.boostDetected)) {
         nextState.boostAlerted = false;
+        nextState.boostDetected = false;
       }
     }
   }
@@ -1618,13 +1697,69 @@ export function evaluatePreInvocation(payload, events = [], prevStateInput = nul
   }
 
   // Active Swarm Coordinator sessions manage their own shared board, @verifier and @monitor.
-  // Never interrupt them with Boost/fallback/goal/delivery-gate injections.
-  if (LEADING_SWARM_SLASH_RE.test(turnInput) || Boolean(transcriptTail?.hasSwarmActivity)) {
-    if (!nextState.swarmActive) {
+  // Never interrupt them with Boost/fallback/goal/delivery-gate injections, while still supporting
+  // clean lifecycle exit on verifiable teardown events or explicit "恢复普通会话" requests.
+  const wantsLeadingSwarm = LEADING_SWARM_SLASH_RE.test(turnInput);
+  const hostSwarmEnded = isHostSwarmEndedPayload(payload);
+  const explicitResumeNormal =
+    isNewUserTurn && !isBgTaskWakeup && !wantsLeadingSwarm && isResumeNormalSessionRequest(rawLastUserInput);
+  const txSwarmEnded = transcriptTail?.swarmLifecycle === "ended";
+  const freshTxSwarm = hasFreshTranscriptSwarmActivity(transcriptTail, nextState);
+  const txSwarmKey = nonEmptyString(transcriptTail?.latestSwarmActivityKey);
+  const txSwarmStep = Number.isSafeInteger(transcriptTail?.latestSwarmActivityStep)
+    ? transcriptTail.latestSwarmActivityStep
+    : null;
+
+  if (wantsLeadingSwarm || (freshTxSwarm && !hostSwarmEnded && !explicitResumeNormal)) {
+    const activityKey = txSwarmKey || nextState.swarmLastActivityKey || "";
+    const activityStep = txSwarmStep ?? initialNumSteps ?? nextState.swarmLastActivityStep ?? null;
+    if (
+      !nextState.swarmActive ||
+      nextState.swarmLastActivityKey !== activityKey ||
+      nextState.swarmLastActivityStep !== activityStep
+    ) {
       nextState.swarmActive = true;
+      nextState.swarmLastActivityKey = activityKey;
+      nextState.swarmLastActivityStep = activityStep;
       stateChanged = true;
     }
+  } else if (
+    explicitResumeNormal ||
+    hostSwarmEnded ||
+    (nextState.swarmActive && isNewUserTurn && !isBgTaskWakeup && txSwarmEnded)
+  ) {
+    const clearKey = txSwarmKey || nextState.swarmLastActivityKey || "";
+    const clearStep = txSwarmStep ?? nextState.swarmLastActivityStep ?? initialNumSteps ?? null;
+    const wasSwarmActive = Boolean(nextState.swarmActive);
+    if (
+      nextState.swarmActive ||
+      nextState.swarmClearedAfterKey !== clearKey ||
+      nextState.swarmClearedAtStep !== clearStep
+    ) {
+      nextState.swarmActive = false;
+      nextState.swarmClearedAfterKey = clearKey;
+      nextState.swarmClearedAtStep = clearStep;
+      if (wasSwarmActive) {
+        if ((nextState.debugTurnStreak || 0) > 1 && (prevState.debugTurnStreak || 0) === 0) {
+          nextState.debugTurnStreak = 1;
+        }
+        nextState.boostAlerted = false;
+        nextState.boostDetected = false;
+      }
+      stateChanged = true;
+    }
+    if (explicitResumeNormal && isBareResumeNormalSessionRequest(rawLastUserInput)) {
+      return {
+        nextState,
+        injectStep: null,
+        shouldResetEvents,
+        reasonCode: "swarm_resumed_normal",
+        stateChanged,
+        metrics
+      };
+    }
   }
+
   if (nextState.swarmActive) {
     return {
       nextState,
@@ -1754,25 +1889,70 @@ export function evaluatePreInvocation(payload, events = [], prevStateInput = nul
     !isCleanNonDebugTurnEntry && metrics.editFailOscillations >= oscThreshold && hasFreshFailureSinceAlert;
   const failStreakHit =
     !isCleanNonDebugTurnEntry && metrics.consecutiveCmdFailures >= 3 && hasFreshFailureSinceAlert;
-  const multiTurnDebugHit = isNewUserTurn && (nextState.debugTurnStreak || 0) >= 2;
-  const hardTaskHit = isNewUserTurn && DEBUG_ACTION_RE.test(intentProse) && HARD_DEBUG_TASK_RE.test(intentProse);
+  const pendingTurnDebugDetect =
+    !nextState.boostAlerted &&
+    nextState.boostDetected &&
+    nextState.lastBoostDetectedTurn === nextState.userTurnCount &&
+    (nextState.debugTurnStreak || 0) >= 2;
+  const multiTurnDebugHit =
+    (isNewUserTurn && (nextState.debugTurnStreak || 0) >= 2) || pendingTurnDebugDetect;
+  const matchesHardTask = DEBUG_ACTION_RE.test(intentProse) && HARD_DEBUG_TASK_RE.test(intentProse);
+  const pendingTurnHardDetect =
+    !nextState.boostAlerted &&
+    nextState.boostDetected &&
+    nextState.lastBoostDetectedTurn === nextState.userTurnCount &&
+    matchesHardTask;
+  const hardTaskHit = (isNewUserTurn && matchesHardTask) || pendingTurnHardDetect;
   const stuck = oscHit || failStreakHit || multiTurnDebugHit;
-  const shouldEscalate = paidBoostActive
-    ? (hardTaskHit || stuck) && !uiOnly && !isBgTaskWakeup && !activePlanBlock &&
-      !transcriptTail?.awaitingUserApprovalOrQuestion && !DEBUG_DISCUSSION_RE.test(intentProse) &&
-      !(isNewUserTurn && (nextState.turnUnattendedGoal || requestsMigration(intentProse))) &&
-      nextState.lastPaidBoostTurn !== nextState.userTurnCount
+
+  // Shared dispatch-eligibility gate for BOTH paid Boost and free stuck fallback
+  const dispatchEligible =
+    activeSlash.size === 0 &&
+    !DECLINES_DELEGATION_RE.test(intentProse) &&
+    !isBgTaskWakeup &&
+    !activePlanBlock &&
+    !transcriptTail?.awaitingUserApprovalOrQuestion &&
+    !DEBUG_DISCUSSION_RE.test(intentProse) &&
+    !(isNewUserTurn && (nextState.turnUnattendedGoal || requestsMigration(intentProse)));
+
+  const branchTriggered = paidBoostActive
+    ? (hardTaskHit || stuck) && nextState.lastPaidBoostTurn !== nextState.userTurnCount
     : stuck && effSettings.freeFallbackEnabled;
 
-  if (shouldEscalate && activeSlash.size === 0 && !DECLINES_DELEGATION_RE.test(intentProse)) {
+  if (dispatchEligible && branchTriggered) {
     const cooldownElapsed =
       !nextState.boostAlerted ||
       (!paidBoostActive && nextState.userTurnCount - (nextState.lastBoostAlertTurn || 0) >= 3);
 
     if (cooldownElapsed) {
+      const detectedEventTs = metrics.latestFailureTs || metrics.latestEventTs || nowMs;
+      if (
+        !nextState.boostDetected ||
+        nextState.lastBoostDetectedTurn !== nextState.userTurnCount ||
+        nextState.lastBoostDetectedEventTs !== detectedEventTs
+      ) {
+        nextState.boostDetected = true;
+        nextState.lastBoostDetectedTurn = nextState.userTurnCount;
+        nextState.lastBoostDetectedEventTs = detectedEventTs;
+        stateChanged = true;
+      }
+
+      // Separate detection state from dispatched-alert state so uiOnly -> visible
+      // never swallows the first visible escalation prompt.
+      if (uiOnly) {
+        return {
+          nextState,
+          injectStep: null,
+          shouldResetEvents,
+          reasonCode: paidBoostActive ? "auto_boost_ui_only" : "free_stuck_fallback_ui_only",
+          stateChanged,
+          metrics
+        };
+      }
+
       nextState.boostAlerted = true;
       nextState.lastBoostAlertTurn = nextState.userTurnCount;
-      nextState.lastBoostAlertEventTs = metrics.latestFailureTs || metrics.latestEventTs || nowMs;
+      nextState.lastBoostAlertEventTs = detectedEventTs;
       stateChanged = true;
 
       const reasonsZh = [];
@@ -1886,7 +2066,7 @@ export function evaluatePreInvocation(payload, events = [], prevStateInput = nul
     };
   }
 
-  // 6. Priority 4: Repo-wide multi-day migration/rewrite (turn entry only; tier-aware)
+  // 6. Priority 4: Repo-wide multi-day migration/rewrite (turn entry only; tier-, surface-, and capability-aware)
   if (
     isNewUserTurn &&
     activeSlash.size === 0 &&
@@ -1895,18 +2075,61 @@ export function evaluatePreInvocation(payload, events = [], prevStateInput = nul
   ) {
     nextState.lastTeamworkAlertTurn = nextState.userTurnCount;
     stateChanged = true;
-    if (effSettings.planTier === "paid") {
+    const surface = detectHostSurface(payload);
+    const teamworkCap = resolveHostSlashCapability(payload, "teamwork");
+    if (effSettings.planTier === "paid" && surface === "app" && teamworkCap !== "unavailable") {
       const summary = sanitizeSnippet(intentProse, 36) || "仓库级迁移与重构";
+      const capabilityGuard =
+        teamworkCap === "unknown"
+          ? ' First verify that "/teamwork" is listed in this host\'s available slash commands; ONLY if exposed by the current host, put "[agy-cmd → 建议 /teamwork]" and a copyable "/teamwork <concise target>" on line 1. If the host does not expose "/teamwork", do NOT emit a heavy command badge—silently fall back to creating a phased Implementation Plan (RequestFeedback: true) broken into independently verifiable milestones.'
+          : ' Put "[agy-cmd → 建议 /teamwork]" and a copyable "/teamwork <concise target>" on line 1.';
       return {
         nextState,
         injectStep: buildInjectStep({
           uiOnly,
-          userMarkdown: `> **[agy-cmd → 建议 /teamwork]** 检测到仓库级长周期迁移/重写诉求。可复制：\`/teamwork ${summary}\``,
+          userMarkdown:
+            teamworkCap === "available"
+              ? `> **[agy-cmd → 建议 /teamwork]** 检测到仓库级长周期迁移/重写诉求。可复制：\`/teamwork ${summary}\``
+              : `> 检测到仓库级长周期迁移/重写诉求（若当前 Antigravity App 宿主开放 \`/teamwork\`，可建议：\`/teamwork ${summary}\`；未开放则改用分里程碑实施计划，不亮重型徽标）。`,
           systemMessage:
-            '[agy-cmd] User requested a repo-wide multi-phase migration/rewrite. Put "[agy-cmd → 建议 /teamwork]" and a copyable "/teamwork <concise target>" on line 1. Outline independently verifiable milestones. Start with the scoping interview to establish the target, constraints and acceptance checks before workers start.'
+            `[agy-cmd] User requested a repo-wide multi-phase migration/rewrite.${capabilityGuard} Outline independently verifiable milestones. Start with the scoping interview to establish the target, constraints and acceptance checks before workers start.`
         }),
         shouldResetEvents,
         reasonCode: "suggest_teamwork",
+        stateChanged,
+        metrics
+      };
+    }
+
+    if (effSettings.planTier === "paid" && surface !== "app") {
+      const surfaceLabel = surface === "ide" ? "IDE" : surface === "cli" ? "CLI" : "未确认表面";
+      return {
+        nextState,
+        injectStep: buildInjectStep({
+          uiOnly,
+          userMarkdown: `> **[agy-cmd → 分阶段迁移规划]** 检测到仓库级迁移/重写诉求（当前为 ${surfaceLabel}，非 Antigravity App 表面，按默认分里程碑方案推进，不推荐 \`/teamwork\`）。`,
+          systemMessage:
+            '[agy-cmd] Repo-wide migration detected on a non-App or unconfirmed host surface (do NOT suggest /teamwork or emit a heavy command badge). Start line 1 with "[agy-cmd → 分阶段迁移规划]" and create a phased Implementation Plan (RequestFeedback: true) broken into independently verifiable milestones.'
+        }),
+        shouldResetEvents,
+        reasonCode: "migration_surface_fallback",
+        stateChanged,
+        metrics
+      };
+    }
+
+    if (effSettings.planTier === "paid" && teamworkCap === "unavailable") {
+      return {
+        nextState,
+        injectStep: buildInjectStep({
+          uiOnly,
+          userMarkdown:
+            "> **[agy-cmd → 分阶段迁移规划]** 检测到仓库级迁移/重写诉求（当前宿主未开放 `/teamwork`，按默认分里程碑方案推进，不亮重型徽标）。",
+          systemMessage:
+            '[agy-cmd] Repo-wide migration detected while /teamwork is unavailable in this host (do NOT suggest /teamwork or emit a heavy command badge). Start line 1 with "[agy-cmd → 分阶段迁移规划]" and create a phased Implementation Plan (RequestFeedback: true) broken into independently verifiable milestones.'
+        }),
+        shouldResetEvents,
+        reasonCode: "migration_capability_fallback",
         stateChanged,
         metrics
       };
@@ -1928,7 +2151,7 @@ export function evaluatePreInvocation(payload, events = [], prevStateInput = nul
     };
   }
 
-  // 7. Priority 5: Delivery Test Gate conservative missing-test disclosure (once per turn)
+  // 7. Priority 5: Delivery Test Gate invalid custom command or conservative missing-test disclosure (once per turn)
   const activeGate = effSettings.deliveryTestGateEnabled ? nextState.deliveryGate : null;
   if (
     activeGate &&
@@ -1941,6 +2164,24 @@ export function evaluatePreInvocation(payload, events = [], prevStateInput = nul
     !transcriptTail?.awaitingUserApprovalOrQuestion
   ) {
     const gateStatus = evaluateDeliveryGateStatus(activeGate, effSettings.deliveryTestCommand);
+    if (gateStatus.invalidCustomCommand) {
+      nextState.deliveryGate = { ...activeGate, noCmdNoticed: true };
+      stateChanged = true;
+      const errMsg = gateStatus.invalidCustomCommand.error || "语法或分段数不符合要求";
+      return {
+        nextState,
+        injectStep: buildInjectStep({
+          uiOnly,
+          systemMessage:
+            `[agy-cmd 交付测试门禁 · 自定义命令无效（需修正）] 检测到已保存的自定义验证命令无效（${errMsg}），本次不会静默截断，也不会静默回退到自动探测。` +
+            `请在最终交付回复末尾明确提醒用户在面板或 CLI 修正 \`deliveryTestCommand\` 后重新验证，严禁宣称已通过交付测试门禁。`
+        }),
+        shouldResetEvents,
+        reasonCode: "delivery_gate_invalid_custom_command",
+        stateChanged,
+        metrics
+      };
+    }
     if (
       gateStatus.untestedScopes.length > 0 &&
       gateStatus.pendingChecks.length === 0 &&
@@ -2145,14 +2386,48 @@ export function evaluateStop(payload, events = [], prevStateInput = null, option
       metrics: null
     };
   }
-  const hasActiveSwarm =
-    Boolean(nextState.swarmActive) ||
-    Boolean(transcriptTail?.hasSwarmActivity) ||
-    LEADING_SWARM_SLASH_RE.test(rawLastUserInput);
-  if (hasActiveSwarm && !nextState.swarmActive) {
-    nextState.swarmActive = true;
-    stateChanged = true;
+  const wantsLeadingSwarm = LEADING_SWARM_SLASH_RE.test(rawLastUserInput);
+  const hostSwarmEnded = isHostSwarmEndedPayload(payload);
+  const explicitResumeNormal = !wantsLeadingSwarm && isResumeNormalSessionRequest(rawLastUserInput);
+  const postTeardownUserTurn = isTranscriptUserTurnAfterSwarmEnd(transcriptTail);
+  const freshTxSwarm = hasFreshTranscriptSwarmActivity(transcriptTail, nextState);
+  const txSwarmKey = nonEmptyString(transcriptTail?.latestSwarmActivityKey);
+  const txSwarmStep = Number.isSafeInteger(transcriptTail?.latestSwarmActivityStep)
+    ? transcriptTail.latestSwarmActivityStep
+    : null;
+
+  let hasActiveSwarm = false;
+  if (wantsLeadingSwarm || (freshTxSwarm && !hostSwarmEnded && !explicitResumeNormal)) {
+    hasActiveSwarm = true;
+    const activityKey = txSwarmKey || nextState.swarmLastActivityKey || "";
+    const activityStep = txSwarmStep ?? nextState.swarmLastActivityStep ?? null;
+    if (
+      !nextState.swarmActive ||
+      nextState.swarmLastActivityKey !== activityKey ||
+      nextState.swarmLastActivityStep !== activityStep
+    ) {
+      nextState.swarmActive = true;
+      nextState.swarmLastActivityKey = activityKey;
+      nextState.swarmLastActivityStep = activityStep;
+      stateChanged = true;
+    }
+  } else if (hostSwarmEnded || explicitResumeNormal || (nextState.swarmActive && postTeardownUserTurn)) {
+    const clearKey = txSwarmKey || nextState.swarmLastActivityKey || "";
+    const clearStep = txSwarmStep ?? nextState.swarmLastActivityStep ?? null;
+    if (
+      nextState.swarmActive ||
+      nextState.swarmClearedAfterKey !== clearKey ||
+      nextState.swarmClearedAtStep !== clearStep
+    ) {
+      nextState.swarmActive = false;
+      nextState.swarmClearedAfterKey = clearKey;
+      nextState.swarmClearedAtStep = clearStep;
+      stateChanged = true;
+    }
+  } else if (nextState.swarmActive) {
+    hasActiveSwarm = true;
   }
+
   if (hasActiveSwarm || LEADING_AUTONOMY_SLASH_RE.test(rawLastUserInput)) {
     return {
       decision: "allow",
@@ -2226,7 +2501,17 @@ export function evaluateStop(payload, events = [], prevStateInput = null, option
   const gateStatus =
     deliveryGate && !skipDeliveryGate
       ? evaluateDeliveryGateStatus(deliveryGate, effSettings.deliveryTestCommand)
-      : { pendingChecks: [], failedChecks: [], untestedScopes: [], allPassed: true };
+      : { pendingChecks: [], failedChecks: [], untestedScopes: [], invalidCustomCommand: null, allPassed: true };
+  if (gateStatus.invalidCustomCommand && deliveryGate?.wroteSource) {
+    return {
+      decision: "allow",
+      reason: "",
+      reasonCode: "delivery_gate_invalid_custom_command",
+      nextState,
+      stateChanged,
+      metrics
+    };
+  }
   const gateFailedCheck = gateStatus.failedChecks[0] || null;
   const gatePendingChecks = gateStatus.pendingChecks;
 
@@ -2257,10 +2542,49 @@ export function evaluateStop(payload, events = [], prevStateInput = null, option
       return checkedEntries.every(entry => {
         const runKey = pathKey(entry?.runDir || "");
         if (!runKey) return false;
+        const entryAutoKeys =
+          Array.isArray(entry.autoKeys) && entry.autoKeys.length > 0
+            ? entry.autoKeys
+            : entry.autoKey
+              ? [entry.autoKey]
+              : [];
         const scopes = Object.entries(deliveryGate.scopes || {}).filter(([key, sc]) =>
           (key === runKey || pathKey(sc.root || "") === runKey) && deliveryEditOrders(sc).length);
-        return scopes.length > 0 && scopes.every(([, sc]) =>
-          deliveryEditOrders(sc).some(edit => compareDeliveryOrder(edit, evOrder) === 1));
+        return scopes.length > 0 && scopes.every(([, sc]) => {
+          const obs = sc.obligations && typeof sc.obligations === "object" ? Object.values(sc.obligations) : [];
+          if (obs.length > 0 && entryAutoKeys.length > 0 && !effSettings.deliveryTestCommand) {
+            const matchingObs = obs.filter(ob => {
+              const obKey = ob?.declared ? autoCheckCanonicalKey(ob.declared) : "";
+              return obKey && entryAutoKeys.includes(obKey);
+            });
+            if (matchingObs.length > 0) {
+              return matchingObs.every(ob =>
+                deliveryEditOrders(ob).some(edit => compareDeliveryOrder(edit, evOrder) === 1)
+              );
+            }
+            const entryFamilies = new Set(
+              entryAutoKeys
+                .map(k => {
+                  if (k.startsWith("node:") || k.startsWith("static:tsc") || k.startsWith("static:npm")) return "node";
+                  if (k.startsWith("python:")) return "python";
+                  if (k.startsWith("go:") || k.startsWith("static:go ")) return "go";
+                  if (k.startsWith("rust:") || k.startsWith("static:cargo ")) return "rust";
+                  return "";
+                })
+                .filter(Boolean)
+            );
+            if (entryFamilies.size > 0) {
+              const familyObs = obs.filter(ob => ob?.family && entryFamilies.has(ob.family));
+              if (familyObs.length > 0) {
+                return familyObs.every(ob =>
+                  deliveryEditOrders(ob).some(edit => compareDeliveryOrder(edit, evOrder) === 1)
+                );
+              }
+              return false;
+            }
+          }
+          return deliveryEditOrders(sc).some(edit => compareDeliveryOrder(edit, evOrder) === 1);
+        });
       });
     })
   );

@@ -910,8 +910,9 @@
             <button id="btn-clear-delivery-cmd" class="cmd-btn-ghost" type="button" hidden>清空</button>
           </div>
           <div class="gate-sub-hint">
-            支持单条或 <code>&amp;&amp;</code> 组合命令；保存后优先生效，关闭门禁仍保留已填命令。
+            支持单条或最多 8 段 <code>&amp;&amp;</code> 组合命令；保存后优先生效，关闭门禁仍保留已填命令。
           </div>
+          <div id="delivery-cmd-error" class="gate-warn-note" hidden></div>
           <div id="delivery-off-warn" class="gate-warn-note" hidden>
             当前「自动重试」已关闭：未跑测试时最多提醒补跑 1 次，测挂后不会自动修复；如需修到全绿，请在上方改选「指定次数」或「一直重试」。
           </div>
@@ -999,6 +1000,10 @@
         </div>
         <div class="status-line">
           <span class="status-muted" id="lbl-gate-status">—</span>
+        </div>
+        <div class="status-line" id="row-swarm-resume" hidden>
+          <span class="status-muted">当前会话处于 Swarm 协调器豁免模式</span>
+          <button id="btn-resume-normal" class="link-btn" type="button">恢复普通会话</button>
         </div>
         <div class="status-line" style="margin-top:2px">
           <span class="status-muted">累计自动拦截续跑：<strong id="lbl-total-retries">0</strong> 次</span>
@@ -1134,10 +1139,13 @@
       const inpDeliveryCmd = $("inp-delivery-cmd");
       const btnSaveDeliveryCmd = $("btn-save-delivery-cmd");
       const btnClearDeliveryCmd = $("btn-clear-delivery-cmd");
+      const deliveryCmdError = $("delivery-cmd-error");
       const deliveryOffWarn = $("delivery-off-warn");
       const lblSummary = $("lbl-summary");
       const lblBoostStatus = $("lbl-boost-status");
       const lblGateStatus = $("lbl-gate-status");
+      const rowSwarmResume = $("row-swarm-resume");
+      const btnResumeNormal = $("btn-resume-normal");
       const lblTotalRetries = $("lbl-total-retries");
       const btnResetStats = $("btn-reset-stats");
       const toastEl = $("toast");
@@ -1782,7 +1790,15 @@
         }
         const curCmdVal = inpDeliveryCmd ? inpDeliveryCmd.value.trim() : savedCmd;
         setElementHidden(btnClearDeliveryCmd, !savedCmd && !curCmdVal);
+        const cmdErr = typeof data.deliveryCommandError === "string" ? data.deliveryCommandError : "";
+        if (deliveryCmdError) {
+          deliveryCmdError.textContent = cmdErr
+            ? `已保存的自定义命令无效，未回退自动探测，请修正：${cmdErr}`
+            : "";
+          setElementHidden(deliveryCmdError, !cmdErr);
+        }
         setElementHidden(deliveryOffWarn, !(gateOn && s.autoRetryMode === "off"));
+        setElementHidden(rowSwarmResume, !(data.activeSession && data.activeSession.swarmActive === true));
 
         lblSummary.textContent = data.summaryZh || "";
         lblBoostStatus.textContent = data.boostStatusZh || "";
@@ -1968,6 +1984,21 @@
       btnResetStats.addEventListener("click", () => {
         return savePatch({ resetStats: true }, "统计已清零");
       });
+
+      if (btnResumeNormal) {
+        btnResumeNormal.addEventListener("click", async () => {
+          const mutSeq = ++apiMutationSeq;
+          try {
+            const data = await callApi("/api/resume-normal-session", {});
+            if (mutSeq < latestAppliedMutationSeq) return;
+            latestAppliedMutationSeq = mutSeq;
+            render(data);
+            showToast("已恢复普通会话护栏");
+          } catch (err) {
+            showToast(`操作失败：${err.message}`);
+          }
+        });
+      }
 
       if (githubStarLink) {
         githubStarLink.addEventListener("click", handleHeaderStarClick);

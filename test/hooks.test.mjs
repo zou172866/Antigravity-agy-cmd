@@ -10,6 +10,7 @@ import {
   detectHostSurface,
   extractActiveSlashCommands,
   isSubagentPayload,
+  resolveHostSlashCapability,
   resolveStateDir,
   sanitizeConversationId,
   sanitizeSnippet,
@@ -38,6 +39,7 @@ import {
   compareDeliveryOrder,
   detectTestAssertionWeakening,
   evaluateDeliveryGateStatus,
+  inspectCustomCheckCommand,
   isTestFilePath,
   pendingPlanChecks,
   planPreferences,
@@ -4324,4 +4326,659 @@ test("v2.7.4 review verification: paired Stop invariance, /compact, rewind, high
       {}
     );
   }
+});
+
+test("P1-B1: simple && chains credit same-package and cross-package checks on terminal success, never on short-circuit failure or running", async (t) => {
+  // 1. Same-package `npm run lint && npm test` clears auto-detect delivery gate
+  const samePkg = await deliveryGateFixture(t, {
+    settings: { deliveryTestGateEnabled: true, autoRetryMode: "count", autoRetryMax: 5 }
+  });
+  await samePkg.edit(1, "src/index.ts");
+  assert.equal((await samePkg.stop()).decision, "continue");
+  await samePkg.command(2, "npm run lint && npm test", "Command exited with code 0.");
+  assert.deepEqual(await samePkg.stop(), { decision: "allow" });
+
+  // After a later edit, previous green chain is invalidated; failed short-circuit chain must NOT credit npm test
+  await samePkg.edit(3, "src/index.ts");
+  await samePkg.command(4, "npm run lint && npm test", "Command exited with code 1.");
+  // Even after an unrelated non-read-only command exits 0 (clearing consecutiveCmdFailures), npm test stays pending!
+  await samePkg.command(5, "node -e \"process.exit(0)\"", "Command exited with code 0.");
+  const afterFailChain = await samePkg.stop();
+  assert.equal(afterFailChain.decision, "continue");
+  assert.match(afterFailChain.reason, /交付测试门禁.*npm test/);
+
+  // Re-running after last edit and passing clears cleanly
+  await samePkg.command(6, "npm run lint && npm test", "Command exited with code 0.");
+  assert.deepEqual(await samePkg.stop(), { decision: "allow" });
+
+  // 2. Cross-package `cd pkg-a && npm test && cd ../pkg-b && npm test`
+  const cross = await deliveryGateFixture(t, {
+    settings: { deliveryTestGateEnabled: true, autoRetryMode: "count", autoRetryMax: 6 },
+    files: {
+      "pkg-a/package.json": JSON.stringify({ scripts: { test: "node --test" } }),
+      "pkg-b/package.json": JSON.stringify({ scripts: { test: "node --test" } })
+    }
+  });
+  await cross.edit(1, "pkg-a/a.ts");
+  await cross.edit(2, "pkg-b/b.ts");
+  // Background running chain does not credit either package
+  await cross.command(
+    3,
+    "cd pkg-a && npm test && cd ../pkg-b && npm test",
+    "Tool is running as a background task with task id: gate-conv/task-3",
+    cross.workspace
+  );
+  const whileRunning = await cross.stop();
+  assert.equal(whileRunning.decision, "continue");
+  assert.match(whileRunning.reason, /pkg-a/);
+  assert.match(whileRunning.reason, /pkg-b/);
+
+  // pkg-a passes alone; then cross-package chain fails in pkg-b -> pkg-a stays green, pkg-b stays pending
+  await cross.command(4, "npm test", "Command exited with code 0.", path.join(cross.workspace, "pkg-a"));
+  await cross.command(
+    5,
+    "cd pkg-a && npm test && cd ../pkg-b && npm test",
+    "Command exited with code 1.",
+    cross.workspace
+  );
+  await cross.command(6, "node -e \"process.exit(0)\"", "Command exited with code 0.", cross.workspace);
+  const partialCross = await cross.stop();
+  assert.equal(partialCross.decision, "continue");
+  assert.match(partialCross.reason, /pkg-b/);
+  assert.doesNotMatch(partialCross.reason, /pkg-a/);
+
+  // Cross-package chain passing clears both packages cleanly after editing both again
+  await cross.edit(7, "pkg-a/a.ts");
+  await cross.edit(8, "pkg-b/b.ts");
+  await cross.command(
+    9,
+    "cd pkg-a && npm test && cd ../pkg-b && npm test",
+    "Command exited with code 0.",
+    cross.workspace
+  );
+  assert.deepEqual(await cross.stop(), { decision: "allow" });
+
+  // 3. Free approved plan ledger also credits simple && chain on terminal success and refuses on failure
+  const planDir = makeTmpDir("agy-cmd-b1-plan-");
+  t.after(() => fs.rmSync(planDir, { recursive: true, force: true }));
+  const ws = path.join(planDir, "repo");
+  fs.mkdirSync(path.join(ws, "pkg-a"), { recursive: true });
+  fs.mkdirSync(path.join(ws, "pkg-b"), { recursive: true });
+  fs.writeFileSync(path.join(ws, "pkg-a/package.json"), JSON.stringify({ scripts: { test: "node --test" } }));
+  fs.writeFileSync(path.join(ws, "pkg-b/package.json"), JSON.stringify({ scripts: { test: "node --test" } }));
+  const basePlan = { key: "plan-b1", wroteSource: false, scopes: {} };
+  const editA = classifyToolEvents(
+    {
+      stepIdx: 1,
+      cwd: ws,
+      workspacePaths: [ws],
+      toolCall: { name: "edit_file", args: { Path: path.join(ws, "pkg-a/a.ts"), Target: "const x = 1;", Replacement: "const x = 2;" } },
+      toolResponse: "Made 1 replacement in pkg-a/a.ts"
+    },
+    1000,
+    { plan: basePlan }
+  );
+  const editB = classifyToolEvents(
+    {
+      stepIdx: 2,
+      cwd: ws,
+      workspacePaths: [ws],
+      toolCall: { name: "edit_file", args: { Path: path.join(ws, "pkg-b/b.ts"), Target: "const y = 1;", Replacement: "const y = 2;" } },
+      toolResponse: "Made 1 replacement in pkg-b/b.ts"
+    },
+    1010,
+    { plan: basePlan }
+  );
+  const failChain = classifyToolEvents(
+    {
+      stepIdx: 3,
+      cwd: ws,
+      workspacePaths: [ws],
+      toolCall: { name: "run_command", args: { CommandLine: "cd pkg-a && npm test && cd ../pkg-b && npm test" } },
+      toolResponse: "Command exited with code 1."
+    },
+    1020,
+    { plan: basePlan }
+  );
+  const planAfterFail = advancePlan(basePlan, [...editA, ...editB, ...failChain]);
+  assert.equal(pendingPlanChecks(planAfterFail).length, 2);
+
+  const passChain = classifyToolEvents(
+    {
+      stepIdx: 4,
+      cwd: ws,
+      workspacePaths: [ws],
+      toolCall: { name: "run_command", args: { CommandLine: "cd pkg-a && npm test && cd ../pkg-b && npm test" } },
+      toolResponse: "Command exited with code 0."
+    },
+    1030,
+    { plan: basePlan }
+  );
+  const planAfterPass = advancePlan(planAfterFail, passChain);
+  assert.deepEqual(pendingPlanChecks(planAfterPass), []);
+});
+
+test("P1-Polyglot: same-root Node + Python maintains independent obligations regardless of edit order, partial apply_edits, or check order", async (t) => {
+  const polyFiles = {
+    "package.json": JSON.stringify({ name: "poly-root", scripts: { test: "node --test" } }),
+    "pytest.ini": "[pytest]\n"
+  };
+
+  // 1. Edit TS then PY -> running only npm test leaves pytest pending; running pytest clears all
+  const orderAB = await deliveryGateFixture(t, {
+    settings: { deliveryTestGateEnabled: true, autoRetryMode: "count", autoRetryMax: 6 },
+    files: polyFiles
+  });
+  await orderAB.edit(1, "src/app.ts");
+  await orderAB.edit(2, "src/worker.py");
+  const bothPending1 = await orderAB.stop();
+  assert.equal(bothPending1.decision, "continue");
+  assert.match(bothPending1.reason, /npm test/);
+  assert.match(bothPending1.reason, /pytest/);
+
+  await orderAB.command(3, "npm test", "Command exited with code 0.");
+  const onlyPyLeft = await orderAB.stop();
+  assert.equal(onlyPyLeft.decision, "continue");
+  assert.match(onlyPyLeft.reason, /pytest/);
+  assert.doesNotMatch(onlyPyLeft.reason, /npm test/);
+
+  await orderAB.command(4, "pytest", "Command exited with code 0.");
+  assert.deepEqual(await orderAB.stop(), { decision: "allow" });
+
+  // 2. Reversed order: PY then TS -> running only pytest leaves npm test pending; running `npm test && pytest` clears both
+  const orderBA = await deliveryGateFixture(t, {
+    settings: { deliveryTestGateEnabled: true, autoRetryMode: "count", autoRetryMax: 6 },
+    files: polyFiles
+  });
+  await orderBA.edit(1, "src/worker.py");
+  await orderBA.edit(2, "src/app.ts");
+  await orderBA.command(3, "pytest", "Command exited with code 0.");
+  const onlyNodeLeft = await orderBA.stop();
+  assert.equal(onlyNodeLeft.decision, "continue");
+  assert.match(onlyNodeLeft.reason, /npm test/);
+  assert.doesNotMatch(onlyNodeLeft.reason, /pytest/);
+
+  // Re-edit both in a single apply_edits batch and clear both with one chained command
+  await orderBA.post(
+    4,
+    "apply_edits",
+    {
+      cwd: orderBA.workspace,
+      edits: [
+        { path: "src/app.ts", hunks: [{ target: "const a = 1;", replacement: "const a = 2;" }] },
+        { path: "src/worker.py", hunks: [{ target: "x = 1", replacement: "x = 2" }] }
+      ]
+    },
+    "Applied edits to 2 file(s):\n- src/app.ts\n- src/worker.py"
+  );
+  const batchPending = await orderBA.stop();
+  assert.match(batchPending.reason, /npm test/);
+  assert.match(batchPending.reason, /pytest/);
+  await orderBA.command(5, "npm test && pytest", "Command exited with code 0.");
+  assert.deepEqual(await orderBA.stop(), { decision: "allow" });
+
+  // 3. Editing Python file must NOT suppress an unresolved Node tsc failure as stale
+  const staleCheck = await deliveryGateFixture(t, {
+    settings: { deliveryTestGateEnabled: true, autoRetryMode: "count", autoRetryMax: 6 },
+    files: polyFiles
+  });
+  await staleCheck.edit(1, "src/app.ts");
+  await staleCheck.command(2, "npx tsc --noEmit", "Command exited with code 1.");
+  await staleCheck.edit(3, "src/worker.py");
+  const stillFailing = await staleCheck.stop();
+  assert.equal(stillFailing.decision, "continue");
+  assert.match(stillFailing.reason, /自动续跑/);
+});
+
+test("P1-CustomCheck: validates 8-segment cap without silent truncation, rejects 9 segments and unsupported syntax, and never silently falls back on invalid saved config", async (t) => {
+  // 1. 8 segments (including cd prefixes) pass parser and complete all 8 segments cleanly
+  const eightCmd = Array.from({ length: 8 }, (_, i) => `cd p${i + 1} && node --test`).join(" && ");
+  const eightRes = inspectCustomCheckCommand(eightCmd);
+  assert.equal(eightRes.ok, true);
+  assert.equal(eightRes.spec.segments.length, 8);
+
+  const eightSimple = Array.from({ length: 8 }, (_, i) => `npm run check${i + 1}`).join(" && ");
+  assert.equal(inspectCustomCheckCommand(eightSimple).ok, true);
+
+  // 2. 9 segments rejected explicitly (and updateSettings preserves existing saved command)
+  const nineSimple = Array.from({ length: 9 }, (_, i) => `npm run check${i + 1}`).join(" && ");
+  const nineRes = inspectCustomCheckCommand(nineSimple);
+  assert.equal(nineRes.ok, false);
+  assert.equal(nineRes.errorCode, "too_many_segments");
+
+  const stateDir = makeTmpDir("agy-cmd-custom-val-");
+  t.after(() => fs.rmSync(stateDir, { recursive: true, force: true }));
+  updateSettings(stateDir, { deliveryTestGateEnabled: true, deliveryTestCommand: eightSimple });
+  assert.equal(readSettings(stateDir).deliveryTestCommand, eightSimple);
+
+  for (const badCmd of [
+    nineSimple,
+    "npm test | cat",
+    "npm test || true",
+    "npm test; echo ok",
+    "npm test & echo bg",
+    "npm test && $(echo ok)",
+    "npm test && `echo ok`",
+    "npm test &&",
+    "&& npm test",
+    "npm test && && npm run lint",
+    "cd backend",
+    "cd - && npm test",
+    'npm test "unclosed'
+  ]) {
+    const check = inspectCustomCheckCommand(badCmd);
+    assert.equal(check.ok, false, `Expected invalid: ${badCmd}`);
+    assert.throws(
+      () => updateSettings(stateDir, { deliveryTestCommand: badCmd }),
+      (err) => err?.statusCode === 400,
+      `Expected 400 for: ${badCmd}`
+    );
+    assert.equal(readSettings(stateDir).deliveryTestCommand, eightSimple, `Previous value lost for: ${badCmd}`);
+  }
+
+  // 3. 8-segment custom command actually enforces all 8 segments before allowing Stop
+  const eightFix = await deliveryGateFixture(t, {
+    settings: { deliveryTestGateEnabled: true, deliveryTestCommand: eightSimple, autoRetryMax: 10 }
+  });
+  await eightFix.edit(1, "src/a.ts");
+  for (let i = 1; i <= 7; i++) {
+    await eightFix.command(i + 1, `npm run check${i}`, "Command exited with code 0.");
+  }
+  const missing8th = await eightFix.stop();
+  assert.equal(missing8th.decision, "continue");
+  assert.match(missing8th.reason, /npm run check8/);
+  await eightFix.command(9, "npm run check8", "Command exited with code 0.");
+  assert.deepEqual(await eightFix.stop(), { decision: "allow" });
+
+  // 4. Pre-existing invalid saved command on disk NEVER silently falls back to auto-detect
+  const legacyInvalid = await deliveryGateFixture(t, {
+    settings: { deliveryTestGateEnabled: true }
+  });
+  const invalidStateDir = legacyInvalid.env.AGY_CMD_STATE_DIR;
+  // Simulate pre-existing invalid settings.json edited directly or from older version
+  const settingsPath = path.join(invalidStateDir, "settings.json");
+  const rawSettings = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
+  rawSettings.deliveryTestCommand = "npm test | cat";
+  fs.writeFileSync(settingsPath, JSON.stringify(rawSettings, null, 2) + "\n", "utf8");
+
+  await legacyInvalid.edit(1, "src/app.ts");
+  await legacyInvalid.command(2, "npm test", "Command exited with code 0.");
+
+  const gateState = readState(invalidStateDir, "gate-conv").deliveryGate;
+  const evalStatus = evaluateDeliveryGateStatus(
+    advanceDeliveryGate(gateState, readEvents(invalidStateDir, "gate-conv"), "npm test | cat"),
+    "npm test | cat"
+  );
+  assert.equal(evalStatus.allPassed, false);
+  assert.ok(evalStatus.invalidCustomCommand);
+  assert.equal(evalStatus.invalidCustomCommand.errorCode, "unsupported_syntax");
+
+  const preWarn = await legacyInvalid.pre();
+  assert.equal(preWarn.injectSteps?.length, 1);
+  assert.match(preWarn.injectSteps[0].systemMessage.systemMessage, /自定义命令无效（需修正）/);
+  assert.match(preWarn.injectSteps[0].systemMessage.systemMessage, /不会静默回退到自动探测/);
+
+  const stopRes = evaluateStop(
+    { terminationReason: "NO_TOOL_CALL", fullyIdle: true, lastUserInput: "修改登录校验逻辑" },
+    readEvents(invalidStateDir, "gate-conv"),
+    readState(invalidStateDir, "gate-conv"),
+    { settings: readSettings(invalidStateDir) }
+  );
+  assert.equal(stopRes.decision, "allow");
+  assert.equal(stopRes.reasonCode, "delivery_gate_invalid_custom_command");
+});
+
+test("P1-B2-Lifecycle: Swarm coordinator survives active turns & bg wakeups, enforces Plan Mode approval, exits cleanly on teardown or explicit resume, and re-enters on new /swarm", async (t) => {
+  const dir = makeTmpDir("agy-cmd-b2-life-");
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const workspace = path.join(dir, "repo");
+  fs.mkdirSync(workspace, { recursive: true });
+  fs.writeFileSync(path.join(workspace, "package.json"), JSON.stringify({ scripts: { test: "node --test" } }));
+  const stateDir = path.join(dir, "state");
+  const env = makeEnv(stateDir);
+  updateSettings(stateDir, {
+    planTier: "paid",
+    boostEnabled: true,
+    deliveryTestGateEnabled: true,
+    autoRetryMode: "count",
+    autoRetryMax: 3
+  });
+
+  const convId = "swarm-life-1";
+  const txPath = writeTranscript(dir, "swarm-life.jsonl", [
+    { step_index: 0, type: "USER_INPUT", content: "<USER_REQUEST>\n/swarm 拆分模块并行重构\n</USER_REQUEST>" },
+    {
+      step_index: 1,
+      type: "PLANNER_RESPONSE",
+      content: "Spawning worker",
+      tool_calls: [{ name: "swarm", args: { action: "add", name: "worker-a" } }]
+    }
+  ]);
+  const base = { conversationId: convId, transcriptPath: txPath, cwd: workspace, workspacePaths: [workspace] };
+
+  // 1. Active Swarm entry
+  assert.deepEqual(
+    await runPreInvocation({ ...base, invocationNum: 0, initialNumSteps: 2, lastUserInput: "/swarm 拆分模块并行重构" }, env, 1000),
+    {}
+  );
+  assert.equal(readState(stateDir, convId).swarmActive, true);
+
+  // 2. Background wakeup while Swarm is active stays isolated
+  assert.deepEqual(
+    await runPreInvocation({ ...base, invocationNum: 0, initialNumSteps: 3, lastUserInput: "/swarm 拆分模块并行重构" }, env, 1050),
+    {}
+  );
+  assert.equal(readState(stateDir, convId).swarmActive, true);
+
+  // 3. Plan Mode approval inside active Swarm still guards PreInvocation & PreToolUse
+  appendTranscript(txPath, [
+    {
+      step_index: 4,
+      type: "PLANNER_RESPONSE",
+      content: "Writing plan",
+      tool_calls: [{ name: "write_file", args: { Path: "/brain/implementation_plan.md", ArtifactMetadata: { RequestFeedback: true } } }]
+    },
+    { step_index: 5, type: "GENERIC", status: "ERROR", error: "Plan mode is on: write_file is not allowed in read-only mode." }
+  ]);
+  const planAlert = await runPreInvocation(
+    { ...base, invocationNum: 1, initialNumSteps: 6, lastUserInput: "/swarm 拆分模块并行重构" },
+    env,
+    1100
+  );
+  assert.match(planAlert.injectSteps?.[0]?.systemMessage?.systemMessage || "", /agy-cmd → \/plan 审批/);
+  const exitGuard = await runPreToolUse(
+    { ...base, toolCall: { name: "exit_plan_mode", args: {} }, lastUserInput: "/swarm 拆分模块并行重构" },
+    env
+  );
+  assert.equal(exitGuard.decision, "force_ask");
+
+  // Plan mode exited cleanly -> Swarm coordination continues
+  appendTranscript(txPath, [{ step_index: 6, type: "GENERIC", status: "DONE", content: "Plan mode is off." }]);
+
+  // 4. Swarm teardown (`swarm(kill)` with 0 active workers): wrap-up Stop still allowed cleanly
+  appendTranscript(txPath, [
+    {
+      step_index: 7,
+      type: "PLANNER_RESPONSE",
+      content: "Cleaning up workers",
+      tool_calls: [{ name: "swarm", args: { action: "kill", name: "worker-a" } }]
+    },
+    {
+      step_index: 8,
+      type: "GENERIC",
+      status: "DONE",
+      content: "Swarm status:\n- worker-a: killed\nNo active workers remaining."
+    }
+  ]);
+  const txAfterKill = inspectTranscriptTail(txPath);
+  assert.equal(txAfterKill.swarmLifecycle, "ended");
+  assert.equal(txAfterKill.hasSwarmActivity, false);
+  assert.deepEqual(
+    await runStop({ ...base, terminationReason: "NO_TOOL_CALL", fullyIdle: true, lastUserInput: "/swarm 拆分模块并行重构" }, env, 1200),
+    { decision: "allow" }
+  );
+
+  // 5. Next ordinary user task in the SAME conversation automatically resumes normal guardrails!
+  appendTranscript(txPath, [
+    { step_index: 10, type: "USER_INPUT", content: "<USER_REQUEST>\n修一下 src/app.ts 的校验逻辑\n</USER_REQUEST>" }
+  ]);
+  assert.deepEqual(
+    await runPreInvocation({ ...base, invocationNum: 0, initialNumSteps: 11, lastUserInput: "修一下 src/app.ts 的校验逻辑" }, env, 1300),
+    {}
+  );
+  assert.equal(readState(stateDir, convId).swarmActive, false);
+  await runPostToolUse(
+    {
+      ...base,
+      stepIdx: 11,
+      toolCall: { name: "edit_file", args: { Path: path.join(workspace, "src/app.ts"), Target: "return 1;", Replacement: "return 2;" } },
+      toolResponse: "Made 1 replacement in src/app.ts"
+    },
+    env,
+    1310
+  );
+  const normalStop = await runStop(
+    { ...base, terminationReason: "NO_TOOL_CALL", fullyIdle: true, lastUserInput: "修一下 src/app.ts 的校验逻辑" },
+    env,
+    1320
+  );
+  assert.equal(normalStop.decision, "continue");
+  assert.match(normalStop.reason, /交付测试门禁.*npm test/);
+
+  // 6. Re-entering /swarm later in the same conversation works, and explicit "恢复普通会话" exits cleanly despite old transcript entries!
+  appendTranscript(txPath, [
+    { step_index: 20, type: "USER_INPUT", content: "<USER_REQUEST>\n/swarm 第二轮并行排查\n</USER_REQUEST>" }
+  ]);
+  await runPreInvocation({ ...base, invocationNum: 0, initialNumSteps: 21, lastUserInput: "/swarm 第二轮并行排查" }, env, 2000);
+  assert.equal(readState(stateDir, convId).swarmActive, true);
+
+  // Negated phrase does NOT exit Swarm
+  appendTranscript(txPath, [
+    { step_index: 22, type: "USER_INPUT", content: "<USER_REQUEST>\n先不要退出 swarm，继续观察\n</USER_REQUEST>" }
+  ]);
+  await runPreInvocation({ ...base, invocationNum: 0, initialNumSteps: 23, lastUserInput: "先不要退出 swarm，继续观察" }, env, 2050);
+  assert.equal(readState(stateDir, convId).swarmActive, true);
+
+  // Explicit "恢复普通会话" with a new task immediately restores normal guardrails in the same turn
+  appendTranscript(txPath, [
+    { step_index: 25, type: "USER_INPUT", content: "<USER_REQUEST>\n恢复普通会话，帮我修一下 src/b.ts\n</USER_REQUEST>" }
+  ]);
+  await runPreInvocation(
+    { ...base, invocationNum: 0, initialNumSteps: 26, lastUserInput: "恢复普通会话，帮我修一下 src/b.ts" },
+    env,
+    2100
+  );
+  assert.equal(readState(stateDir, convId).swarmActive, false);
+  await runPostToolUse(
+    {
+      ...base,
+      stepIdx: 26,
+      toolCall: { name: "edit_file", args: { Path: path.join(workspace, "src/b.ts"), Target: "const b = 1;", Replacement: "const b = 2;" } },
+      toolResponse: "Made 1 replacement in src/b.ts"
+    },
+    env,
+    2110
+  );
+  const resumedStop = await runStop(
+    { ...base, terminationReason: "NO_TOOL_CALL", fullyIdle: true, lastUserInput: "恢复普通会话，帮我修一下 src/b.ts" },
+    env,
+    2120
+  );
+  assert.equal(resumedStop.decision, "continue");
+  assert.match(resumedStop.reason, /交付测试门禁.*npm test/);
+});
+
+test("P1-B3: free stuck fallback shares paid dispatch gates and separates detected vs sent across uiOnly -> visible transitions", () => {
+  const freeSettings = { planTier: "free", boostEnabled: false, freeFallbackEnabled: true, planFallbackEnabled: true };
+  const paidSettings = { planTier: "paid", boostEnabled: true, boostAfterPlanApproval: false };
+  const twoOsc = [
+    { ts: 1000, kind: "edit", files: ["src/a.ts"], applied: true },
+    { ts: 1010, kind: "cmd", cmd: "npm test", failed: true, isVerify: true, terminal: true },
+    { ts: 1020, kind: "edit", files: ["src/a.ts"], applied: true },
+    { ts: 1030, kind: "cmd", cmd: "npm test", failed: true, isVerify: true, terminal: true }
+  ];
+
+  // 1. Free fallback yields to awaitingUserApprovalOrQuestion
+  const waitRes = evaluatePreInvocation(
+    { invocationNum: 1, initialNumSteps: 10, lastUserInput: "修一下单测" },
+    twoOsc,
+    null,
+    { settings: freeSettings, transcriptTail: { awaitingUserApprovalOrQuestion: true } }
+  );
+  assert.equal(waitRes.reasonCode, "steady_state");
+  assert.equal(waitRes.injectStep, null);
+
+  // 2. Free fallback yields when an active Plan Mode denial is already pending user confirmation
+  const planWaitRes = evaluatePreInvocation(
+    { invocationNum: 1, initialNumSteps: 10, lastUserInput: "修一下单测" },
+    twoOsc,
+    { lastPlanBlockAlertKey: "tx:4", lastTurnStartTs: 900 },
+    { settings: freeSettings, transcriptTail: { latestPlanModeDenial: { stepIdx: 4, key: "tx:4", error: "Plan mode is on" } } }
+  );
+  assert.equal(planWaitRes.reasonCode, "steady_state");
+  assert.equal(planWaitRes.injectStep, null);
+
+  // 3. Free fallback yields on background task wakeup (same tx turn key & repeated prompt)
+  const bgWakeRes = evaluatePreInvocation(
+    { invocationNum: 0, initialNumSteps: 12, lastUserInput: "修一下单测" },
+    twoOsc,
+    { userTurnCount: 1, lastUserInput: "修一下单测", lastTurnUserInputKey: "step:0", lastTurnInitialSteps: 1 },
+    { settings: freeSettings, transcriptTail: { latestUserInputKey: "step:0", latestUserInput: "修一下单测" } }
+  );
+  assert.equal(bgWakeRes.reasonCode, "steady_state");
+  assert.equal(bgWakeRes.injectStep, null);
+
+  // 4. Free fallback yields to pure discussion questions
+  const discussRes = evaluatePreInvocation(
+    { invocationNum: 1, initialNumSteps: 10, lastUserInput: "解释一下为什么报错？" },
+    twoOsc,
+    null,
+    { settings: freeSettings }
+  );
+  assert.equal(discussRes.reasonCode, "steady_state");
+  assert.equal(discussRes.injectStep, null);
+
+  // 5. Free fallback yields on new turn with explicit unattended /goal or repo-wide migration (Priorities 3 & 4 win)
+  const goalTurnRes = evaluatePreInvocation(
+    { invocationNum: 0, initialNumSteps: 12, lastUserInput: "帮我一直修到全部测试通过，还是报错" },
+    twoOsc,
+    { userTurnCount: 1, debugTurnStreak: 1, lastUserInput: "修一下报错", lastTurnInitialSteps: 1 },
+    { settings: freeSettings }
+  );
+  assert.equal(goalTurnRes.reasonCode, "auto_retry_armed");
+
+  const migTurnRes = evaluatePreInvocation(
+    { invocationNum: 0, initialNumSteps: 12, lastUserInput: "还是报错，请直接做整个项目的仓库级迁移" },
+    twoOsc,
+    { userTurnCount: 1, debugTurnStreak: 1, lastUserInput: "修一下报错", lastTurnInitialSteps: 1 },
+    { settings: freeSettings }
+  );
+  assert.equal(migTurnRes.reasonCode, "free_migration_fallback");
+
+  // 6. uiOnly -> visible: detection recorded silently without consuming boostAlerted; first visible alert is NOT lost!
+  const silentFree = evaluatePreInvocation(
+    { invocationNum: 1, initialNumSteps: 10, lastUserInput: "修一下单测" },
+    twoOsc,
+    null,
+    { settings: freeSettings, uiOnly: true }
+  );
+  assert.equal(silentFree.injectStep, null);
+  assert.equal(silentFree.reasonCode, "free_stuck_fallback_ui_only");
+  assert.equal(silentFree.nextState.boostDetected, true);
+  assert.equal(silentFree.nextState.boostAlerted, false);
+
+  const visibleFree = evaluatePreInvocation(
+    { invocationNum: 2, initialNumSteps: 11, lastUserInput: "修一下单测" },
+    twoOsc,
+    silentFree.nextState,
+    { settings: freeSettings, uiOnly: false }
+  );
+  assert.equal(visibleFree.reasonCode, "free_stuck_fallback");
+  assert.ok(visibleFree.injectStep);
+  assert.equal(visibleFree.nextState.boostAlerted, true);
+
+  // Subsequent visible invocation with same failures respects cooldown (no duplicate alert)
+  const afterSentFree = evaluatePreInvocation(
+    { invocationNum: 3, initialNumSteps: 12, lastUserInput: "修一下单测" },
+    twoOsc,
+    visibleFree.nextState,
+    { settings: freeSettings, uiOnly: false }
+  );
+  assert.equal(afterSentFree.reasonCode, "steady_state");
+  assert.equal(afterSentFree.injectStep, null);
+
+  // Paid hard task: uiOnly at turn entry -> visible on mid-turn invocation still delivers first Boost alert!
+  const silentPaid = evaluatePreInvocation(
+    { invocationNum: 0, initialNumSteps: 1, lastUserInput: "修复两个消费者并发取消时的竞态" },
+    [],
+    null,
+    { settings: paidSettings, uiOnly: true }
+  );
+  assert.equal(silentPaid.injectStep, null);
+  assert.equal(silentPaid.reasonCode, "auto_boost_ui_only");
+  assert.equal(silentPaid.nextState.boostDetected, true);
+  assert.equal(silentPaid.nextState.boostAlerted, false);
+
+  const visiblePaid = evaluatePreInvocation(
+    { invocationNum: 1, initialNumSteps: 2, lastUserInput: "修复两个消费者并发取消时的竞态" },
+    [],
+    silentPaid.nextState,
+    { settings: paidSettings, uiOnly: false }
+  );
+  assert.equal(visiblePaid.reasonCode, "auto_boost");
+  assert.match(visiblePaid.injectStep.systemMessage.systemMessage, /TypeName='DeepCoder'/);
+});
+
+test("P1-Teamwork-Surface: paid migration branch requires App surface and host capability, falling back on IDE/CLI/unknown/unavailable without heavy badge", () => {
+  const prompt = "请帮我做整个项目的仓库级迁移，从 Vue 2 升到 Vue 3";
+  const paid = { planTier: "paid", boostEnabled: true };
+  const free = { planTier: "free", boostEnabled: false };
+  const appTx = "/home/u/.gemini/antigravity/brain/c1/.system_generated/logs/transcript.jsonl";
+  const ideTx = "C:\\Users\\u\\.gemini\\antigravity-ide\\brain\\c1\\transcript.jsonl";
+  const cliTx = "/home/u/.gemini/antigravity-cli/brain/c1/transcript.jsonl";
+
+  // Helper unit checks for surface & capability detection
+  assert.equal(detectHostSurface({ hostSurface: "app" }), "app");
+  assert.equal(detectHostSurface({ metadata: { surface: "ide" } }), "ide");
+  assert.equal(resolveHostSlashCapability({ capabilities: { teamwork: true } }, "teamwork"), "available");
+  assert.equal(resolveHostSlashCapability({ capabilities: { teamwork: false } }, "teamwork"), "unavailable");
+  assert.equal(resolveHostSlashCapability({ availableSlashCommands: ["/plan", "/goal"] }, "teamwork"), "unavailable");
+  assert.equal(resolveHostSlashCapability({ availableSlashCommands: ["/plan", "/teamwork"] }, "teamwork"), "available");
+  assert.equal(resolveHostSlashCapability({ disabledSlashCommands: ["teamwork"] }, "teamwork"), "unavailable");
+  assert.equal(resolveHostSlashCapability({}, "teamwork"), "unknown");
+
+  // 1. Free tier on App with teamwork available -> still free_migration_fallback
+  const freeApp = evaluatePreInvocation(
+    { invocationNum: 0, initialNumSteps: 1, lastUserInput: prompt, transcriptPath: appTx, capabilities: { teamwork: true } },
+    [],
+    null,
+    { settings: free }
+  );
+  assert.equal(freeApp.reasonCode, "free_migration_fallback");
+  assert.match(freeApp.injectStep.systemMessage.systemMessage, /分阶段迁移规划/);
+  assert.doesNotMatch(freeApp.injectStep.systemMessage.systemMessage, /建议 \/teamwork/);
+
+  // 2. Paid tier on IDE / CLI / unknown surface -> migration_surface_fallback (no heavy badge)
+  for (const extra of [{ transcriptPath: ideTx }, { transcriptPath: cliTx }, {}]) {
+    const nonApp = evaluatePreInvocation(
+      { invocationNum: 0, initialNumSteps: 1, lastUserInput: prompt, ...extra },
+      [],
+      null,
+      { settings: paid }
+    );
+    assert.equal(nonApp.reasonCode, "migration_surface_fallback");
+    assert.match(nonApp.injectStep.systemMessage.systemMessage, /分阶段迁移规划/);
+    assert.doesNotMatch(nonApp.injectStep.systemMessage.systemMessage, /建议 \/teamwork/);
+  }
+
+  // 3. Paid tier on App where host explicitly marks /teamwork unavailable -> migration_capability_fallback
+  const unavail = evaluatePreInvocation(
+    { invocationNum: 0, initialNumSteps: 1, lastUserInput: prompt, transcriptPath: appTx, availableSlashCommands: ["/plan", "/goal"] },
+    [],
+    null,
+    { settings: paid }
+  );
+  assert.equal(unavail.reasonCode, "migration_capability_fallback");
+  assert.match(unavail.injectStep.systemMessage.systemMessage, /分阶段迁移规划/);
+  assert.doesNotMatch(unavail.injectStep.systemMessage.systemMessage, /建议 \/teamwork/);
+
+  // 4. Paid tier on App with /teamwork explicitly available -> direct suggest_teamwork
+  const paidAppAvail = evaluatePreInvocation(
+    { invocationNum: 0, initialNumSteps: 1, lastUserInput: prompt, transcriptPath: appTx, capabilities: { teamwork: true } },
+    [],
+    null,
+    { settings: paid }
+  );
+  assert.equal(paidAppAvail.reasonCode, "suggest_teamwork");
+  assert.match(paidAppAvail.injectStep.systemMessage.systemMessage, /\[agy-cmd → 建议 \/teamwork\]/);
+
+  // 5. Paid tier on App without capability field (unknown) -> suggest_teamwork with explicit host capability check guard
+  const paidAppUnknown = evaluatePreInvocation(
+    { invocationNum: 0, initialNumSteps: 1, lastUserInput: prompt, transcriptPath: appTx },
+    [],
+    null,
+    { settings: paid }
+  );
+  assert.equal(paidAppUnknown.reasonCode, "suggest_teamwork");
+  assert.match(paidAppUnknown.injectStep.systemMessage.systemMessage, /First verify that "\/teamwork" is listed/);
 });

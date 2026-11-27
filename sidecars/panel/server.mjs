@@ -312,7 +312,13 @@ export function registerSidecarRoutes(
     });
   }
 
-  for (const route of ["/api/state", "/api/settings", "/api/dismiss-onboarding", "/api/star-prompt"]) {
+  for (const route of [
+    "/api/state",
+    "/api/settings",
+    "/api/dismiss-onboarding",
+    "/api/star-prompt",
+    "/api/resume-normal-session"
+  ]) {
     app.api(
       route,
       (rawData) => {

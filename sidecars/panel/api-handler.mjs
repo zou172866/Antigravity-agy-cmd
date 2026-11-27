@@ -7,13 +7,14 @@ import {
   evaluateStarPrompt,
   formatDeliveryGateSummaryZh,
   formatRetrySummaryZh,
+  getDeliveryCommandValidationError,
   readSettings,
   setStarPromptState,
   STAR_PROMPT_TERMINAL_STATES,
   updateAutoUpdateState,
   updateSettings
 } from "../../hooks/lib/settings.mjs";
-import { readState } from "../../hooks/lib/state.mjs";
+import { readState, writeState } from "../../hooks/lib/state.mjs";
 import { createVersionChecker, parseVersion, readLocalVersion } from "./version-check.mjs";
 import { createPluginUpdater, evaluateAutoInstallEligibility, verifiedAssetIdentity } from "./version-update.mjs";
 
@@ -28,12 +29,14 @@ const LOCAL_HOST_RE = /^(?:127\.0\.0\.1|localhost|\[::1\])(?::\d{1,5})?$/i;
 const LOCAL_HTTP_ORIGIN_RE = /^http:\/\/(?:127\.0\.0\.1|localhost|\[::1\])(?::\d{1,5})?$/i;
 const VSCODE_WEBVIEW_RE = /^vscode-webview:\/\/[a-z0-9._-]+(?:\/.*)?$/i;
 export const AUTO_UPDATE_ACK_ROUTE = "/api/auto-update-ack";
+export const RESUME_NORMAL_SESSION_ROUTE = "/api/resume-normal-session";
 
 const STAR_PROMPT_ALLOWED_KEYS = new Set(["state"]);
 const STAR_PROMPT_ALLOWED_STATES = new Set(STAR_PROMPT_TERMINAL_STATES);
 const VERSION_CHECK_ALLOWED_KEYS = new Set(["mode", "fresh"]);
 const PLUGIN_UPDATE_ALLOWED_KEYS = new Set(["version", "assetName", "assetUrl", "assetSha256"]);
 const AUTO_UPDATE_ACK_ALLOWED_KEYS = new Set(["dismissNotice"]);
+const RESUME_NORMAL_ALLOWED_KEYS = new Set(["conversationId"]);
 const NON_CIRCUIT_AUTO_FAIL_REASONS = new Set(["gitCheckout", "notInstalled", "managedByHost", "busy", "releaseChanged"]);
 
 let _defaultVersionChecker = null;
@@ -196,7 +199,8 @@ export function buildPanelStatePayload(stateDir, rawConvId = "", { markStarTrigg
         conversationId: safeId.slice(0, 12),
         userTurnCount: st.userTurnCount || 0,
         turnAutoRetries: st.turnAutoRetries || 0,
-        debugTurnStreak: st.debugTurnStreak || 0
+        debugTurnStreak: st.debugTurnStreak || 0,
+        swarmActive: Boolean(st.swarmActive)
       };
     }
   }
@@ -222,6 +226,7 @@ export function buildPanelStatePayload(stateDir, rawConvId = "", { markStarTrigg
     starPrompt,
     summaryZh: formatRetrySummaryZh(settings),
     deliveryGateStatusZh: formatDeliveryGateSummaryZh(settings),
+    deliveryCommandError: getDeliveryCommandValidationError(settings),
     boostStatusZh:
       settings.planTier === "paid" && settings.boostEnabled
         ? "Pro/Ultra 会员 · 已开启 /boost 自动接入"
@@ -566,6 +571,42 @@ export function dispatchPanelApi(pathname, rawData, { stateDir, defaultConvId = 
       { configuredByUser: true, onboardingShown: true },
       { markConfigured: true }
     );
+    return {
+      status: 200,
+      body: buildPanelStatePayload(stateDir, convId, { markStarTriggered: false })
+    };
+  }
+
+  if (pathname === RESUME_NORMAL_SESSION_ROUTE) {
+    for (const key of Object.keys(data)) {
+      if (!RESUME_NORMAL_ALLOWED_KEYS.has(key)) {
+        return {
+          status: 400,
+          body: { ok: false, error: `Unexpected field '${key}' in request body` }
+        };
+      }
+    }
+    if (!convId) {
+      return {
+        status: 400,
+        body: { ok: false, error: "Missing conversationId" }
+      };
+    }
+    const safeId = sanitizeConversationId(convId);
+    const st = readState(stateDir, safeId);
+    const stepCandidates = [st.swarmLastActivityStep, st.lastInitialNumSteps, st.swarmClearedAtStep].filter(
+      (n) => Number.isSafeInteger(n) && n >= 0
+    );
+    const clearedAtStep = stepCandidates.length > 0 ? Math.max(...stepCandidates) : null;
+    const clearedAfterKey = st.swarmLastActivityKey || st.swarmClearedAfterKey || "__manual__";
+    writeState(stateDir, safeId, {
+      ...st,
+      swarmActive: false,
+      swarmClearedAfterKey: clearedAfterKey,
+      swarmClearedAtStep: clearedAtStep,
+      boostAlerted: false,
+      boostDetected: false
+    });
     return {
       status: 200,
       body: buildPanelStatePayload(stateDir, convId, { markStarTriggered: false })
