@@ -1,10 +1,15 @@
 import fs from "node:fs";
-import { nonEmptyString } from "./common.mjs";
+import { extractActiveSlashCommands, nonEmptyString, unwrapUserRequestText } from "./common.mjs";
 
 const HEAD_READ_BYTES = 64 * 1024;
 const TAIL_READ_BYTES = 256 * 1024;
 
 const SUBAGENT_MSG_RE = /\[Message\]\s+timestamp=[^\n]*\bsender=/;
+const SWARM_WORKER_SYS_RE =
+  /<swarm_worker\b|<\/swarm_worker>|You are the swarm's stall monitor|\[Swarm Worker\]/i;
+const SWARM_TOOL_NAME_RE = /^(?:swarm|post_board|read_board|swarm_wait)$/i;
+const SWARM_PLAN_FILE_RE = /[\\/]\.system_generated[\\/]swarm[\\/]plan\.json$/i;
+const LEADING_SWARM_SLASH_RE = /^\s*\/swarm(?=$|\s)/i;
 const BG_TASK_SENDER_RE = /\[Message\]\s+timestamp=[^\n]*\bsender=[^\s\]]*\/task-(\d+)\b/;
 const PLAN_MODE_DENY_RE =
   /(?:plan\s*mode\s+is\s+on|only\s+read[- ]?only\s+tools|read[- ]?only\s+mode|cannot\s+write\s+in\s+plan|writes?\s+(?:are|is)\s+(?:disabled|blocked|not\s+allowed|forbidden)|tool\s+not\s+allowed\s+in\s+plan|plan\s*mode\s+is\s+read[- ]?only|计划模式|只读模式)/i;
@@ -55,18 +60,19 @@ export function resolveTranscriptPath(payload = {}) {
 }
 
 function readTranscriptHeadRaw(transcriptPath, maxBytes = HEAD_READ_BYTES) {
-  if (!transcriptPath) return { steps: [], truncatedTail: "" };
+  if (!transcriptPath) return { steps: [], truncatedTail: "", truncated: false };
   let fd = null;
   try {
     const st = fs.statSync(transcriptPath);
-    if (!st.isFile() || st.size === 0) return { steps: [], truncatedTail: "" };
+    if (!st.isFile() || st.size === 0) return { steps: [], truncatedTail: "", truncated: false };
     const readLen = Math.min(st.size, maxBytes);
+    const truncated = st.size > readLen;
     const buf = Buffer.allocUnsafe(readLen);
     fd = fs.openSync(transcriptPath, "r");
     const bytesRead = fs.readSync(fd, buf, 0, readLen, 0);
     let raw = buf.subarray(0, bytesRead).toString("utf8");
     let truncatedTail = "";
-    if (st.size > readLen) {
+    if (truncated) {
       const lastNl = raw.lastIndexOf("\n");
       if (lastNl >= 0) {
         truncatedTail = raw.slice(lastNl + 1, lastNl + 1 + 1024);
@@ -76,9 +82,9 @@ function readTranscriptHeadRaw(transcriptPath, maxBytes = HEAD_READ_BYTES) {
         raw = "";
       }
     }
-    return { steps: parseJsonLines(raw), truncatedTail };
+    return { steps: parseJsonLines(raw), truncatedTail, truncated };
   } catch {
-    return { steps: [], truncatedTail: "" };
+    return { steps: [], truncatedTail: "", truncated: false };
   } finally {
     if (fd !== null) {
       try {
@@ -164,10 +170,29 @@ export function readTranscriptTail(transcriptPath, maxBytes = TAIL_READ_BYTES) {
  * - Subagent sessions have zero `USER_INPUT` steps and begin with `SYSTEM_MESSAGE`
  *   (including `[Message] timestamp=... sender=...` dispatch from parent).
  */
+function hasSwarmWorkerSystemStep(steps) {
+  return steps.some(
+    (step) =>
+      step &&
+      step.type === "SYSTEM_MESSAGE" &&
+      typeof step.content === "string" &&
+      SWARM_WORKER_SYS_RE.test(step.content)
+  );
+}
+
 export function isSubagentTranscript(transcriptPath) {
   if (!transcriptPath) return false;
-  const { steps: head, truncatedTail } = readTranscriptHeadRaw(transcriptPath, HEAD_READ_BYTES);
+  const { steps: head, truncatedTail, truncated } = readTranscriptHeadRaw(transcriptPath, HEAD_READ_BYTES);
   if (head.length === 0 && !truncatedTail) return false;
+
+  if (hasSwarmWorkerSystemStep(head)) return true;
+  if (
+    truncatedTail &&
+    /"type"\s*:\s*"SYSTEM_MESSAGE"/.test(truncatedTail) &&
+    SWARM_WORKER_SYS_RE.test(truncatedTail)
+  ) {
+    return true;
+  }
 
   const sample = head.slice(0, 12);
   let hasUserInput = false;
@@ -200,7 +225,17 @@ export function isSubagentTranscript(transcriptPath) {
     }
   }
 
-  if (hasUserInput) return false;
+  if (hasUserInput) {
+    // A Swarm worker spawned via `fork: "coordinator"` inherits the coordinator's
+    // opening USER_INPUT, then receives a `<swarm_worker>` SYSTEM_MESSAGE later in the log.
+    if (truncated) {
+      const tailSteps = readTranscriptTail(transcriptPath, TAIL_READ_BYTES);
+      if (hasSwarmWorkerSystemStep(tailSteps)) {
+        return true;
+      }
+    }
+    return false;
+  }
   if (hasSubagentMessage) return true;
   if (systemHeadCount >= 2 && (sample[0]?.type === "SYSTEM_MESSAGE" || (sample.length === 0 && /"type"\s*:\s*"SYSTEM_MESSAGE"/.test(truncatedTail)))) {
     return true;
@@ -280,6 +315,7 @@ export function inspectTranscriptTail(transcriptPath) {
     latestInputFollowsPlan: false,
     hasPlannerResponseSinceUserInput: false,
     hasBgTaskCompletionSinceUserInput: false,
+    hasSwarmActivity: false,
     tailRolledOverWithoutUserInput: false,
     awaitingUserApprovalOrQuestion: false
   };
@@ -307,6 +343,7 @@ export function inspectTranscriptTail(transcriptPath) {
   let latestInputFollowsPlan = false;
   let hasPlannerResponseSinceUserInput = false;
   let hasBgTaskCompletionSinceUserInput = false;
+  let hasSwarmActivity = false;
 
   for (const { step, byteOffset } of entries) {
     const idx = parseNonNegStepIdx(step.step_index);
@@ -325,6 +362,12 @@ export function inspectTranscriptTail(transcriptPath) {
       hasBgTaskCompletionSinceUserInput = false;
       if (typeof step.content === "string" && step.content.trim()) {
         latestUserInput = step.content;
+        const unwrapped = unwrapUserRequestText(step.content);
+        if (extractActiveSlashCommands(unwrapped).has("compact")) {
+          hasSwarmActivity = false;
+        } else if (LEADING_SWARM_SLASH_RE.test(unwrapped)) {
+          hasSwarmActivity = true;
+        }
       }
       // A new user turn supersedes any prior turn's Plan Mode denial or approval wait
       latestPlanModeDenial = null;
@@ -342,6 +385,22 @@ export function inspectTranscriptTail(transcriptPath) {
         : Array.isArray(step.toolCalls)
           ? step.toolCalls
           : [];
+      if (
+        pCalls.some((c) => {
+          const name = nonEmptyString(c?.name);
+          if (SWARM_TOOL_NAME_RE.test(name)) return true;
+          if (PLAN_WRITE_TOOL_RE.test(name)) {
+            const args = parseToolCallArgs(c?.args);
+            const rawPath = String(
+              args.Path ?? args.path ?? args.TargetFile ?? args.targetFile ?? args.filePath ?? ""
+            ).replace(/^["']|["']$/g, "");
+            if (SWARM_PLAN_FILE_RE.test(rawPath)) return true;
+          }
+          return false;
+        })
+      ) {
+        hasSwarmActivity = true;
+      }
       const calledAskQuestion = pCalls.some((c) => nonEmptyString(c?.name) === "ask_question");
       const showsPlan = /^\s*(?:\*\*)?\[agy-cmd\s*→\s*\/plan\s*审批\]/.test(pContent);
       if (calledAskQuestion || pCalls.length > 0 || showsPlan) {
@@ -442,6 +501,7 @@ export function inspectTranscriptTail(transcriptPath) {
     latestInputFollowsPlan,
     hasPlannerResponseSinceUserInput,
     hasBgTaskCompletionSinceUserInput,
+    hasSwarmActivity,
     tailRolledOverWithoutUserInput: Boolean(truncated && !latestUserInputKey && fileSize > 0),
     awaitingUserApprovalOrQuestion
   };

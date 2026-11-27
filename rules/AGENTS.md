@@ -1,6 +1,6 @@
 # Antigravity 自动路由 (agy-cmd)
 
-仅桌面端 App/IDE；工作区 `AGENTS.md` 优先。
+仅桌面端 App/IDE；工作区 `AGENTS.md` 优先。**若当前为子智能体、Swarm 成员（Worker / Verifier / Monitor）或 Workflow Worker，跳过本文件的 `/plan` 审批、`/grill-me` 追问与重型路由，直接按任务书或留言板协议执行。**
 
 - **轻量直出（零打扰）**：解释代码、本地文本查找，或改法明确、仅涉及 1～2 个文件且不触及公共接口的低风险修改 → 直接执行，**不加徽标、不建计划、不推指令**。
 - **可见徽标**：仅当命中下方「原生调度」或「套餐感知兜底」时，在回复（或方案/提问）第 1 行输出 1 个简短徽标，例如 `[agy-cmd → /plan 审批]`、`[agy-cmd → 自动换视角排查]`。
@@ -8,7 +8,7 @@
   1. 需求/边界未定 → 标注 `[agy-cmd → /grill-me 追问]` 并调 `ask_question` 单题追问，推荐项置顶 `(Recommended)`。
   2. 首次写项目文件前，按本次任务预计改动的文件数判断范围（`agy-dart` 的 `apply_edits` 批量修改按文件计）。范围不明时先只读扫描。预计改 ≥3 个文件、变更公共接口或涉及高风险 → 输出 `[agy-cmd → /plan 审批]`，提交 `RequestFeedback: true` 的 Implementation Plan，获批后再写项目文件。**若只读 Plan Mode 拒绝 `write_file` 写方案产物，在回复正文给出方案并等待确认，严禁调用 `exit_plan_mode` 绕过审批**。
   3. 批处理或多模块协作才检查重型路由。默认在主会话顺序分批，纯正则用本地命令。主动调度须同时确认面板 `planTier=paid`、当前是 Antigravity App 且宿主开放目标能力（取证见 `agy-cmd` 技能）。免费、未知或 IDE 直接走默认路径，不亮重型徽标。用户本次明确要求运行 App 已开放的 Swarm 或 Workflow 时可单次使用，保留其设置。
-  4. 准入后，≥5 个同质对象独立交回结果 → `[agy-cmd → /run-workflow]`，读 `run-workflow`。2～4 个模块须协调接口或交叉审查 → `[agy-cmd → /swarm]`，先定接口、互不重叠的写入路径与验证命令，每组设独立 Verifier，账户可选时用不同模型。共享文件交单人顺序改。
+  4. 准入后，≥5 个同质对象独立交回结果 → `[agy-cmd → /run-workflow]`，读 `run-workflow`。可拆成互不碰撞独立 Lane 的多模块协作、并行只读评审或 Best-of-N 择优 → 先做 Pre-flight（定接口/边界、互不重叠写入路径或只读范围、验证命令）再输出 `[agy-cmd → 建议 /swarm]` 与可复制 `/swarm` 提示词（获批的多模块计划也可衔接 `/swarm execute our plan`）；未经用户点名不私自调 `swarm` 工具。**前后强依赖或紧耦合改动禁止强行并行**，留在主会话 / Orchestrator 或走 `/boost`；共享文件交单人顺序改。
   5. 有一项独立调查且主会话有其他工作可继续时，可派一个可用的 `research` 查证，主会话核对。动态网页/截图 → `[agy-cmd → /browser]` 调 `browser`；App 开放交互图表工具时 → `[agy-cmd → /generative_ui]` 读 `generative_ui`。
 - **防报错套餐感知与自动续跑**（禁推 CLI 专属 `/undo`、`/branch`、`/effort`；本轮已用对应 `/` 指令则不重复提示）：
   1. **疑难任务与卡壳排错**：收到钩子的 `[agy-cmd → 自动 Boost]` 时，直接用 `invoke_subagent` 派一个角色。只读排查或待审批时用 `DeepInvestigator`，已授权的修复可用 `DeepCoder`。主会话验证结果，角色调用失败则接手。收到 `[agy-cmd → 自动换视角排查]` 时，给可用的 `dart-reviewer` 派只读排查任务，备选 `research`；都不可用时由主会话逐一验证假设。

@@ -81,10 +81,10 @@ python ~/.agents/skills/agy-cmd/scripts/setup_auto_router.py --install --standal
 
 - 改动 1～2 个文件、解释代码或查找内容时，AI 直接给出结果，不额外弹窗打扰。
 - 需求没说清时，AI 先出一个选择题向你确认方向。
-- 需要改动 3 个及以上文件时，AI 先把修改方案列出来，等你确认后再动手改代码。即使当前处于只读模式无法新建方案文件，AI 也会直接在对话框里写出方案等你点头；如在会员 Boost 模式下手动开启了「计划获批后自动使用 Boost」，方案获批后会自动提示 `[agy-cmd → 计划获批，自动 Boost]` 并单次触发 `DeepCoder` / `DeepInvestigator` 执行，同时在后台任务唤醒时保留 `Stop` 自动续跑状态。
+- 需要改动 3 个及以上文件时，AI 先把修改方案列出来，等你确认后再动手改代码。即使当前处于只读模式无法新建方案文件，AI 也会直接在对话框里写出方案等你点头；多模块独立计划获批后可直接衔接 `/swarm execute our plan` 并行落地；如在会员 Boost 模式下手动开启了「计划获批后自动使用 Boost」，方案获批后会自动提示 `[agy-cmd → 计划获批，自动 Boost]` 并单次触发 `DeepCoder` / `DeepInvestigator` 执行，同时在后台任务唤醒时保留 `Stop` 自动续跑状态。
 - 查一条复杂调用链、验一个页面，可以各自作为单点旁支交给一个子智能体。简单查找直接在主会话完成。
 - 给 5 个及以上同类对象做相同检查时，默认顺序分批。面板已选付费档且当前 App 提供该命令时，插件可选用 `/run-workflow` 逐项检查、汇总结构化结果。
-- 多个模块要协商接口、相互审查时，App 可用 `/swarm`。先定接口、各写手负责的文件和整体验证命令。单个反复失败的难题适合 `/boost`，跨天且能分里程碑验收的工程适合 `/teamwork`。[选型与可复制示例](skills/agy-cmd/references/desktop-commands-matrix.md)
+- 可拆成互不碰撞独立 Lane 的任务（多模块写码、多视角只读评审、只读排障、Best-of-N 择优等），App 可用 `/swarm`（内置 6 套模板、Gemini 4 三层选模与启动前自检清单）；前后强依赖的紧耦合改动留在主会话 / Orchestrator，单个反复失败的难题适合 `/boost`，跨天且能分里程碑验收的工程适合 `/teamwork`。活跃 `/swarm` 会话及 Swarm Worker（含 `fork` 分叉）由钩子自动隔离放行，不打断留言板协作与前缀缓存。[选型与可复制示例](skills/agy-cmd/references/desktop-commands-matrix.md)
 - 需要操作网页或展示可点击的图表时，AI 会自动打开内置浏览器或生成交互画面。
 
 ### 2. 测试没过自动接着修
@@ -116,7 +116,7 @@ python ~/.agents/skills/agy-cmd/scripts/setup_auto_router.py --install --standal
 
 - **套餐与配额**。Google 将 `/boost`、`/teamwork` 列为付费功能。App 的 `/swarm`、`/run-workflow` 对所有套餐开放。插件在免费模式下默认顺序执行以节省周配额，用户可以在支持的 App 会话里明确要求本次使用后两项。在 IDE 或宿主能力未知时，自动路由留在主会话。[官方套餐对照](https://antigravity.google/docs/boost/) · [工作流说明](https://antigravity.google/docs/dynamic-workflows/)
 - **可选独立复核**。免费用户可在侧栏打开计划实施后的独立复核，默认关闭。主 Agent 负责改代码、跑验证，再把本次改动路径、关键 diff 和验证证据交给一位仅可读文件的 `cmd-verifier`。宿主未提供该角色时，主 Agent 会说明独立复核未完成。
-- **疑难排查与卡壳换思路**：免费版或关闭 Boost 时，命令连续失败 3 次或连改两次仍报同一个错，插件会让 AI 停下反复试错，改为只读排查原因；会员开启 Boost 后，遇到明确的疑难排查或反复失败会自动调度 `DeepInvestigator` / `DeepCoder` 介入，由主会话核对结果。
+- **疑难排查与卡壳换思路**：免费版或关闭 Boost 时，命令连续失败 3 次或连改 2 次仍失败，插件会让 AI 停下反复试错，改为只读排查原因；会员开启 Boost 后，遇到明确的疑难排查、连续 3 次命令失败或 3 次修改后仍失败（为 Orchestrator 原生“失败 2 次自动交回 Neon”留出自愈窗口）时自动调度 `DeepInvestigator` / `DeepCoder` 介入，由主会话核对结果。
 
 Hook 和安装流程已通过本地测试，真实免费账号在 App 和 IDE 中调度复核角色仍待验证。[多智能体路由调研](docs/research/multi-agent-routing-best-practices.md) · [免费档设计提案](docs/proposals/free-tier-v2.3.md)
 

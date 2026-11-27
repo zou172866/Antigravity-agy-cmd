@@ -105,6 +105,9 @@ const DIRECT_TASK_MUTATE_RE =
 const TEAMWORK_MIGRATION_RE =
   /(?:跨天(?:重构|迁移|开发)|仓库级(?:重构|迁移|重写)|全仓库(?:重写|迁移|重构)|整个项目(?:重写|迁移)|大规模框架迁移|\b(?:repo[- ]?wide\s+(?:migration|rewrite|refactor)|multi[- ]?day\s+(?:migration|rewrite|refactor)|full\s+codebase\s+(?:migration|rewrite))\b)/i;
 
+const LEADING_SWARM_SLASH_RE = /^\s*\/swarm(?=$|\s)/i;
+const LEADING_AUTONOMY_SLASH_RE = /^\s*\/(swarm|teamwork|boost|run-workflow)(?=$|\s)/i;
+
 function requestsMigration(text) {
   const migration = TEAMWORK_MIGRATION_RE.exec(text);
   if (!migration) return false;
@@ -1138,6 +1141,7 @@ export function evaluatePreInvocation(payload, events = [], prevStateInput = nul
     if (activeSlash.has("compact")) {
       nextState.freePlan = null;
       nextState.deliveryGate = null;
+      nextState.swarmActive = false;
       nextState.debugTurnStreak = 0;
       nextState.boostAlerted = false;
       nextState.lastBoostPassTs = 0;
@@ -1283,6 +1287,25 @@ export function evaluatePreInvocation(payload, events = [], prevStateInput = nul
     };
   }
 
+  // Active Swarm Coordinator sessions manage their own shared board, @verifier and @monitor.
+  // Never interrupt them with Boost/fallback/goal/delivery-gate injections.
+  if (LEADING_SWARM_SLASH_RE.test(turnInput) || Boolean(transcriptTail?.hasSwarmActivity)) {
+    if (!nextState.swarmActive) {
+      nextState.swarmActive = true;
+      stateChanged = true;
+    }
+  }
+  if (nextState.swarmActive) {
+    return {
+      nextState,
+      injectStep: null,
+      shouldResetEvents,
+      reasonCode: "swarm_active_skip",
+      stateChanged,
+      metrics
+    };
+  }
+
   const paidBoostActive = effSettings.planTier === "paid" && effSettings.boostEnabled === true;
   const noticeHash = isPlanApprovalNotice(inputEnvelope) ? hashText(inputEnvelope) : "";
   const planBoostKey = isDirectUnflushedNotice
@@ -1361,7 +1384,11 @@ export function evaluatePreInvocation(payload, events = [], prevStateInput = nul
   const hasFreshFailureSinceAlert =
     !nextState.boostAlerted || metrics.latestFailureTs > (nextState.lastBoostAlertEventTs || 0);
   const isCleanNonDebugTurnEntry = isNewUserTurn && (nextState.debugTurnStreak || 0) === 0;
-  const oscHit = !isCleanNonDebugTurnEntry && metrics.editFailOscillations >= 2 && hasFreshFailureSinceAlert;
+  // Paid users on Orchestrator get a native planner hand-back after 2 verification failures;
+  // require 3 edit-fail oscillations before escalating to heavy Boost, while keeping free fallback at 2.
+  const oscThreshold = paidBoostActive ? 3 : 2;
+  const oscHit =
+    !isCleanNonDebugTurnEntry && metrics.editFailOscillations >= oscThreshold && hasFreshFailureSinceAlert;
   const failStreakHit =
     !isCleanNonDebugTurnEntry && metrics.consecutiveCmdFailures >= 3 && hasFreshFailureSinceAlert;
   const multiTurnDebugHit = isNewUserTurn && (nextState.debugTurnStreak || 0) >= 2;
@@ -1658,13 +1685,32 @@ export function evaluateStop(payload, events = [], prevStateInput = null, option
       nonEmptyString(nextState.lastUserInput)
   );
 
-  // Safety Brake 3: Do not double-continue when user explicitly invoked native `/goal`
+  // Safety Brake 3: Do not double-continue when user explicitly invoked native `/goal`,
+  // `/swarm`, `/teamwork`, `/boost`, `/run-workflow`, or when this conversation is an active Swarm coordinator.
   const activeSlash = extractActiveSlashCommands(rawLastUserInput);
   if (activeSlash.has("goal")) {
     return {
       decision: "allow",
       reason: "",
       reasonCode: "native_goal_active",
+      nextState,
+      stateChanged,
+      metrics: null
+    };
+  }
+  const hasActiveSwarm =
+    Boolean(nextState.swarmActive) ||
+    Boolean(transcriptTail?.hasSwarmActivity) ||
+    LEADING_SWARM_SLASH_RE.test(rawLastUserInput);
+  if (hasActiveSwarm && !nextState.swarmActive) {
+    nextState.swarmActive = true;
+    stateChanged = true;
+  }
+  if (hasActiveSwarm || LEADING_AUTONOMY_SLASH_RE.test(rawLastUserInput)) {
+    return {
+      decision: "allow",
+      reason: "",
+      reasonCode: "native_autonomy_active",
       nextState,
       stateChanged,
       metrics: null

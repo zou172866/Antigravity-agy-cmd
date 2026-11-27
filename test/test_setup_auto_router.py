@@ -39,9 +39,16 @@ class TestPluginManifestsAndSync(unittest.TestCase):
         self.assertIn("[agy-cmd → /plan 审批]", disk)
         self.assertIn("[agy-cmd → 自动换视角排查]", disk)
         self.assertIn("sidecar://agy-cmd/panel/", disk)
+        self.assertIn("Swarm 成员", disk)
+        self.assertIn("前后强依赖或紧耦合改动禁止强行并行", disk)
+        self.assertIn("[agy-cmd → 建议 /swarm]", disk)
         skill = (PLUGIN_ROOT / "skills/agy-cmd/SKILL.md").read_text(encoding="utf-8")
         self.assertIn('model="inherit"', skill)
         self.assertIn("编码优先选可用的 `dart-coder`，否则选 `self`", skill)
+        self.assertIn("/swarm execute our plan", skill)
+        verifier_doc = (PLUGIN_ROOT / "agents/cmd-verifier.md").read_text(encoding="utf-8")
+        self.assertIn("1-based line number", verifier_doc)
+        self.assertIn("existing test assertions", verifier_doc)
         # Standalone installs only get this text. Keep the quota and host gate
         # ahead of the first instruction that emits a heavy command badge.
         heavy_gate = next(line for line in disk.splitlines() if "planTier=paid" in line)

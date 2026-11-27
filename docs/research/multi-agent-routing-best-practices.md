@@ -201,3 +201,14 @@ flowchart TD
   * [agy-cmd v2.3 普通用户执行提案](../proposals/free-tier-v2.3.md)
   * [agy-cmd 常驻路由规则](../../rules/AGENTS.md)
   * [桌面端与 IDE 指令深度辨析与速查矩阵](../../skills/agy-cmd/references/desktop-commands-matrix.md)
+
+---
+
+## 八、2026-11-26 架构蓝图增补与 v2.6.0 落地纪要
+
+对照 *Gemini 4 Neon AI Agents Swarms* 实战蓝图（2026-11-26 核验汇总 Google Cloud 5 大编排模式、Gemini 4 三层定价与 6 组公开案例）与本机 Antigravity `swarm` 工具协议，补充以下实证结论，并在 `v2.6.0` 中完成落地：
+
+1. **反并行实证与配额成本**：Google + MIT 实测显示，独立可拆分任务并行最高提升 **+80.8%**，但前后强依赖任务强行并行反而下降 **39%～70%**，两人编辑重叠代码成功率降低约 **30%**；实际只读 Swarm 消耗约为单会话的 **4～5 倍配额**。规则与技能层已新增负向否决门，严禁把强依赖改动拆进 Swarm。
+2. **Swarm 全员继承 `AGENTS.md` 与 `hooks` 的隔离与前缀缓存保护**：Swarm Worker（含 `fork: "coordinator"` 分叉成员）共享全局规则、技能与钩子，且 Hydrogen 稳定前缀（≥4,096 token）可享 **95% 隐式缓存读折扣（\$0.075/M）**。`v2.6.0` 已在 `rules/AGENTS.md` 增加子智能体/Swarm 豁免条款，并在 `common.mjs` / `transcript.mjs` / `detector.mjs` 中补齐分叉 Worker 与活跃 Swarm Coordinator 识别，避免卡审批、误续跑或破坏共享前缀缓存。
+3. **Orchestrator 双向回退与 Boost 阈值协同**：Orchestrator（默认 Neon 规划 + Hydrogen 执行，基准省约 24% 配额、提速 19%）在**验证失败 2 次**时原生交回 Neon 修补计划。`v2.6.0` 将付费自动 Boost 的 `edit↔fail` 震荡触发阈值上调至 **≥3 次**（免费档只读换视角仍维持 ≥2 次），避免抢跑打断 Orchestrator 低成本自愈。
+4. **5 大研究编排模式与官方连招落地**：在 [desktop-commands-matrix.md](../../skills/agy-cmd/references/desktop-commands-matrix.md) 补齐 `/grill-me → /plan → /swarm execute our plan`、多视角只读评审团（比单清单多发现约 35% 缺陷）、只读首跑排障、Best-of-N 基准择优、Council of Models 匿名评议、Gemini 4 三层选模、自定义 Subagent `model` 仅支持档位（`inherit`/`flash`/`pro`）说明及启动前自检清单；同时在 [agents/cmd-verifier.md](../../agents/cmd-verifier.md) 正文强化相对路径 + 1-based 行号、禁删断言与真实命令输出硬要求。

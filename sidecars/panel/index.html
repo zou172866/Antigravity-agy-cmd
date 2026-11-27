@@ -763,7 +763,7 @@
           aria-pressed="false"
           title="默认关闭。开启后仅对同主版本且通过 SHA-256 校验的 Release 自动静默升级，单版本失败自动熔断，跨大版本仍需手动确认。"
         >自动更新：关</button>
-        <span class="ver-pill">v2.5.2</span>
+        <span class="ver-pill">v2.6.0</span>
       </div>
     </div>
 
@@ -965,7 +965,7 @@
         <label class="toggle-row" id="row-plan-boost" hidden>
           <div class="row-text">
             <b id="plan-boost-label">计划获批后自动使用 Boost</b>
-            <small id="plan-boost-help">默认关闭。按需开启；会员 Boost 接入开启时，点「批准」或回复「按计划执行」即可触发。</small>
+            <small id="plan-boost-help">默认关闭。按需开启；会员 Boost 接入开启时，点「批准」或回复「按计划执行」即可触发（适合单点深度/高耦合计划；多模块独立并行建议改用 <code>/swarm execute our plan</code>）。</small>
           </div>
           <input id="chk-plan-boost" type="checkbox" role="switch" aria-labelledby="plan-boost-label" aria-describedby="plan-boost-help">
         </label>

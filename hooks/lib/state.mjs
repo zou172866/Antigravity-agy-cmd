@@ -30,6 +30,7 @@ export function createDefaultState() {
     lastPlanBoostPromptKey: "",
     freePlan: null,
     deliveryGate: null,
+    swarmActive: false,
     lastTurnUserInputKey: "",
     lastTurnStartTs: 0,
     turnUnattendedGoal: false,

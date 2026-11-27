@@ -3,7 +3,7 @@ name: agy-cmd
 description: Antigravity 桌面端/IDE 高阶能力自动路由与内置斜杠指令参谋。当用户开关全局自动路由、调节自动重试次数或会员/Boost 开关、查询或对比 /grill-me、/plan、/goal、/boost、/run-workflow 等内置指令，或匹配原生工具时使用；禁混入 CLI 专属命令。
 ---
 
-# agy-cmd：高阶能力自动路由器与内置指令参谋（v2.5.2）
+# agy-cmd：高阶能力自动路由器与内置指令参谋（v2.6.0）
 
 本插件提供四项核心能力：
 
@@ -75,17 +75,17 @@ description: Antigravity 桌面端/IDE 高阶能力自动路由与内置斜杠�
 | 任务特征 | 调度轨道与徽标 | Agent 立即执行的动作 |
 | --- | --- | --- |
 | 新功能只有模糊方向，边界未定 | **自动代执行** `[agy-cmd → /grill-me 追问]` | 调用 `ask_question` 每次只问 1 个关键决策问题并置顶 `(Recommended)` 推荐项 |
-| 预计改 ≥3 个文件、变更公共接口或涉及高风险 | **自动代执行** `[agy-cmd → /plan 审批]` | 只读确认范围，批量编辑按文件计。提交 `RequestFeedback: true` 的 `Implementation Plan`，获批后再写项目文件（含 `apply_edits`）。只读 Plan Mode 拒写方案时在正文提交并等待确认。会员开启 Boost 后，收到钩子的计划获批指令时直接调度 Boost 执行并验证。 |
+| 预计改 ≥3 个文件、变更公共接口或涉及高风险 | **自动代执行** `[agy-cmd → /plan 审批]` | 只读确认范围，批量编辑按文件计。提交 `RequestFeedback: true` 的 `Implementation Plan`，获批后再写项目文件（含 `apply_edits`）。只读 Plan Mode 拒写方案时在正文提交并等待确认。获批计划若明显拆分为多个独立模块且在 App 中，可建议衔接 `/swarm execute our plan`；会员开启「计划获批后自动使用 Boost」时，收到钩子的计划获批指令即直接调度 Boost 执行并验证。 |
 | 一项独立的旁支调查 | Subagents | 主线程有可继续做的工作时，通过 `invoke_subagent` 派一个可用角色，写清范围、需回传的路径与证据。主线程据此核对结论。 |
 | ≥5 个同质对象依同一规则检查 | 默认顺序分批；准入后用 `[agy-cmd → /run-workflow]` | 纯匹配用本地命令。进入 Workflow 后读当前宿主的 `run-workflow` 技能。每项 Prompt 带目标、输入、规则、验收与 JSON Schema，逐项捕获异常并返回失败项。共享规则长且对象相关时，可按 3～5 项复用多轮 Worker。编码优先选可用的 `dart-coder`，否则选 `self`。高精度使用 `model="inherit"`；若当前接口靠省略模型参数继承，则省略。 |
-| 2～4 个模块需协商接口并交叉验收 | 默认单写手；准入后用 `[agy-cmd → /swarm]` | 确认接口、每人的写入范围和验收命令后再派活。每 2～4 个 Worker 配 1 个独立 Verifier，可选时用另一模型；检查 Diff、执行项目验证、保留既有断言。共享配置由同一人修改。非 Git 仓库或 Windows 脏工作区优先单写手。 |
+| 可拆成独立 Lane 的多模块协作、并行只读评审/排障或 Best-of-N 择优 | 默认单写手；准入后给 `[agy-cmd → 建议 /swarm]`（含可复制提示词） | **负向否决门**：前后强依赖或紧耦合改动禁止强行并行（反而降质且耗 4～5 倍配额），留在主会话 / Orchestrator 或走 `/boost`。准入后先做 Pre-flight 定接口、各自所有权（`OWNS` / `MUST NOT TOUCH` / `DONE MEANS`）与确定性验证命令；除非用户本轮显式点名直接起 Swarm，否则输出完整可复制 `/swarm` 提示词由用户拉起。若进入活跃 Swarm：先读 `swarm_pane`，Coordinator 不直接改业务代码；3～4 个相似修复可用 `@fix-1..N` 编号池；写入可能重叠时给写手配 `workspace: "share"`（git worktree），合并落地后再 `kill`；每 2～4 个 Worker 配 1 个跨模型 `@verifier`（要求仓库相对路径 + 1-based 行号、禁止删减断言，且 `不阻塞不 @coordinator` 以保持 Coordinator 零 Token 休眠）；长耗时任务可配 `@monitor`；成员配额耗尽（`quota out`）用 `swarm(action:"model")` 切模型保留上下文继续，而非 `kill` 重建。非 Git 仓库或 Windows 脏工作区优先单写手或只读 Swarm。 |
 | 动态网页操作或复杂可视化图表 | `[agy-cmd → /browser]` / `[agy-cmd → /generative_ui]` | 按需委派可用的 `browser`。交互图表仅在支持该入口的 App 使用 `generative_ui`。 |
-| 明确要求排查竞态、死锁等单点疑难，或同一问题跨 ≥2 轮、修改后仍失败 ≥2 次、连续 ≥3 次命令失败 | **按套餐自动派工** | 会员开启 Boost 后，收到 `[agy-cmd → 自动 Boost]` 即直接派一个 `DeepInvestigator` 只读排查，已授权的修复可派 `DeepCoder`。主会话验证结果，角色不可用时接手。免费档或关闭 Boost 时，卡壳可按 `[agy-cmd → 自动换视角排查]` 调用 `dart-reviewer` 或 `research`。 |
+| 明确要求排查竞态、死锁等单点疑难，或同一问题跨 ≥2 轮、连续 ≥3 次命令失败、修改后反复失败（免费档 ≥2 次震荡 / 付费 Boost ≥3 次震荡以给 Orchestrator 留出自愈窗口） | **按套餐自动派工** | 会员开启 Boost 后，收到 `[agy-cmd → 自动 Boost]` 即直接派一个 `DeepInvestigator` 只读排查，已授权的修复可派 `DeepCoder`。主会话验证结果，角色不可用时接手。免费档或关闭 Boost 时，卡壳可按 `[agy-cmd → 自动换视角排查]` 调用 `dart-reviewer` 或 `research`。活跃 Swarm 会话与 Swarm Worker（含 `fork` 分叉）由钩子自动隔离豁免，避免干扰共享留言板与前缀缓存。 |
 | 日常改代码后命令未过 / 要求修错但测试未绿 | **Stop 自动续跑监工** | 免口令免声明：改过源码后命令失败或要求修错但单测/构建未绿时自动拦截续跑；自然问原因（“为什么挂了/分析报错”）、查看状态、环境探测或等待方案审批时自动识别放行 |
 
 对于免费档已获批的实施计划，只有确认主会话已编辑相关源码、能识别对应检查且缺少改后验证证据时，Stop 才在本次允许的续跑额度内提醒补验，最多一次。若用户在面板开启了「交付前强制测试门禁」，则对所有套餐与所有实质改源码的轮次生效：有自定义验证命令或可识别项目测试时，须在最后一次修改后全部通过才放行；无现成测试时保守放行并要求在回复末尾说明缺测项。
 
 ### 模式 C：指令选型参谋与分类速查
 
-1. **按任务选型**。日常留在当前会话；账户已选 Orchestrator 时由其分配规划与执行。单个旁支可派一个 Subagent。单点疑难考虑 Boost；一次横跨独立模块、需协商或互审选 Swarm；同质任务各自返回结构化结果选 Workflow；跨天且需分里程碑审计选 Teamwork。复用已确定的目标、接口和验证方式；需求不清先澄清，涉及多文件按原规则取得计划审批。
+1. **按任务选型**。日常留在当前会话；账户已选 Orchestrator 时由规划模型（默认 Neon）先只读规划、执行模型（默认 Hydrogen）落地，遇阻（如验证失败 2 次）自动交回规划模型修补。单个旁支可派一个 Subagent。单点疑难考虑 Boost；一次横跨独立 Lane、需协商接口/多视角评审/Best-of-N 择优选 Swarm；同质任务各自返回结构化结果选 Workflow；**跑顺且需要高频复用的 Swarm 流程，升格沉淀为 `/run-workflow` 脚本**；跨天且需分里程碑审计选 Teamwork。复用已确定的目标、接口和验证方式；需求不清先 `/grill-me`，多文件先 `/plan` 审批（多模块计划可直接衔接 `/swarm execute our plan`）。
 2. **用户问“这活怎么跑”**。优先给当前宿主及策略可执行的方式、可复制的带 `@` 请求和验收条件。免费或未知档可直接给普通语言模板。用户点名比较重型能力时，可解释其平台和额度条件。需要具体模板或支持端明细，读取 [选型矩阵](references/desktop-commands-matrix.md)。

@@ -5,7 +5,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const SUBAGENT_ROLE_RE =
-  /(?:^|[-_\s/])(?:sub[-_]?agent|worker|research(?:er)?|verifier|review(?:er)?|explor(?:er|e)|audit(?:or)?|investigat(?:or)?)(?:$|[-_\s/])/i;
+  /(?:^|[-_\s/])(?:sub[-_]?agent|worker|research(?:er)?|verifier|review(?:er)?|explor(?:er|e)|audit(?:or)?|investigat(?:or)?|monitor|narrator|swarm[-_]?(?:worker|member))(?:$|[-_\s/])/i;
 
 const SLASH_CMD_RE =
   /(?:^|[\s，。！？、,;!?(\[（`'"「『])\/(boost|goal|plan|teamwork|swarm|run-workflow|grill-me|compact|btw|browser|generative_ui)(?=$|[\s，。！？、,;!?)\]）`'"」』:：])/gi;
@@ -152,11 +152,19 @@ export function isSubagentPayload(payload, env = process.env) {
   if (nonEmptyString(e.ANTIGRAVITY_PARENT_CONVERSATION_ID)) return true;
   const envSub = nonEmptyString(e.ANTIGRAVITY_SUBAGENT).toLowerCase();
   if (envSub === "1" || envSub === "true") return true;
+  const envSwarmWorker = nonEmptyString(e.ANTIGRAVITY_SWARM_WORKER).toLowerCase();
+  if (envSwarmWorker === "1" || envSwarmWorker === "true") return true;
 
   const p = parseHookPayload(payload);
   if (!p) return false;
 
-  if (p.subagent === true || p.isSubagent === true || p.is_subagent === true) {
+  if (
+    p.subagent === true ||
+    p.isSubagent === true ||
+    p.is_subagent === true ||
+    p.swarmWorker === true ||
+    p.swarm_worker === true
+  ) {
     return true;
   }
   if (
@@ -175,6 +183,8 @@ export function isSubagentPayload(payload, env = process.env) {
       p.metadata.subagent === true ||
       p.metadata.isSubagent === true ||
       p.metadata.is_subagent === true ||
+      p.metadata.swarmWorker === true ||
+      p.metadata.swarm_worker === true ||
       nonEmptyString(p.metadata.subagentId) ||
       nonEmptyString(p.metadata.subagent_id) ||
       nonEmptyString(p.metadata.parentConversationId) ||

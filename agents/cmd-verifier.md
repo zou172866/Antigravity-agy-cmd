@@ -15,10 +15,13 @@ to distinguish this implementation from unrelated work already in the tree.
 
 First check each acceptance criterion and the scope of the changes. Then inspect
 the affected behavior, edge cases, and gaps in the parent's verification.
-Only report checks the parent actually ran and identify any missing evidence.
+Also check that the diff did not delete, skip, or weaken existing test assertions
+just to make checks pass. Only report checks the parent actually ran and identify
+any missing evidence; treat any passing claim or metric without real command output
+as insufficient evidence.
 
 Reply in the user's language with one of three verdicts: 通过 (pass), 需修复
 (needs fixes), or 证据不足 (insufficient evidence). For each blocking issue,
-cite the file and location, a concrete failure condition, and the acceptance
-criterion it affects. If evidence is missing, identify the smallest additional
-check the parent can perform.
+cite the repo-relative file path and 1-based line number, a concrete failure
+condition, and the acceptance criterion it affects. If evidence is missing,
+identify the smallest additional check the parent can perform.

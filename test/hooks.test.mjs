@@ -17,10 +17,12 @@ import {
 import {
   classifyToolEvents,
   evaluatePreInvocation,
+  evaluateStop,
   unwrapCliFilterCommand
 } from "../hooks/lib/detector.mjs";
 import { maybeGcStaleSessions, readEvents, readState } from "../hooks/lib/state.mjs";
-import { isSubagentTranscript } from "../hooks/lib/transcript.mjs";
+import { inspectTranscriptTail, isSubagentTranscript } from "../hooks/lib/transcript.mjs";
+import { runSessionStart } from "../hooks/session-start.mjs";
 import { runPostToolUse } from "../hooks/post-tool-use.mjs";
 import { runPreInvocation } from "../hooks/pre-invocation.mjs";
 import { runStop } from "../hooks/stop.mjs";
@@ -40,6 +42,7 @@ function makeEnv(stateDir, extra = {}) {
     AGY_CMD_STATE_DIR: stateDir,
     ANTIGRAVITY_PARENT_CONVERSATION_ID: "",
     ANTIGRAVITY_SUBAGENT: "",
+    ANTIGRAVITY_SWARM_WORKER: "",
     AGY_CMD_UI_ONLY: "",
     ...extra
   };
@@ -2180,4 +2183,267 @@ test("delivery test gate hardening: blocks shell bypasses (|| true, ;), resolves
     await turnIso.stop({ lastUserInput: "解释一下为什么报错？" }, turn2Ts + 100),
     { decision: "allow" }
   );
+});
+
+test("Swarm worker isolation: detects monitor/narrator/swarmWorker payloads and forked <swarm_worker> transcripts without prose false positives", async () => {
+  assert.equal(isSubagentPayload({ conversationId: "w1" }, { ANTIGRAVITY_SWARM_WORKER: "1" }), true);
+  assert.equal(isSubagentPayload({ conversationId: "w1", swarmWorker: true }, {}), true);
+  assert.equal(isSubagentPayload({ conversationId: "w1", metadata: { swarm_worker: true } }, {}), true);
+  assert.equal(isSubagentPayload({ conversationId: "w1", role: "monitor" }, {}), true);
+  assert.equal(isSubagentPayload({ conversationId: "w1", role: "narrator" }, {}), true);
+  assert.equal(isSubagentPayload({ conversationId: "w1", agentRole: "swarm-worker" }, {}), true);
+
+  const dir = makeTmpDir();
+  const env = makeEnv(dir);
+
+  // 1. Small forked worker transcript: starts with coordinator's USER_INPUT, then receives <swarm_worker> SYSTEM_MESSAGE
+  const smallForkTx = path.join(dir, "fork-small.jsonl");
+  fs.writeFileSync(
+    smallForkTx,
+    [
+      JSON.stringify({ step_index: 0, type: "USER_INPUT", content: "/swarm refactor parser" }),
+      JSON.stringify({ step_index: 1, type: "PLANNER_RESPONSE", content: "Splitting into lanes" }),
+      JSON.stringify({
+        step_index: 2,
+        type: "SYSTEM_MESSAGE",
+        content: "<swarm_worker>You are @parser. Own src/parser/** only.</swarm_worker>"
+      })
+    ].join("\n") + "\n",
+    "utf8"
+  );
+  assert.equal(isSubagentTranscript(smallForkTx), true);
+
+  // 2. Giant (>64KB) forked worker transcript: <swarm_worker> arrives past HEAD_READ_BYTES
+  const giantForkTx = path.join(dir, "fork-giant.jsonl");
+  const filler = "x".repeat(8000);
+  const giantLines = [JSON.stringify({ step_index: 0, type: "USER_INPUT", content: "/swarm big run" })];
+  for (let i = 1; i <= 10; i++) {
+    giantLines.push(JSON.stringify({ step_index: i, type: "GENERIC", content: filler }));
+  }
+  giantLines.push(
+    JSON.stringify({
+      step_index: 11,
+      type: "SYSTEM_MESSAGE",
+      content: "You are the swarm's stall monitor. Check board every 3 minutes."
+    })
+  );
+  fs.writeFileSync(giantForkTx, giantLines.join("\n") + "\n", "utf8");
+  assert.equal(isSubagentTranscript(giantForkTx), true);
+
+  // All 4 hooks must stay completely silent on a forked Swarm worker (preserving shared prefix cache)
+  assert.deepEqual(
+    await runSessionStart({ conversationId: "fork-w1", workspacePaths: [dir], transcriptPath: smallForkTx }, env),
+    {}
+  );
+  assert.deepEqual(
+    await runPostToolUse(
+      {
+        conversationId: "fork-w1",
+        transcriptPath: smallForkTx,
+        toolCall: { name: "run_command", args: { CommandLine: "npm test" } },
+        error: "exit status 1"
+      },
+      env,
+      1000
+    ),
+    {}
+  );
+  assert.equal(readEvents(dir, "fork-w1").length, 0);
+  assert.deepEqual(
+    await runPreInvocation(
+      { conversationId: "fork-w1", transcriptPath: smallForkTx, invocationNum: 0, initialNumSteps: 3, lastUserInput: "修复死锁" },
+      env,
+      1010
+    ),
+    {}
+  );
+  assert.deepEqual(
+    await runStop(
+      { conversationId: "fork-w1", transcriptPath: smallForkTx, terminationReason: "NO_TOOL_CALL", fullyIdle: true },
+      env,
+      1020
+    ),
+    { decision: "allow" }
+  );
+
+  // 3. Main session where user/planner merely discuss `<swarm_worker>` in prose must NOT be treated as a subagent
+  const proseTx = path.join(dir, "main-prose.jsonl");
+  fs.writeFileSync(
+    proseTx,
+    [
+      JSON.stringify({ step_index: 0, type: "USER_INPUT", content: "解释一下 <swarm_worker> 标签的作用" }),
+      JSON.stringify({ step_index: 1, type: "PLANNER_RESPONSE", content: "<swarm_worker> 是 Swarm worker 的系统注入标签。" })
+    ].join("\n") + "\n",
+    "utf8"
+  );
+  assert.equal(isSubagentTranscript(proseTx), false);
+});
+
+test("Active /swarm coordinator and native autonomy commands are exempted in PreInvocation & Stop without false positives on prose", async () => {
+  const dir = makeTmpDir();
+  const env = makeEnv(dir);
+  updateSettings(dir, { planTier: "paid", boostEnabled: true, autoRetryMode: "count", autoRetryMax: 3 });
+
+  // 1. Turn 1 invokes /swarm -> state.swarmActive persists across Turn 2 (no /swarm in prompt)
+  const convId = "swarm-coord";
+  const pre1 = await runPreInvocation(
+    { conversationId: convId, invocationNum: 0, initialNumSteps: 1, lastUserInput: "/swarm 修复竞态与多包测试" },
+    env,
+    2000
+  );
+  assert.deepEqual(pre1, {});
+  assert.equal(readState(dir, convId).swarmActive, true);
+
+  await runPostToolUse(
+    { conversationId: convId, toolCall: { name: "edit_file", args: { Path: "src/a.ts" } } },
+    env,
+    2010
+  );
+  await runPostToolUse(
+    { conversationId: convId, toolCall: { name: "run_command", args: { CommandLine: "npm test" } }, error: "exit status 1" },
+    env,
+    2020
+  );
+  // Stop must allow Coordinator to park at 0 tokens / wait on board
+  assert.deepEqual(
+    await runStop(
+      { conversationId: convId, terminationReason: "NO_TOOL_CALL", fullyIdle: true, lastUserInput: "/swarm 修复竞态与多包测试" },
+      env,
+      2030
+    ),
+    { decision: "allow" }
+  );
+
+  // Follow-up turn without `/swarm` stays isolated while swarmActive is true
+  const pre2 = await runPreInvocation(
+    { conversationId: convId, invocationNum: 0, initialNumSteps: 10, lastUserInput: "把 @verifier 切到 Carbon 并继续排查死锁" },
+    env,
+    2040
+  );
+  assert.deepEqual(pre2, {});
+  assert.deepEqual(
+    await runStop(
+      { conversationId: convId, terminationReason: "NO_TOOL_CALL", fullyIdle: true, lastUserInput: "把 @verifier 切到 Carbon 并继续排查死锁" },
+      env,
+      2050
+    ),
+    { decision: "allow" }
+  );
+
+  // /compact resets swarmActive so normal routing resumes
+  await runPreInvocation(
+    { conversationId: convId, invocationNum: 0, initialNumSteps: 20, lastUserInput: "/compact" },
+    env,
+    2060
+  );
+  assert.equal(readState(dir, convId).swarmActive, false);
+
+  // 2. Transcript-only Swarm detection (tool call `swarm` or writing `.system_generated/swarm/plan.json`)
+  const swarmTx = path.join(dir, "coord-tool.jsonl");
+  fs.writeFileSync(
+    swarmTx,
+    [
+      JSON.stringify({ step_index: 0, type: "USER_INPUT", content: "按计划分模块执行" }),
+      JSON.stringify({
+        step_index: 1,
+        type: "PLANNER_RESPONSE",
+        content: "Adding workers",
+        tool_calls: [{ name: "swarm", args: { action: "add", name: "parser" } }]
+      })
+    ].join("\n") + "\n",
+    "utf8"
+  );
+  const tail = inspectTranscriptTail(swarmTx);
+  assert.equal(tail.hasSwarmActivity, true);
+  const stopFromTx = evaluateStop(
+    { terminationReason: "NO_TOOL_CALL", fullyIdle: true, lastUserInput: "继续" },
+    [
+      { ts: 1000, kind: "edit", files: ["src/a.ts"] },
+      { ts: 1010, kind: "cmd", cmd: "npm test", failed: true, isVerify: true }
+    ],
+    null,
+    { transcriptTail: tail, settings: { autoRetryMode: "count", autoRetryMax: 3 } }
+  );
+  assert.equal(stopFromTx.decision, "allow");
+  assert.equal(stopFromTx.reasonCode, "native_autonomy_active");
+
+  // 3. Leading /teamwork, /boost, /run-workflow allow Stop; /goal preserves native_goal_active
+  const failEvs = [
+    { ts: 1000, kind: "edit", files: ["src/a.ts"] },
+    { ts: 1010, kind: "cmd", cmd: "npm test", failed: true, isVerify: true }
+  ];
+  for (const cmd of ["/teamwork migrate api", "/boost fix deadlock", "/run-workflow audit packages"]) {
+    const res = evaluateStop(
+      { terminationReason: "NO_TOOL_CALL", fullyIdle: true, lastUserInput: cmd },
+      failEvs,
+      null,
+      { settings: { autoRetryMode: "count", autoRetryMax: 3 } }
+    );
+    assert.equal(res.decision, "allow", cmd);
+    assert.equal(res.reasonCode, "native_autonomy_active", cmd);
+  }
+  const goalRes = evaluateStop(
+    { terminationReason: "NO_TOOL_CALL", fullyIdle: true, lastUserInput: "/goal fix tests" },
+    failEvs,
+    null,
+    { settings: { autoRetryMode: "count", autoRetryMax: 3 } }
+  );
+  assert.equal(goalRes.decision, "allow");
+  assert.equal(goalRes.reasonCode, "native_goal_active");
+
+  // 4. Mid-sentence mention of `/swarm` must NOT disable Stop auto-retry on an ordinary edit turn
+  const proseMentionStop = evaluateStop(
+    { terminationReason: "NO_TOOL_CALL", fullyIdle: true, lastUserInput: "帮我修一下 test，不要用 /swarm" },
+    failEvs,
+    null,
+    { settings: { autoRetryMode: "count", autoRetryMax: 3 } }
+  );
+  assert.equal(proseMentionStop.decision, "continue");
+  assert.equal(proseMentionStop.reasonCode, "auto_continue");
+});
+
+test("Paid Boost requires 3 edit<->fail oscillations (leaving Orchestrator 2-failure replan room), while free fallback stays at 2", async () => {
+  const paidSettings = { planTier: "paid", boostEnabled: true, boostAfterPlanApproval: false };
+  const freeSettings = { planTier: "free", boostEnabled: false };
+
+  const twoCycles = [
+    { ts: 1000, kind: "edit", files: ["src/pay.ts"], applied: true },
+    { ts: 1010, kind: "cmd", cmd: "npm test", failed: true, isVerify: true, terminal: true },
+    { ts: 1020, kind: "edit", files: ["src/pay.ts"], applied: true },
+    { ts: 1030, kind: "cmd", cmd: "npm test", failed: true, isVerify: true, terminal: true }
+  ];
+  const threeCycles = [
+    ...twoCycles,
+    { ts: 1040, kind: "edit", files: ["src/pay.ts"], applied: true },
+    { ts: 1050, kind: "cmd", cmd: "npm test", failed: true, isVerify: true, terminal: true }
+  ];
+
+  // Free tier escalates at 2 oscillations
+  const freeAt2 = evaluatePreInvocation(
+    { invocationNum: 1, initialNumSteps: 10, lastUserInput: "修一下 pay 测试" },
+    twoCycles,
+    null,
+    { settings: freeSettings }
+  );
+  assert.equal(freeAt2.reasonCode, "free_stuck_fallback");
+
+  // Paid Boost holds off at 2 oscillations (Orchestrator native Neon hand-back window)
+  const paidAt2 = evaluatePreInvocation(
+    { invocationNum: 1, initialNumSteps: 10, lastUserInput: "修一下 pay 测试" },
+    twoCycles,
+    null,
+    { settings: paidSettings }
+  );
+  assert.equal(paidAt2.reasonCode, "steady_state");
+  assert.equal(paidAt2.injectStep, null);
+
+  // Paid Boost escalates cleanly on 3rd oscillation
+  const paidAt3 = evaluatePreInvocation(
+    { invocationNum: 2, initialNumSteps: 12, lastUserInput: "修一下 pay 测试" },
+    threeCycles,
+    paidAt2.nextState,
+    { settings: paidSettings }
+  );
+  assert.equal(paidAt3.reasonCode, "auto_boost");
+  assert.match(paidAt3.injectStep.systemMessage.systemMessage, /TypeName='DeepCoder'/);
 });
