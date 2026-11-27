@@ -27,11 +27,115 @@ export function pathKey(p) {
   return process.platform === "win32" ? p.toLowerCase() : p;
 }
 
-export function deliveryEventOrder(ev, idx = 0) {
-  if (Number.isSafeInteger(ev?.stepIdx) && ev.stepIdx >= 0) return ev.stepIdx;
-  const ts = Number(ev?.ts);
-  if (Number.isFinite(ts) && ts > 0) return Math.floor(ts) * 1000 + Math.min(999, Math.max(0, idx));
-  return idx;
+export function deliveryEventOrder(ev) {
+  return {
+    stepIdx: Number.isSafeInteger(ev?.stepIdx) && ev.stepIdx >= 0 ? ev.stepIdx : null,
+    ts: Number.isFinite(ev?.ts) && ev.ts > 0 ? ev.ts : null,
+    sub: ev?.tool === "apply_edits:verify" ? 1 : 0,
+    ...(ev?.inlineBatch ? { inlineBatch: ev.inlineBatch } : {})
+  };
+}
+
+function asDeliveryOrder(order) {
+  if (order && typeof order === "object") return order;
+  if (!Number.isSafeInteger(order) || order < 0) return null;
+  // Older versions stored either a host index or epoch milliseconds * 1000 + log offset.
+  // A large legacy time can supply milliseconds only; its log offset is not a causal tie breaker.
+  return order >= 1e14
+    ? { stepIdx: null, ts: Math.floor(order / 1000), sub: 0 }
+    : { stepIdx: order, ts: null, sub: 0 };
+}
+
+export function compareDeliveryOrder(left, right) {
+  const a = asDeliveryOrder(left);
+  const b = asDeliveryOrder(right);
+  if (!a || !b) return null;
+  if (a.stepIdx != null && b.stepIdx != null) {
+    if (a.stepIdx !== b.stepIdx) return Math.sign(a.stepIdx - b.stepIdx);
+    if (a.sub !== b.sub) return Math.sign(a.sub - b.sub);
+    return a.ts != null && b.ts != null ? Math.sign(a.ts - b.ts) : 0;
+  }
+  if (a.ts == null || b.ts == null) return null;
+  if (a.ts !== b.ts) return Math.sign(a.ts - b.ts);
+  if (a.inlineBatch && a.inlineBatch === b.inlineBatch && a.sub !== b.sub) {
+    return Math.sign(a.sub - b.sub);
+  }
+  return null;
+}
+
+export function deliveryEditOrders(scope) {
+  if (scope?.editOrders?.length) return scope.editOrders;
+  const order = asDeliveryOrder(scope?.editOrder ?? scope?.editStep);
+  return order ? [order] : [];
+}
+
+function sameOrder(a, b) {
+  return a.stepIdx === b.stepIdx && a.ts === b.ts && a.sub === b.sub && a.inlineBatch === b.inlineBatch;
+}
+
+function dominatesBoundary(kept, dropped) {
+  // An indexed future receipt compares host steps; an unindexed one compares clocks.
+  // Neither comparison alone can discard an edit needed by the other kind of receipt.
+  if ((kept.stepIdx == null) !== (dropped.stepIdx == null)) return false;
+  const cmp = compareDeliveryOrder(kept, dropped);
+  if (cmp !== 0 && cmp !== 1) return false;
+  return kept.stepIdx == null || kept.ts == null || (dropped.ts != null && kept.ts >= dropped.ts);
+}
+
+function addEditBoundary(existing, order) {
+  if (existing.some(old => sameOrder(order, old) || dominatesBoundary(old, order))) return existing;
+  return [...existing.filter(old => !dominatesBoundary(order, old)), order];
+}
+
+function receiptCoversEdits(receipt, edits) {
+  return receipt && edits.every(edit => {
+    const cmp = compareDeliveryOrder(receipt.order ?? receipt.step, edit);
+    return cmp === 0 || cmp === 1;
+  });
+}
+
+// When the relative order of a pass and a failure is unknown, retain the failure.
+function receiptFrontier(receipt) {
+  if (!receipt) return [];
+  const order = asDeliveryOrder(receipt.order ?? receipt.step);
+  return order ? [{ order, passed: receipt.passed }, ...(receipt.otherReceipts || [])] : [];
+}
+
+function mergeReceipt(current, candidate) {
+  const frontier = receiptFrontier(current);
+  for (const record of receiptFrontier(candidate)) {
+    if (frontier.some(old => {
+      const cmp = compareDeliveryOrder(record.order, old.order);
+      return cmp === -1 || ((cmp === 0 || sameOrder(record.order, old.order)) && (!old.passed || record.passed));
+    })) continue;
+    for (let i = frontier.length - 1; i >= 0; i--) {
+      const cmp = compareDeliveryOrder(record.order, frontier[i].order);
+      if (cmp === 1 || cmp === 0 || sameOrder(record.order, frontier[i].order)) frontier.splice(i, 1);
+    }
+    frontier.push(record);
+  }
+  const [first, ...others] = frontier;
+  if (!first) return current;
+  const merged = { ...candidate, ...first };
+  delete merged.step;
+  delete merged.otherReceipts;
+  if (others.length) merged.otherReceipts = others;
+  return merged;
+}
+
+function receiptStatus(receipt, edits) {
+  const records = receiptFrontier(receipt);
+  let passed = false;
+  let pendingFailure = false;
+  for (const record of records) {
+    if (receiptCoversEdits(record, edits)) {
+      if (!record.passed) return "failed";
+      passed = true;
+    } else if (!record.passed && !edits.some(edit => compareDeliveryOrder(edit, record.order) === 1)) {
+      pendingFailure = true;
+    }
+  }
+  return passed && !pendingFailure ? "passed" : "pending";
 }
 
 export function planPreferences(text) {
@@ -214,6 +318,41 @@ export function requestedProjectCheck(text, roots) {
   return cmds.length === 1 ? { scope: location(roots[0]), command: cmds[0] } : null;
 }
 
+function recordEditedFile(files, file, rawFile, scope, pkg) {
+  const key = canonicalTestFileKey(file);
+  if (files.some(item => item.key === key)) return;
+  if (files.length < 33) files.push({ key, path: normalizeRelativeAuditPath(rawFile), scope, pkg });
+}
+
+function fileEvidence(tool, files, ignored = []) {
+  if (tool !== "apply_edits") return {};
+  return {
+    editedFiles: files.slice(0, 32),
+    ...(files.length > 32 ? { filesTruncated: true } : {}),
+    ...(ignored.length ? { ignoredFiles: ignored.slice(0, 32) } : {})
+  };
+}
+
+function collectIgnoredSourceFiles(args, cwd, findRoot, recorded) {
+  const edits = decoded(args.edits);
+  if (!Array.isArray(edits)) return [];
+  const seen = new Set(recorded.map(item => item.key));
+  const ignored = [];
+  for (const edit of edits) {
+    if (!edit || typeof edit !== "object") continue;
+    const rawFile = decoded(edit.path);
+    if (typeof rawFile !== "string" || !(SOURCE.test(rawFile) || RUNTIME_CONFIG.test(rawFile))) continue;
+    const file = location(rawFile, cwd);
+    const root = file && findRoot(file);
+    if (!root || EXAMPLE.test(path.relative(root, file))) continue;
+    const key = canonicalTestFileKey(file);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    if (ignored.length < 32) ignored.push({ key, path: normalizeRelativeAuditPath(rawFile) });
+  }
+  return ignored;
+}
+
 // Bind scope at dispatch time (background checks may finish after later edits).
 // Keep no source snippets or arbitrarily user-supplied shell strings on disk.
 export function planToolEvidence(plan, tool, args, payload, command) {
@@ -228,6 +367,7 @@ export function planToolEvidence(plan, tool, args, payload, command) {
   const packages = new Map();
   let wroteSource = false;
   const edited = new Map();
+  const files = [];
   for (const edit of codePaths(tool, args, Boolean(plan.requested))) {
     const file = location(edit.file, cwd);
     const root = file && findRoot(file);
@@ -238,6 +378,7 @@ export function planToolEvidence(plan, tool, args, payload, command) {
     wroteSource = true;
     const pkg = requested ?? detected;
     if (pkg && edit.canRequireCheck) edited.set(pkg.scope, pkg);
+    if (tool === "apply_edits") recordEditedFile(files, file, edit.file, pkg?.scope || root, edit.canRequireCheck ? pkg : null);
   }
 
   let commands = [];
@@ -262,7 +403,10 @@ export function planToolEvidence(plan, tool, args, payload, command) {
   const pkg = checkRoot && (projectFor(runDir, checkRoot, packages) ??
     (runDir === plan.requested?.scope ? plan.requested : null));
   const checked = pkg && pkg.scope === runDir ? { scope: pkg.scope, command: check } : null;
-  return wroteSource || checked ? { key: plan.key, wroteSource, edited: [...edited.values()], checked } : null;
+  const ignored = tool === "apply_edits" && wroteSource ? collectIgnoredSourceFiles(args, cwd, findRoot, files) : [];
+  return wroteSource || checked
+    ? { key: plan.key, wroteSource, edited: [...edited.values()], ...fileEvidence(tool, files, ignored), checked }
+    : null;
 }
 
 // Store one edit watermark and the most recent terminal result per package.
@@ -273,6 +417,7 @@ export function advancePlan(plan, events) {
   for (const ev of events) {
     const data = ev.planEvidence;
     if (data?.key !== plan.key || ev.pending || ev.backgroundRunning) continue;
+    if (ev.kind === "edit") updateUnattributedWrites(next, data, ev);
     const step = Number.isSafeInteger(ev.stepIdx) && ev.stepIdx >= 0 ? ev.stepIdx : null;
     if (step === null) continue;
     if (ev.kind === "edit" && ev.applied && !ev.failed && !ev.hasArtifactMeta && !ev.looksLikePlanPath && data.wroteSource) {
@@ -650,6 +795,7 @@ export function deliveryGateToolEvidence(gate, tool, args, payload, command, cus
 
   let wroteSource = false;
   const edited = new Map();
+  const files = [];
   for (const edit of codePaths(tool, args, true, { delivery: true })) {
     const file = location(edit.file, cwd);
     const root = file && findRoot(file);
@@ -659,12 +805,8 @@ export function deliveryGateToolEvidence(gate, tool, args, payload, command, cus
       Boolean(gate.requested && pathKey(gate.requested.scope) === pathKey(pkg.scope));
     if (RUNTIME_CONFIG.test(file) && !hasConfiguredCheck) continue;
     wroteSource = true;
-    edited.set(pathKey(pkg.scope), {
-      scope: pkg.scope,
-      root: pkg.root,
-      command: pkg.command,
-      family: pkg.family
-    });
+    edited.set(pathKey(pkg.scope), pkg);
+    if (tool === "apply_edits") recordEditedFile(files, file, edit.file, pkg.scope, pkg);
   }
 
   const rawEntries = [];
@@ -724,10 +866,12 @@ export function deliveryGateToolEvidence(gate, tool, args, payload, command, cus
   }
 
   if (!wroteSource && checked.length === 0) return null;
+  const ignored = tool === "apply_edits" && wroteSource ? collectIgnoredSourceFiles(args, cwd, findRoot, files) : [];
   return {
     key: gate.key,
     wroteSource,
     edited: [...edited.values()],
+    ...fileEvidence(tool, files, ignored),
     checked
   };
 }
@@ -749,13 +893,15 @@ export function advanceDeliveryGate(gate, events, customCommand = "") {
     customReceipts: { ...(gate.customReceipts || {}) }
   };
 
-  let progressStep = Number.isSafeInteger(next.lastProgressStep) ? next.lastProgressStep : -1;
+  const previousProgress = next.progressOrders || [asDeliveryOrder(next.lastProgressStep)].filter(Boolean);
+  let progress = previousProgress;
 
   for (let i = 0; i < events.length; i++) {
     const ev = events[i];
     const data = ev?.deliveryEvidence;
     if (!data || data.key !== gate.key || ev.pending || ev.backgroundRunning) continue;
-    const step = deliveryEventOrder(ev, i);
+    const order = deliveryEventOrder(ev);
+    if (ev.kind === "edit") updateUnattributedWrites(next, data, ev);
 
     if (
       ev.kind === "edit" &&
@@ -766,14 +912,19 @@ export function advanceDeliveryGate(gate, events, customCommand = "") {
       data.wroteSource
     ) {
       next.wroteSource = true;
-      if (step > progressStep) progressStep = step;
+      progress = addEditBoundary(progress, order);
       for (const ed of data.edited || []) {
         const sKey = pathKey(ed.scope);
         const prev = next.scopes[sKey] || {};
-        const scope = { ...prev };
-        if (scope.editStep === undefined || step >= scope.editStep) {
+        const existing = deliveryEditOrders(prev);
+        const boundaries = addEditBoundary(existing, order);
+        if (boundaries !== existing) {
+          const scope = { ...prev };
           scope.dir = ed.scope;
-          scope.editStep = step;
+          delete scope.editStep;
+          scope.editOrder = order;
+          if (boundaries.length > 1) scope.editOrders = boundaries;
+          else delete scope.editOrders;
           scope.root = ed.root;
           scope.declared = ed.command || "";
           scope.family = ed.family || "";
@@ -789,30 +940,22 @@ export function advanceDeliveryGate(gate, events, customCommand = "") {
         if (entry.autoKey) {
           const prevScope = next.scopes[dKey] || {};
           const autoChecks = { ...(prevScope.autoChecks || {}) };
-          const prevRec = autoChecks[entry.autoKey];
-          if (!prevRec || step >= prevRec.step) {
-            autoChecks[entry.autoKey] = { step, passed: !ev.failed };
-            next.scopes[dKey] = { ...prevScope, dir: prevScope.dir || entry.runDir, autoChecks };
-          }
-          if (step > progressStep) progressStep = step;
+          autoChecks[entry.autoKey] = mergeReceipt(autoChecks[entry.autoKey], { order, passed: !ev.failed });
+          next.scopes[dKey] = { ...prevScope, dir: prevScope.dir || entry.runDir, autoChecks };
+          progress = addEditBoundary(progress, order);
         }
         if (customSpec && Array.isArray(entry.segments) && entry.segments.length > 0) {
           for (const segKey of entry.segments) {
             if (!segKey) continue;
             const rKey = `${dKey}\0${segKey}`;
-            const prevRec = next.customReceipts[rKey];
-            if (!prevRec || step >= prevRec.step) {
-              next.customReceipts[rKey] = {
+            next.customReceipts[rKey] = mergeReceipt(next.customReceipts[rKey], {
                 runDir: entry.runDir,
                 root: entry.root || "",
                 segKey,
-                step,
+                order,
                 passed: !ev.failed
-              };
-            }
-            if (customKeySet && customKeySet.has(segKey) && step > progressStep) {
-              progressStep = step;
-            }
+            });
+            if (customKeySet?.has(segKey)) progress = addEditBoundary(progress, order);
           }
         }
       }
@@ -826,13 +969,14 @@ export function advanceDeliveryGate(gate, events, customCommand = "") {
       const aMatch = customKeySet && customKeySet.has(a[1]?.segKey) ? 1 : 0;
       const bMatch = customKeySet && customKeySet.has(b[1]?.segKey) ? 1 : 0;
       if (aMatch !== bMatch) return bMatch - aMatch;
-      return (b[1]?.step ?? -1) - (a[1]?.step ?? -1);
+      return compareDeliveryOrder(b[1].order ?? b[1].step, a[1].order ?? a[1].step) ?? 0;
     });
     next.customReceipts = Object.fromEntries(receiptEntries.slice(0, MAX_CUSTOM_RECEIPTS));
   }
 
-  if (progressStep > (Number.isSafeInteger(next.lastProgressStep) ? next.lastProgressStep : -1)) {
-    next.lastProgressStep = progressStep;
+  if (JSON.stringify(progress) !== JSON.stringify(previousProgress)) {
+    next.progressOrders = progress;
+    delete next.lastProgressStep;
     next.consecutiveNoTestNudges = 0;
   }
 
@@ -843,15 +987,17 @@ export function evaluateDeliveryGateStatus(gate, customCommand = "") {
   const pendingChecks = [];
   const failedChecks = [];
   const untestedScopes = [];
+  const unattributedWrites = gate?.unattributedWrites || [];
   if (!gate || !gate.wroteSource) {
-    return { pendingChecks, failedChecks, untestedScopes, allPassed: true };
+    return { pendingChecks, failedChecks, untestedScopes, unattributedWrites, allPassed: !unattributedWrites.length };
   }
 
   const customSpec = parseCustomCheckSpec(customCommand);
   const receipts = Object.values(gate.customReceipts || {});
 
   for (const [sKey, scope] of Object.entries(gate.scopes || {})) {
-    if (scope.editStep === undefined) continue;
+    const edits = deliveryEditOrders(scope);
+    if (!edits.length) continue;
     const dir = scope.dir || sKey;
     const scopeDirKey = pathKey(dir);
     const scopeRootKey = pathKey(scope.root || "");
@@ -869,13 +1015,11 @@ export function evaluateDeliveryGateStatus(gate, customCommand = "") {
             ? rDirKey === expectedSubDirKey
             : rDirKey === scopeDirKey || (rDirKey === scopeRootKey && inside(r.runDir, dir));
           if (!scopeMatches) continue;
-          if (!best || r.step >= best.step) best = r;
+          best = mergeReceipt(best, r);
         }
-        if (best && best.step >= scope.editStep) {
-          if (!best.passed) failedSegs.push(seg.raw);
-        } else {
-          missingSegs.push(seg.raw);
-        }
+        const status = receiptStatus(best, edits);
+        if (status === "failed") failedSegs.push(seg.raw);
+        if (status === "pending") missingSegs.push(seg.raw);
       }
       if (failedSegs.length > 0) {
         const label =
@@ -909,13 +1053,11 @@ export function evaluateDeliveryGateStatus(gate, customCommand = "") {
             if (!r || r.segKey !== seg.key) continue;
             const rDirKey = pathKey(r.runDir);
             if (rDirKey !== scopeDirKey && !(rDirKey === scopeRootKey && inside(r.runDir, dir))) continue;
-            if (!best || r.step >= best.step) best = r;
+            best = mergeReceipt(best, r);
           }
-          if (best && best.step >= scope.editStep) {
-            if (!best.passed) failedSegs.push(seg.raw);
-          } else {
-            missingSegs.push(seg.raw);
-          }
+          const status = receiptStatus(best, edits);
+          if (status === "failed") failedSegs.push(seg.raw);
+          if (status === "pending") missingSegs.push(seg.raw);
         }
         if (failedSegs.length > 0) {
           failedChecks.push({
@@ -939,11 +1081,10 @@ export function evaluateDeliveryGateStatus(gate, customCommand = "") {
 
     const expectedKey = autoCheckCanonicalKey(expectedCmd);
     const receipt = expectedKey ? scope.autoChecks?.[expectedKey] : null;
-    if (receipt && receipt.step >= scope.editStep) {
-      if (!receipt.passed) {
-        failedChecks.push({ dir, command: expectedCmd, failed: true, isCustom: false });
-      }
-    } else {
+    const status = receiptStatus(receipt, edits);
+    if (status === "failed") {
+      failedChecks.push({ dir, command: expectedCmd, failed: true, isCustom: false });
+    } else if (status === "pending") {
       pendingChecks.push({ dir, command: expectedCmd, failed: false, isCustom: false });
     }
   }
@@ -952,7 +1093,8 @@ export function evaluateDeliveryGateStatus(gate, customCommand = "") {
     pendingChecks,
     failedChecks,
     untestedScopes,
-    allPassed: pendingChecks.length === 0 && failedChecks.length === 0
+    unattributedWrites,
+    allPassed: pendingChecks.length === 0 && failedChecks.length === 0 && unattributedWrites.length === 0
   };
 }
 
@@ -1452,23 +1594,10 @@ export function detectTestAssertionWeakening(tool, args, options = {}) {
   };
 }
 
-/**
- * Filter a batch's test-weakening summary by the files confirmed written in a
- * `Partial edit applied` receipt. If the receipt only reports total counts (no
- * confirmed file list), conservatively return null (unknown attribution).
- */
-export function filterTestWeakeningByAppliedFiles(weakening, details, partialReceipt, cwd = "") {
-  if (!weakening) return null;
-  if (!partialReceipt || !partialReceipt.isPartial) return weakening;
-  if (!Array.isArray(partialReceipt.appliedFiles) || partialReceipt.appliedFiles.length === 0) {
-    return null;
-  }
-  if (!Array.isArray(details) || details.length === 0) {
-    return null;
-  }
-
+export function matchAppliedFileEntries(details, appliedFiles, cwd = "", exactOnly = false) {
   const matched = new Set();
-  for (const rawApplied of partialReceipt.appliedFiles) {
+  const unmatched = [];
+  for (const rawApplied of appliedFiles) {
     const normApplied = normalizeRelativeAuditPath(rawApplied);
     if (!normApplied) continue;
     const appliedKey = canonicalTestFileKey(rawApplied, cwd);
@@ -1491,7 +1620,10 @@ export function filterTestWeakeningByAppliedFiles(weakening, details, partialRec
       matched.add(exactHits[0]);
       continue;
     }
-    if (exactHits.length > 1) continue;
+    if (exactHits.length > 1 || exactOnly) {
+      unmatched.push(rawApplied);
+      continue;
+    }
 
     // 2. Unambiguous path-segment suffix match when one side is absolute and the other relative
     const suffixHits = [];
@@ -1508,8 +1640,82 @@ export function filterTestWeakeningByAppliedFiles(weakening, details, partialRec
     }
     if (suffixHits.length === 1) {
       matched.add(suffixHits[0]);
+    } else {
+      unmatched.push(rawApplied);
     }
   }
+  return { matched, unmatched };
+}
+
+function partialEvidence(data, partial, cwd, order) {
+  const entries = data.editedFiles || [];
+  const paths = partial.appliedFiles || [];
+  const { matched, unmatched } = matchAppliedFileEntries(entries, paths, cwd, data.filesTruncated);
+  const remainingUnmatched = unmatched.length && data.ignoredFiles?.length
+    ? matchAppliedFileEntries(data.ignoredFiles, unmatched, cwd, data.filesTruncated).unmatched
+    : unmatched;
+  const confirmed = [...matched].map(index => entries[index]);
+  const edited = new Map(confirmed.filter(item => item.pkg).map(item => [pathKey(item.pkg.scope), item.pkg]));
+  const scopes = new Set([...entries.map(item => item.scope), ...(data.edited || []).map(item => item.scope)]);
+  const unresolved = partial.writtenCount !== 0 && (data.wroteSource || entries.length > 0) && (
+    (partial.writtenCount == null ? paths.length === 0 : partial.writtenCount > paths.length) ||
+    remainingUnmatched.some(file => !EXAMPLE.test(file) && (SOURCE.test(file) || RUNTIME_CONFIG.test(file)))
+  );
+  const updated = {
+    ...data, attempted: { wroteSource: data.wroteSource, edited: data.edited || [] },
+    wroteSource: confirmed.length > 0, edited: [...edited.values()]
+  };
+  if (unresolved) {
+    updated.unattributedWrites = [{ order, writtenCount: partial.writtenCount, candidateScopes: [...scopes].sort() }];
+  }
+  return updated;
+}
+
+// Both a freshly delivered receipt and its transcript/cache replay use the same file attribution.
+export function applyEditReceipt(fields, partial, applied, cwd, event) {
+  if (!fields.planEvidence && !fields.deliveryEvidence) return {};
+  const result = { applied: Boolean(applied) };
+  let unknown;
+  for (const key of ["planEvidence", "deliveryEvidence"]) {
+    if (!fields[key]) continue;
+    let data = fields[key];
+    if (data.attempted) {
+      const { attempted, unattributedWrites, ...original } = data;
+      data = { ...original, ...attempted };
+    }
+    if (partial?.isPartial) data = partialEvidence(data, partial, cwd, deliveryEventOrder(event));
+    result[key] = data;
+    if (data.unattributedWrites) unknown = data.unattributedWrites;
+  }
+  if (partial?.isPartial) {
+    result.applied = Boolean(result.planEvidence?.wroteSource || result.deliveryEvidence?.wroteSource);
+    result.partialReceipt = partial;
+  } else if (event.partialReceipt) {
+    result.partialReceipt = null;
+  }
+  if (unknown) result.unattributedWrites = unknown;
+  else if (event.unattributedWrites) result.unattributedWrites = [];
+  return result;
+}
+
+function updateUnattributedWrites(ledger, evidence, event) {
+  const order = deliveryEventOrder(event);
+  const existing = ledger.unattributedWrites || [];
+  // A later richer receipt for this operation can resolve an earlier counts-only report.
+  const others = existing.filter(item => !(order.stepIdx != null && item.order?.stepIdx === order.stepIdx));
+  const records = event.failed ? [] : evidence.unattributedWrites || [];
+  for (const record of records) {
+    if (!others.some(item => sameOrder(record.order, item.order) && item.writtenCount === record.writtenCount &&
+        item.candidateScopes.join("\0") === record.candidateScopes.join("\0"))) others.push(record);
+  }
+  if (others.length || existing.length) ledger.unattributedWrites = others;
+}
+
+export function filterTestWeakeningByAppliedFiles(weakening, details, partialReceipt, cwd = "") {
+  if (!weakening) return null;
+  if (!partialReceipt?.isPartial) return weakening;
+  if (!details?.length || !partialReceipt.appliedFiles?.length) return null;
+  const { matched } = matchAppliedFileEntries(details, partialReceipt.appliedFiles, cwd);
 
   let addedSkip = 0;
   let droppedAssert = 0;

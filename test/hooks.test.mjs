@@ -20,6 +20,7 @@ import {
   evaluatePreInvocation,
   evaluatePreToolUse,
   evaluateStop,
+  reconcileEventsWithTranscript,
   unwrapCliFilterCommand
 } from "../hooks/lib/detector.mjs";
 import { maybeGcStaleSessions, readEvents, readState } from "../hooks/lib/state.mjs";
@@ -31,9 +32,14 @@ import { runPreInvocation } from "../hooks/pre-invocation.mjs";
 import { runStop } from "../hooks/stop.mjs";
 import { readSettings, updateSettings } from "../hooks/lib/settings.mjs";
 import {
+  advanceDeliveryGate,
+  advancePlan,
   allowsTestWeakening,
+  compareDeliveryOrder,
   detectTestAssertionWeakening,
+  evaluateDeliveryGateStatus,
   isTestFilePath,
+  pendingPlanChecks,
   planPreferences,
   requestedProjectCheck
 } from "../hooks/lib/plan-verification.mjs";
@@ -598,6 +604,41 @@ test("benign search exit-1 (rg/grep) and read-only MCP calls never trigger failu
     2100
   );
   assert.deepEqual(out, {});
+});
+
+test("PowerShell NativeCommandError accepts only a complete green test summary on exit 1", () => {
+  // Reduced transcript from the Windows PowerShell background run. unittest writes progress to stderr.
+  const progress = "    + CategoryInfo          : NotSpecified: (...............:String) [], RemoteException\r\n    + FullyQualifiedErrorId : NativeCommandError";
+  const node = "✔ star-6: Sidecar UI retries transient failures on header re-click\nℹ pass 85\nℹ fail 0\nℹ cancelled 0\nℹ skipped 0\nℹ todo 0\nℹ duration_ms 2391.5253";
+  const python = "----------------------------------------------------------------------\r\nRan 15 tests in 8.552s\r\nOK";
+  const mixed = [node, progress, python].join("\r\n");
+  const command = { name: "run_command", args: { CommandLine: "npm test; python -m unittest discover 2>&1 | Select-Object -Last 20" } };
+  function receipt(body, code = 1) {
+    return "Command exited with code " + code + ".\n\nCommand output:\n" + body;
+  }
+  function outcome(body, code, extra) {
+    return classifyToolEvents({ toolCall: command, toolResponse: receipt(body, code), ...extra })[0];
+  }
+  for (const body of [mixed, progress + "\n" + node, progress + "\n" + python + " (skipped=2)",
+    progress + "\n# pass 1\n# fail 0\n# cancelled 0\n# duration_ms 9"]) {
+    assert.equal(outcome(body).failed, false, body);
+  }
+  for (const body of [node + "\n" + progress + "\nRan 2 tests in 0.1s\nFAILED (failures=1)",
+    "ℹ fail 1\n" + progress + "\n" + python, "not ok 2 - bad result\n" + mixed,
+    "Traceback (most recent call last):\n" + mixed, "\x1b[31mℹ fail 1\x1b[0m\n" + mixed,
+    "Bail out! worker exited\n" + mixed, "Process exited with status 2\n" + mixed, "Exit code: 127\n" + mixed,
+    progress + "\n" + node + "\nℹ cancelled 1",
+    "ERROR: failed to import test\n" + mixed, progress + "\n" + node + "\nstarting another suite",
+    python, "OK", progress + "\nOK"]) {
+    assert.equal(outcome(body).failed, true, body);
+  }
+  assert.equal(outcome(mixed, 2).failed, true);
+  assert.equal(outcome(mixed, 127).failed, true);
+  assert.equal(outcome(mixed, 1, { error: "Permission denied" }).failed, true);
+  assert.equal(outcome(mixed, 1, { toolCall: { name: "run_command", args: { CommandLine: "git status" } } }).failed, true);
+  const [pending] = classifyToolEvents({ stepIdx: 37, toolCall: command }, 1000, { hasTranscriptPath: true });
+  const tail = { taskResultsByStepIdx: new Map([[37, { text: receipt(mixed) + "\n\nLog: file:///temp/task.log\n</SYSTEM_MESSAGE>" }]]) };
+  assert.equal(reconcileEventsWithTranscript([pending], tail).resolvedEvents[0].failed, false);
 });
 
 test("Trigger 1: Plan Mode read-only write_file refusal injects immediate inline-plan fallback once", async () => {
@@ -1189,10 +1230,12 @@ test("fenced code blocks containing trigger phrases do not false-fire /goal or /
   assert.deepEqual(out, {});
 });
 
-test("PLUGIN_DATA env var is used by hooks when AGY_CMD_STATE_DIR is unset", () => {
+test("PLUGIN_DATA env var is used by hooks when AGY_CMD_STATE_DIR is unset", (t) => {
   const dir = makeTmpDir("agy-cmd-plugin-data-");
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const env = {
     ...process.env,
+    AGY_CMD_DEV_ROOT: PLUGIN_ROOT,
     PLUGIN_DATA: dir,
     AGY_CMD_STATE_DIR: "",
     ANTIGRAVITY_PARENT_CONVERSATION_ID: "",
@@ -1694,8 +1737,9 @@ test("unwrapUserRequestText strips <ADDITIONAL_METADATA> so expanded slash promp
   assert.deepEqual(out, {});
 });
 
-test("hooks.json cross-workspace bootstrapper executes all 4 hooks cleanly from a foreign workspace CWD", () => {
+test("hooks.json cross-workspace bootstrapper executes all five hooks from a foreign workspace", (t) => {
   const dir = makeTmpDir("agy-cmd-foreign-cwd-");
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const foreignWs = path.join(dir, "business-repo");
   const stateDir = path.join(dir, "state");
   fs.mkdirSync(foreignWs, { recursive: true });
@@ -1711,6 +1755,7 @@ test("hooks.json cross-workspace bootstrapper executes all 4 hooks cleanly from 
     ANTIGRAVITY_PARENT_CONVERSATION_ID: "",
     ANTIGRAVITY_SUBAGENT: ""
   };
+  delete env.AGY_CMD_DEV_ROOT;
 
   for (const [evName, cmdStr, payload, checkFn] of [
     ["SessionStart", spec.SessionStart[0].command, { conversationId: "xcwd-1" }, (o) => typeof o === "object"],
@@ -1753,6 +1798,103 @@ test("hooks.json cross-workspace bootstrapper executes all 4 hooks cleanly from 
     const parsed = JSON.parse(res.stdout.trim());
     assert.ok(checkFn(parsed), `${evName} unexpected output: ${res.stdout}`);
   }
+  assert.ok(fs.existsSync(path.join(stateDir, "sessions", "xcwd-1.events.jsonl")));
+  assert.equal(fs.existsSync(path.join(stateDir, "hook-bootstrap.log")), false);
+});
+
+test("hook bootstrap checks configured roots, ignores the workspace and logs only diagnostic codes", async (t) => {
+  const dir = makeTmpDir("agy-cmd-bootstrap-");
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const cwd = path.join(dir, "business workspace");
+  const home = path.join(dir, "home");
+  const siblingData = path.join(dir, "plugin_data", "another-plugin");
+  const stateDir = path.join(dir, "plugin_data", "agy-cmd");
+  const logPath = path.join(stateDir, "hook-bootstrap.log");
+  const config = path.join(dir, "user config");
+  const slot = path.join(config, "plugins", "agy-cmd");
+  fs.mkdirSync(slot, { recursive: true });
+  fs.cpSync(path.join(PLUGIN_ROOT, "hooks"), path.join(slot, "hooks"), { recursive: true });
+  fs.copyFileSync(path.join(PLUGIN_ROOT, "plugin.json"), path.join(slot, "plugin.json"));
+  const env = makeEnv("", { HOME: home, USERPROFILE: home, PLUGIN_DATA: siblingData });
+  for (const key of ["PLUGIN_ROOT", "AGY_PLUGIN_ROOT", "AGY_CMD_DEV_ROOT", "ANTIGRAVITY_CONFIG_DIR", "GEMINI_CONFIG_DIR", "GEMINI_HOME"]) {
+    delete env[key];
+  }
+  const spec = JSON.parse(fs.readFileSync(path.join(PLUGIN_ROOT, "hooks.json"), "utf8"))["agy-cmd-router"];
+  const filenames = ["session-start.mjs", "pre-tool-use.mjs", "post-tool-use.mjs", "pre-invocation.mjs", "stop.mjs"];
+  function inertPlugin(root) {
+    fs.mkdirSync(path.join(root, "hooks"), { recursive: true });
+    fs.writeFileSync(path.join(root, "plugin.json"), JSON.stringify({ name: "agy-cmd" }));
+    for (const name of filenames) fs.writeFileSync(path.join(root, "hooks", name), "");
+  }
+  inertPlugin(cwd);
+  inertPlugin(path.join(dir, ".agents", "plugins", "agy-cmd"));
+  const escaped = path.join(dir, "escaped");
+  fs.mkdirSync(escaped);
+  fs.copyFileSync(path.join(slot, "plugin.json"), path.join(escaped, "plugin.json"));
+  fs.symlinkSync(path.join(cwd, "hooks"), path.join(escaped, "hooks"), "junction");
+  const broken = path.join(dir, "incomplete");
+  inertPlugin(broken);
+  for (const name of filenames) fs.writeFileSync(path.join(broken, "hooks", name), 'import "./missing-library.mjs";\n');
+
+  function checkAll(overrides, expectedReason) {
+    if (fs.existsSync(logPath)) fs.unlinkSync(logPath);
+    for (const [hook, handlers] of Object.entries(spec)) {
+      const handler = handlers[0].hooks?.[0] ?? handlers[0];
+      const res = spawnSync(handler.command, {
+        shell: true, windowsHide: true, timeout: 5000, encoding: "utf8",
+        input: "{}", cwd, env: { ...env, ...overrides }
+      });
+      assert.equal(res.status, 0, `${hook}: ${res.stderr}`);
+      assert.equal(res.stderr, "", hook);
+      const output = JSON.parse(res.stdout);
+      if (expectedReason) {
+        assert.deepEqual(output, ["PreToolUse", "Stop"].includes(hook) ? { decision: "allow" } : {}, hook);
+      }
+    }
+    if (!expectedReason) {
+      assert.equal(fs.existsSync(logPath), false);
+      return;
+    }
+    const lines = fs.readFileSync(logPath, "utf8").trim().split("\n").map(line => JSON.parse(line));
+    assert.deepEqual(lines.map(row => row.hook), Object.keys(spec));
+    for (const row of lines) {
+      assert.deepEqual(Object.keys(row).sort(), ["hook", "reason", "ts"]);
+      assert.equal(row.reason, expectedReason);
+      assert.ok(Number.isFinite(Date.parse(row.ts)));
+    }
+    assert.equal(fs.existsSync(path.join(siblingData, "hook-bootstrap.log")), false);
+  }
+  checkAll({ AGY_CMD_DEV_ROOT: PLUGIN_ROOT });
+  checkAll({ AGY_CMD_DEV_ROOT: "", ANTIGRAVITY_CONFIG_DIR: config });
+  checkAll({ ANTIGRAVITY_CONFIG_DIR: config });
+  checkAll({ PLUGIN_ROOT: "nonexistent", AGY_PLUGIN_ROOT: PLUGIN_ROOT });
+  checkAll({}, "no_trusted_root");
+  checkAll({ PLUGIN_ROOT: ".", ANTIGRAVITY_CONFIG_DIR: "." }, "no_trusted_root");
+  checkAll({ AGY_CMD_DEV_ROOT: ".", PLUGIN_ROOT }, "invalid_dev_root");
+  checkAll({ AGY_CMD_DEV_ROOT: path.join(dir, "missing"), ANTIGRAVITY_CONFIG_DIR: config }, "invalid_dev_root");
+  checkAll({ AGY_CMD_DEV_ROOT: escaped }, "invalid_dev_root");
+  checkAll({ AGY_CMD_DEV_ROOT: broken }, "hook_load_failed");
+  const linkedConfig = path.join(dir, "linked-config");
+  fs.mkdirSync(path.join(linkedConfig, "plugins"), { recursive: true });
+  fs.symlinkSync(cwd, path.join(linkedConfig, "plugins", "agy-cmd"), "junction");
+  checkAll({ ANTIGRAVITY_CONFIG_DIR: linkedConfig }, "no_trusted_root");
+  await t.test("requires a regular in-root manifest even with valid hooks", (t) => {
+    const root = path.join(dir, "external-manifest");
+    fs.mkdirSync(root);
+    fs.cpSync(path.join(slot, "hooks"), path.join(root, "hooks"), { recursive: true });
+    const manifest = path.join(root, "plugin.json");
+    fs.mkdirSync(manifest);
+    checkAll({ AGY_CMD_DEV_ROOT: root }, "invalid_dev_root");
+    fs.rmdirSync(manifest);
+    try {
+      fs.symlinkSync(path.join(slot, "plugin.json"), manifest, "file");
+    } catch (error) {
+      if (process.platform !== "win32" || error.code !== "EPERM") throw error;
+      t.diagnostic("File-symlink check requires Windows Developer Mode or symlink privileges");
+      return;
+    }
+    checkAll({ AGY_CMD_DEV_ROOT: root }, "invalid_dev_root");
+  });
 });
 
 test("detector classifies stringified apply_edits.edits and Error [HOST_SERIALIZATION_CORRUPTION] zero-write aborts", () => {
@@ -2608,6 +2750,42 @@ test("P0-2 & P0-3: Stop auto-retry works on official model_stop, blocks max_step
   assert.equal(maxSteps.reasonCode, "term_max_steps_exceeded");
 });
 
+test("main and Swarm coordinators share pending plan approval across immediate and delayed receipts", () => {
+  const env = makeEnv("");
+  const exit = { lastUserInput: "先写方案", invocationNum: 1, toolCall: { name: "exit_plan_mode", args: {} } };
+  const pending = { ts: 12000, stepIdx: 5, kind: "edit", tool: "write_file", hasArtifactMeta: true, pending: true };
+  const denial = { status: "ERROR", content: "Tool write_file is not allowed in read-only Plan Mode" };
+  const delayed = { stepsByIndex: new Map([[5, denial]]) };
+  for (const swarmActive of [false, true]) {
+    const state = { swarmActive, lastTurnStartTs: 11000 };
+    for (const source of [{ events: [pending], tail: delayed },
+      { events: [], tail: { latestPlanModeDenial: { key: "tx:5", stepIdx: 5 } } }]) {
+      const opts = { env, transcriptTail: source.tail };
+      const first = evaluatePreInvocation(exit, source.events, state, opts);
+      assert.equal(first.reasonCode, "plan_mode_fallback");
+      assert.equal(evaluatePreToolUse(exit, source.events, state, opts).decision, "force_ask");
+      assert.equal(evaluatePreToolUse({ ...exit, toolCall: { name: "read_file" } }, source.events, state, opts).decision, "allow");
+      assert.equal(evaluatePreToolUse({ ...exit, isSubagent: true }, source.events, state, opts).decision, "allow");
+      if (source.events.length) {
+        assert.equal(evaluatePreToolUse(exit, source.events, first.nextState, { env }).decision, "force_ask");
+      }
+      const approved = { ...exit, lastUserInput: "按计划执行" };
+      const after = { env, transcriptTail: { ...source.tail, latestUserInput: "按计划执行", latestUserInputKey: "step:7", latestInputFollowsPlan: true } };
+      assert.equal(evaluatePreToolUse(approved, source.events, state, after).reasonCode, "plan_already_approved");
+      assert.notEqual(evaluatePreInvocation(approved, source.events, state, after).reasonCode, "plan_mode_fallback");
+      const later = { env, transcriptTail: { ...after.transcriptTail, latestPlanModeDenial: { key: "tx:8", stepIdx: 8 } } };
+      assert.equal(evaluatePreToolUse(approved, source.events, state, later).decision, "force_ask");
+      assert.equal(evaluatePreInvocation(approved, source.events, state, later).reasonCode, "plan_mode_fallback");
+      const noIndexes = { env, transcriptTail: { ...later.transcriptTail, latestUserInputKey: "byte:700", latestPlanModeDenial: { key: "tx:unknown" } } };
+      assert.equal(evaluatePreToolUse(approved, source.events, state, noIndexes).decision, "force_ask");
+      const notified = evaluatePreInvocation(approved, source.events, state, noIndexes);
+      assert.equal(notified.reasonCode, "plan_mode_fallback");
+      const paid = { ...noIndexes, settings: { planTier: "paid", boostEnabled: true, boostAfterPlanApproval: true } };
+      assert.notEqual(evaluatePreInvocation({ ...approved, invocationNum: 0 }, source.events, notified.nextState, paid).reasonCode, "approved_plan_boost");
+    }
+  }
+});
+
 test("P1-1: PreToolUse deterministically gates exit_plan_mode with force_ask after read-only Plan Mode denial until approved", async (t) => {
   const dir = makeTmpDir("agy-cmd-pretool-");
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
@@ -3262,6 +3440,148 @@ test("Frozen Rules: test assertion weakening soft audit (positive triggers, zero
   assert.match(reviewMsg, /app\.test\.ts.*新增 1 处跳过标记、净删减 1 处断言/);
   // Follow-up PreInvocation does not duplicate the audit notice already folded into cmd-verifier dispatch
   assert.deepEqual(await f.pre(), {});
+});
+
+test("P0-4 partial source writes update only confirmed package scopes in both ledgers, including transcript and cache replay", t => {
+  const cwd = makeTmpDir();
+  t.after(() => fs.rmSync(cwd, { recursive: true, force: true }));
+  for (const pkg of ["a", "b"]) {
+    fs.mkdirSync(path.join(cwd, pkg));
+    fs.writeFileSync(path.join(cwd, pkg, "package.json"), JSON.stringify({ scripts: { test: "node --test" } }));
+  }
+  const plan = { key: "plan", scopes: {} };
+  const gate = { key: "turn:1", scopes: {} };
+  const options = { plan, deliveryGate: gate, hasTranscriptPath: true };
+  const source = ["a/src/x.ts", "b/src/x.ts", "README.md"].map(file =>
+    ({ path: file, hunks: [{ target: "return 1;", replacement: "return 2;" }] }));
+  function post(stepIdx, name, args, toolResponse) {
+    return classifyToolEvents({ stepIdx, cwd, workspacePaths: [cwd], toolCall: { name, args }, toolResponse }, stepIdx * 10, options);
+  }
+  const edits = (step, receipt) => post(step, "apply_edits", { cwd, edits: source }, receipt);
+  const seeded = [
+    ...edits(1, "Applied edits to 3 file(s):"),
+    ...post(2, "run_command", { cwd: path.join(cwd, "a"), CommandLine: "npm test" }, "Command exited with code 0."),
+    ...post(3, "run_command", { cwd: path.join(cwd, "b"), CommandLine: "npm test" }, "Command exited with code 0.")
+  ];
+  const greenPlan = advancePlan(plan, seeded);
+  const greenGate = advanceDeliveryGate(gate, seeded);
+  assert.equal(pendingPlanChecks(greenPlan).length, 0);
+  assert.equal(evaluateDeliveryGateStatus(greenGate).allPassed, true);
+  const both = events => [advancePlan(greenPlan, events), advanceDeliveryGate(greenGate, events)];
+  const partial = "Partial edit applied (1/3 file(s) written; 2 file(s) failed)";
+  const writesA = partial + "\nApplied:\n- a/src/x.ts: updated\n\nFailed:\n- b/src/x.ts: missing";
+  const pending = edits(4, undefined);
+  const tx = { stepsByIndex: new Map([[4, { status: "DONE", content: writesA }]]) };
+  const delayed = reconcileEventsWithTranscript(pending, tx);
+  const cached = reconcileEventsWithTranscript(pending, null, delayed.nextResolvedSteps);
+  const direct = both(edits(4, writesA));
+  assert.deepEqual(both(delayed.resolvedEvents), direct);
+  assert.deepEqual(both(cached.resolvedEvents), direct);
+  assert.deepEqual(pendingPlanChecks(direct[0]).map(c => c.dir), [path.join(cwd, "a")]);
+  assert.deepEqual(evaluateDeliveryGateStatus(direct[1]).pendingChecks.map(c => c.dir), [path.join(cwd, "a")]);
+  for (const text of ["Partial edit applied (0/3 file(s) written; 3 file(s) failed)", partial + "\nApplied:\n- README.md: updated"]) {
+    const [nextPlan, nextGate] = both(edits(4, text));
+    assert.deepEqual(nextPlan, greenPlan);
+    assert.deepEqual(nextGate, greenGate);
+  }
+  for (const text of [partial, "Partial edit applied", partial + "\nApplied:\n- src/x.ts: updated"]) {
+    const events = edits(4, text);
+    const [nextPlan, nextGate] = both(events);
+    assert.equal(events[0].applied, false);
+    assert.equal(events[0].unattributedWrites[0].writtenCount, text === "Partial edit applied" ? null : 1);
+    assert.deepEqual(nextPlan.scopes, greenPlan.scopes);
+    assert.deepEqual(nextGate.scopes, greenGate.scopes);
+    assert.deepEqual(nextPlan.unattributedWrites, nextGate.unattributedWrites);
+    assert.deepEqual(nextGate.unattributedWrites[0].candidateScopes, ["a", "b"].map(p => path.join(cwd, p)));
+    assert.deepEqual(evaluateDeliveryGateStatus(nextGate).unattributedWrites, nextGate.unattributedWrites);
+    assert.equal(evaluateDeliveryGateStatus(nextGate).allPassed, false);
+    assert.deepEqual(advanceDeliveryGate(nextGate, events), nextGate);
+    assert.deepEqual(advancePlan(nextPlan, events), nextPlan);
+    const attributed = advanceDeliveryGate(nextGate, edits(4, writesA));
+    assert.equal(evaluateDeliveryGateStatus(attributed).unattributedWrites.length, 0);
+    for (const [content, expectedPending] of [[writesA, 1], ["Applied edits to 3 file(s):", 2],
+      ["Partial edit applied (0/3 file(s) written; 3 file(s) failed)", 0]]) {
+      const richer = reconcileEventsWithTranscript(events, { stepsByIndex: new Map([[4, { status: "DONE", content }]]) });
+      const replay = reconcileEventsWithTranscript(events, null, richer.nextResolvedSteps);
+      for (const resolved of [richer.resolvedEvents, replay.resolvedEvents]) {
+        assert.deepEqual(resolved[0].unattributedWrites, []);
+        const after = evaluateDeliveryGateStatus(advanceDeliveryGate(nextGate, resolved));
+        assert.deepEqual(after.unattributedWrites, []);
+        assert.equal(after.pendingChecks.length, expectedPending);
+        assert.equal(after.allPassed, expectedPending === 0);
+        assert.equal(pendingPlanChecks(advancePlan(nextPlan, resolved)).length, expectedPending);
+      }
+    }
+  }
+  // Mixed batch with a comment-only .ts edit: confirming both the code file and comment-only file
+  // must attribute only the code package without emitting a false unattributedWrites record.
+  const mixedBatch = [
+    { path: "a/src/x.ts", hunks: [{ target: "return 1;", replacement: "return 2;" }] },
+    { path: "b/src/comment.ts", hunks: [{ target: "// old", replacement: "// new" }] },
+    { path: "b/src/x.ts", hunks: [{ target: "return 1;", replacement: "return 2;" }] }
+  ];
+  const mixedReceipt =
+    "Partial edit applied (2/3 file(s) written; 1 file(s) failed)\nApplied:\n- a/src/x.ts: updated\n- b/src/comment.ts: updated\n\nFailed:\n- b/src/x.ts: missing";
+  const mixedEvs = post(5, "apply_edits", { cwd, edits: mixedBatch }, mixedReceipt);
+  const [mixedPlan, mixedGate] = both(mixedEvs);
+  assert.deepEqual(pendingPlanChecks(mixedPlan).map(c => c.dir), [path.join(cwd, "a")]);
+  assert.deepEqual(evaluateDeliveryGateStatus(mixedGate).pendingChecks.map(c => c.dir), [path.join(cwd, "a")]);
+  assert.deepEqual(evaluateDeliveryGateStatus(mixedGate).unattributedWrites, []);
+});
+
+test("P0-4 delivery receipts retain dispatch order across mixed indexes, ambiguous timestamps and inline verification", t => {
+  const cwd = makeTmpDir();
+  t.after(() => fs.rmSync(cwd, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(cwd, "package.json"), JSON.stringify({ scripts: { test: "node --test" } }));
+  const gate = { key: "turn:1", scopes: {} };
+  const events = (stepIdx, ts, name, args, toolResponse) => classifyToolEvents({
+    stepIdx, cwd, workspacePaths: [cwd], toolCall: { name, args }, toolResponse
+  }, ts, { deliveryGate: gate, hasTranscriptPath: true, deliveryTestCommand: "npm test" });
+  const edit = (idx, ts) => events(idx, ts, "edit_file", { Path: "app.ts", Target: "return 1;", Replacement: "return 2;" },
+    "Made 1 replacement in app.ts")[0];
+  const check = (idx, ts, text = "Command exited with code 0.") => events(idx, ts, "run_command", { CommandLine: "npm test" }, text)[0];
+  const status = (items, command = "") => {
+    const updated = advanceDeliveryGate(gate, items, command);
+    assert.deepEqual(advanceDeliveryGate(JSON.parse(JSON.stringify(updated)), items, command), updated);
+    return evaluateDeliveryGateStatus(updated, command);
+  };
+  for (const [ei, ci] of [[4, null], [null, 5], [null, null]]) {
+    for (const command of ["", "npm test"]) {
+      assert.equal(status([check(ci, 10), edit(ei, 20)], command).pendingChecks.length, 1);
+      assert.equal(status([edit(ei, 10), check(ci, 20)], command).allPassed, true);
+      assert.equal(status([edit(ei, 10), check(ci, 10)], command).pendingChecks.length, 1);
+    }
+  }
+  const noClock = { ...edit(1, 10), ts: null };
+  const twoEdits = [noClock, edit(null, 20)];
+  assert.equal(status([...twoEdits, check(null, 30)]).pendingChecks.length, 1);
+  assert.equal(status([...twoEdits, check(3, 30)]).allPassed, true);
+  // Concurrent Hook processes may timestamp a lower host step later than its successor.
+  const reversedClocks = [edit(1, 30), edit(2, 10)];
+  assert.equal(status([...reversedClocks, check(null, 20)]).pendingChecks.length, 1);
+  assert.equal(status([...reversedClocks, check(null, 31)]).allPassed, true);
+  assert.equal(status([...reversedClocks, check(3, 5)]).allPassed, true);
+  assert.equal(status([edit(5, 10), edit(null, 20), check(4, 30)]).pendingChecks.length, 1);
+  assert.equal(status([edit(1, 1), check(4, 20, "Command exited with code 1."), check(null, 20)]).failedChecks.length, 1);
+  const running = check(2, 10, "Tool is running as a background task with task id: scope/task-2");
+  const late = reconcileEventsWithTranscript([running, edit(null, 20)], {
+    taskResultsByStepIdx: new Map([[2, { text: "Command exited with code 0." }]])
+  });
+  assert.equal(status(late.resolvedEvents).pendingChecks.length, 1);
+  const inline = idx => events(idx, 30, "apply_edits", {
+    edits: [{ path: "app.ts", hunks: [{ target: "return 1;", replacement: "return 2;" }] }], verify: "npm test"
+  }, "Applied edits to 1 file(s):\n- app.ts: updated\nVerify [PASS in 3ms] npm test");
+  for (const idx of [null, 5]) assert.equal(status(inline(idx)).allPassed, true);
+  assert.equal(status([inline(null)[0], inline(null)[1]]).pendingChecks.length, 1);
+  const [missingIndex] = classifyToolEvents({
+    step_idx: null, cwd, workspacePaths: [cwd], toolCall: { name: "run_command", args: { CommandLine: "npm test" } }
+  }, 40, { deliveryGate: gate, transcriptStep: { step_index: 0, status: "DONE", content: "Command exited with code 0." } });
+  assert.equal(status([edit(1, 10), missingIndex]).pendingChecks.length, 1);
+  const legacy = { ...gate, wroteSource: true, scopes: { [cwd]: {
+    dir: cwd, editStep: 1, declared: "npm test", autoChecks: { "node:test": { step: 2, passed: true } }
+  } } };
+  assert.equal(evaluateDeliveryGateStatus(legacy).allPassed, true);
+  assert.equal(compareDeliveryOrder({ stepIdx: 1, ts: null, sub: 0 }, { stepIdx: null, ts: 10, sub: 0 }), null);
 });
 
 test("v2.7.4 review regressions 1-3: delayed apply_edits backfill, RUNNING->ERROR zero-write, bestEffort partial attribution, and non-verify command isolation", async (t) => {

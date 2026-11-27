@@ -135,7 +135,7 @@ export function hasActiveUpdateMarker(
   }
 }
 
-async function reclaimStaleUpdateMarker(markerPath, markerOptions = {}) {
+async function checkUpdateMarker(markerPath, markerOptions, reclaimStale = false) {
   const st = await safeLstat(markerPath);
   if (!st) return;
   if (!st.isFile() || st.isSymbolicLink()) {
@@ -149,9 +149,11 @@ async function reclaimStaleUpdateMarker(markerPath, markerOptions = {}) {
   if (state === "active") {
     throw new UpdateError("busy");
   }
-  await unlink(markerPath).catch((err) => {
-    if (err?.code !== "ENOENT") throw new InstallError(err, UPDATE_MARKER_NAME);
-  });
+  if (reclaimStale) {
+    await unlink(markerPath).catch((err) => {
+      if (err?.code !== "ENOENT") throw new InstallError(err, UPDATE_MARKER_NAME);
+    });
+  }
 }
 
 async function readDiskJson(root, relPath) {
@@ -530,7 +532,7 @@ async function replaceInstalledFiles(
 ) {
   await mkdir(backupDir, { recursive: true });
   const markerPath = join(root, UPDATE_MARKER_NAME);
-  await reclaimStaleUpdateMarker(markerPath, markerOptions);
+  await checkUpdateMarker(markerPath, markerOptions, true);
 
   const markerNow = markerOptions.now || Date.now;
   try {
@@ -625,6 +627,25 @@ async function replaceInstalledFiles(
   }
 }
 
+const RELEASE_ASSET_PREFIX = `https://github.com/${REPO}/releases/download/`;
+const ASSET_FILENAME = /^[a-z0-9][a-z0-9._+-]*\.(?:zip|tgz)$/i;
+
+export function verifiedAssetIdentity({ assetName, assetUrl, assetSha256 }, { strictNameMatch = false } = {}) {
+  if (typeof assetUrl !== "string" || !assetUrl.startsWith(RELEASE_ASSET_PREFIX)) return null;
+  if (typeof assetSha256 !== "string" || !/^[0-9a-f]{64}$/i.test(assetSha256)) return null;
+  if (assetName !== undefined && (typeof assetName !== "string" || !ASSET_FILENAME.test(assetName))) return null;
+
+  // GitHub may encode the plus sign of SemVer build metadata in the download URL.
+  const parts = assetUrl.slice(RELEASE_ASSET_PREFIX.length).replace(/%2b/gi, "+").split("/");
+  if (parts.length !== 2 || !/^[a-z0-9][a-z0-9.+-]*$/i.test(parts[0]) || !ASSET_FILENAME.test(parts[1])) {
+    return null;
+  }
+  if (strictNameMatch && assetName !== undefined && assetName !== parts[1]) {
+    return null;
+  }
+  return { ...(assetName !== undefined && { assetName }), assetUrl, assetSha256: assetSha256.toLowerCase() };
+}
+
 /**
  * Evaluate whether a discovered release qualifies for opt-in silent auto-install:
  * requires same major version, a verified SHA-256 release asset, and no open failure
@@ -653,20 +674,15 @@ export function evaluateAutoInstallEligibility({ release, currentVersion, failed
   if (cur.core[0] !== latest.core[0]) {
     return { eligible: false, skipReason: "majorUpgrade", targetVersion: latest.version };
   }
-  const hasVerifiedAsset = Boolean(
-    typeof release.assetUrl === "string" &&
-      release.assetUrl.trim() &&
-      typeof release.assetSha256 === "string" &&
-      /^[0-9a-f]{64}$/i.test(release.assetSha256.trim())
-  );
-  if (!hasVerifiedAsset) {
+  const expectedAsset = verifiedAssetIdentity(release);
+  if (!expectedAsset) {
     return { eligible: false, skipReason: "noVerifiedAsset", targetVersion: latest.version };
   }
   const failedParsed = parseVersion(failedVersion);
   if (failedParsed && failedParsed.version === latest.version) {
     return { eligible: false, skipReason: "failedCircuitOpen", targetVersion: latest.version };
   }
-  return { eligible: true, skipReason: null, targetVersion: latest.version };
+  return { eligible: true, skipReason: null, targetVersion: latest.version, expectedAsset };
 }
 
 /**
@@ -690,7 +706,7 @@ export function createPluginUpdater({
     diagnostics: { step, ...details }
   });
 
-  return async function update(expectedVersion) {
+  return async function update(expectedVersion, { expectedAsset } = {}) {
     if (busy) return failure("busy", "start");
     busy = true;
     let workDir;
@@ -702,10 +718,12 @@ export function createPluginUpdater({
       const parsedExpected = parseVersion(expectedVersion);
       if (!parsedExpected) throw new UpdateError("releaseChanged");
       const targetVersion = parsedExpected.version;
+      const pinned = expectedAsset && verifiedAssetIdentity(expectedAsset);
+      if (expectedAsset !== undefined && !pinned) throw new UpdateError("releaseChanged");
 
       step = "inspect";
       const root = await resolveInstalledRoot(sidecarDirectory, { pluginsDirectory, allowCustomRoot });
-      await reclaimStaleUpdateMarker(join(root, UPDATE_MARKER_NAME), markerOptions);
+      await checkUpdateMarker(join(root, UPDATE_MARKER_NAME), markerOptions);
       const localManifest = await readDiskJson(root, "plugin.json");
       const currentVersion = parseVersion(localManifest?.version)?.version;
       if (!currentVersion || localManifest?.name !== PLUGIN_NAME) {
@@ -733,19 +751,20 @@ export function createPluginUpdater({
         throw new UpdateError("releaseChanged");
       }
 
+      const asset = verifiedAssetIdentity(release);
+      if (!asset) throw new UpdateError("noVerifiedAsset");
+      if (pinned && (
+        pinned.assetUrl !== asset.assetUrl ||
+        pinned.assetSha256 !== asset.assetSha256 ||
+        (pinned.assetName !== undefined && pinned.assetName !== asset.assetName)
+      )) {
+        throw new UpdateError("releaseChanged");
+      }
+
       step = "download";
-      const useVerifiedAsset = Boolean(
-        typeof release.assetUrl === "string" &&
-          release.assetUrl &&
-          typeof release.assetSha256 === "string" &&
-          release.assetSha256
-      );
-      const downloadUrl = useVerifiedAsset
-        ? release.assetUrl
-        : `https://api.github.com/repos/${REPO}/tarball/${encodeURIComponent(release.releaseTag)}`;
-      const archiveBuffer = await downloadArchive(downloadUrl, {
+      const archiveBuffer = await downloadArchive(asset.assetUrl, {
         ...downloadOptions,
-        ...(useVerifiedAsset ? { expectedSha256: release.assetSha256 } : {})
+        expectedSha256: asset.assetSha256
       });
 
       step = "validate-archive";
@@ -786,7 +805,7 @@ export function createPluginUpdater({
         version: releaseParsed.version,
         releaseTag: release.releaseTag,
         releaseUrl: release.releaseUrl,
-        ...(useVerifiedAsset ? { verifiedSha256: release.assetSha256 } : {})
+        verifiedSha256: asset.assetSha256
       };
     } catch (error) {
       const failureError =

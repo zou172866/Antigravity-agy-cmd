@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { stripVTControlCharacters } from "node:util";
 import {
   detectHostSurface,
   extractActiveSlashCommands,
@@ -16,6 +17,9 @@ import {
   advanceDeliveryGate,
   advancePlan,
   allowsTestWeakening,
+  applyEditReceipt,
+  compareDeliveryOrder,
+  deliveryEditOrders,
   deliveryEventOrder,
   deliveryGateToolEvidence,
   detectTestAssertionWeakeningDetails,
@@ -48,6 +52,26 @@ function confirmsPlan(reply) {
   if (approval?.[0] === text) return true;
   const action = text.slice(approval?.[0].length ?? 0).replace(/^[，,、\s]+/, "");
   return /^(?:请)?(?:按(?:照)?(?:此|该)?(?:计划|方案)(?:执行|实施)|继续(?:执行|实施|推进)?|开始(?:执行|实施)|执行|实施)$/.test(action);
+}
+
+function resolvePendingPlanApprovalState(inputEnvelope, transcriptTail, eventBlock, turnStartedAt, enabled) {
+  const request = unwrapUserRequestText(inputEnvelope);
+  const transcriptInput = nonEmptyString(transcriptTail?.latestUserInput);
+  const matchesTranscript = inputEnvelope === transcriptInput || inputEnvelope === unwrapUserRequestText(transcriptInput);
+  const confirmed = confirmsPlan(request);
+  const approvedNotice = (isPlanApprovalNotice(inputEnvelope) || (matchesTranscript && isPlanApprovalNotice(transcriptInput))) &&
+    (!request || confirmed);
+  const chatApproval = confirmed && transcriptTail?.latestInputFollowsPlan && (!transcriptInput || matchesTranscript);
+  const recentEvent = eventBlock && eventBlock.ts >= turnStartedAt - 5000 ? eventBlock : null;
+  const txDenial = transcriptTail?.latestPlanModeDenial;
+  const block = enabled ? txDenial || recentEvent : null;
+  // The tail scanner clears its denial at each USER_INPUT, even when the host omits indexes.
+  const inputStep = /^step:(\d+)$/.exec(transcriptTail?.latestUserInputKey || "");
+  const laterTxDenial = txDenial && (!inputStep || txDenial.stepIdx == null || txDenial.stepIdx > Number(inputStep[1]));
+  const laterEvent = recentEvent && inputStep && recentEvent.stepIdx != null && recentEvent.stepIdx > Number(inputStep[1]);
+  const laterDenial = matchesTranscript && (laterTxDenial || laterEvent);
+  const isApproved = Boolean((approvedNotice || chatApproval) && !laterDenial);
+  return { approvedNotice, isApproved, activePlanBlock: block, requiresConfirmation: Boolean(block && !isApproved) };
 }
 
 // Note: ctx_execute is intentionally excluded (it is a read/analysis sandbox, not a build/test runner)
@@ -347,7 +371,24 @@ function extractErrorSignature(errorText, bodyText) {
   return sanitizeSnippet(prioritized, 64);
 }
 
-function classifyCommandOutcome(bareTool, isBenignCmd, errorText, rawResponseText, explicitError, checkMeta = null) {
+// Windows PowerShell can report exit 1 when a successful test runner wrote progress to stderr.
+// Only accept complete runner summaries, and check all earlier suites for failures first.
+function hasSuccessfulNativeTestSummary(output, errorText) {
+  output = stripVTControlCharacters(output);
+  if (!/^[ \t]*\+[ \t]+FullyQualifiedErrorId[ \t]*:[ \t]*NativeCommandError[ \t]*\r?$/im.test(output)) return false;
+  if (errorText && !/^(?:(?:command|process)\s+)?exit(?:ed)?(?:\s+with)?(?:\s+(?:code|status))?\s*:?\s*1\.?$/i.test(errorText.trim())) return false;
+  const runnerFailure = /^[ \t]*(?:FAILED\b|(?:ERROR|FAIL):[ \t]+|(?:[ℹ#][ \t]+)?(?:fail|cancelled)[ \t]+[1-9]\d*\b|✖[ \t]+|not ok[ \t]+\d+\b|Bail out!)/im;
+  const processFailure = /^[ \t]*(?:Segmentation fault\b|Fatal Python error:|npm (?:ERR!|error)\s|(?:(?:Command|Process) )?exit(?:ed)?(?: with)? (?:code|status)[ \t]*:?[ \t]*[1-9]\d*\b)/im;
+  if (REAL_CMD_ERROR_RE.test(output) || runnerFailure.test(output) || processFailure.test(output)) return false;
+  const summary = output.replace(/\r\n/g, "\n").trimEnd()
+    .replace(/\n[ \t]*<\/SYSTEM_MESSAGE>$/i, "").trimEnd()
+    .replace(/\n[ \t]*Log:[ \t]+file:\/\/\/[^\n]+$/i, "").trimEnd();
+  const unittestSummary = /(?:^|\n)Ran [1-9]\d* tests? in \d+(?:\.\d+)?s\n(?:[ \t]*\n)*OK(?: \((?:skipped|expected failures)=\d+(?:, (?:skipped|expected failures)=\d+)*\))?$/;
+  const nodeSummary = /(?:^|\n)([ℹ#]?[ \t]*)pass [1-9]\d*\n\1fail 0(?:\n\1(?:cancelled 0|(?:skipped|todo) \d+|duration_ms \d+(?:\.\d+)?))*$/;
+  return unittestSummary.test(summary) || nodeSummary.test(summary);
+}
+
+function classifyCommandOutcome(bareTool, isBenignCmd, errorText, rawResponseText, explicitError, checkMeta = null, isVerify = false) {
   const body = stripTranscriptStepHeaders(rawResponseText);
 
   if (BG_RUNNING_RE.test(body) && !explicitError) {
@@ -395,7 +436,8 @@ function classifyCommandOutcome(bareTool, isBenignCmd, errorText, rawResponseTex
       if (code === 0) {
         failed = explicitError && !isBenignSearchExit1(isBenignCmd, errorText, body);
       } else if (code === 1) {
-        failed = !isBenignSearchExit1(isBenignCmd, errorText, body);
+        const powerShellProgress = isVerify && hasSuccessfulNativeTestSummary(body.slice(headExitMatch[0].length), errorText);
+        failed = !powerShellProgress && !isBenignSearchExit1(isBenignCmd, errorText, body);
       } else {
         failed = true;
       }
@@ -516,10 +558,8 @@ export function classifyToolEvents(payload, nowMs = Date.now(), options = {}) {
   const { bareTool, effectiveArgs } = normalizeBareTool(toolCall.name, toolCall.args || {});
   if (!bareTool) return [];
 
-  const stepIdx = Number.isFinite(Number(payload.stepIdx ?? payload.step_idx))
-    ? Math.floor(Number(payload.stepIdx ?? payload.step_idx))
-    : null;
-  const transcriptStep = options.transcriptStep || null;
+  const stepIdx = parseNonNegInt(payload.stepIdx ?? payload.step_idx);
+  const transcriptStep = stepIdx === null ? null : options.transcriptStep || null;
   const hasTranscriptPath = Boolean(options.hasTranscriptPath || nonEmptyString(payload.transcriptPath ?? payload.transcript_path));
 
   const payloadErrorText = extractErrorText(payload);
@@ -589,6 +629,9 @@ export function classifyToolEvents(payload, nowMs = Date.now(), options = {}) {
     );
 
     const emitInlineVerify = Boolean(hasVerify && editOutcome.verifyResult);
+    // A timestamp alone cannot distinguish two edits in the same millisecond.
+    const inlineBatch = emitInlineVerify && hasVerificationEvidence && stepIdx === null
+      ? { inlineBatch: crypto.randomUUID() } : {};
     const pendingEdit = Boolean(
       needsPreInvocationResolve && (bareTool === "apply_edits" || !explicitError)
     );
@@ -627,11 +670,12 @@ export function classifyToolEvents(payload, nowMs = Date.now(), options = {}) {
         ts: nowMs,
         stepIdx,
         kind: "edit",
-        ...planFields,
-        ...(hasVerificationEvidence && editOutcome.applied ? { applied: true } : {}),
+        ...inlineBatch,
+        ...applyEditReceipt(planFields, editOutcome.partialReceipt, editOutcome.applied, editCwd,
+          { ts: nowMs, stepIdx, ...inlineBatch }),
         ...(testWeakening ? { testWeakening } : {}),
         ...(testWeakeningDetails ? { testWeakeningDetails } : {}),
-        ...(testWeakeningDetails && editCwd ? { editCwd } : {}),
+        ...((testWeakeningDetails || (bareTool === "apply_edits" && hasVerificationEvidence)) && editCwd ? { editCwd } : {}),
         tool: bareTool,
         failed: editOutcome.editFailed,
         abortedNoWrite: editOutcome.editFailed,
@@ -651,6 +695,7 @@ export function classifyToolEvents(payload, nowMs = Date.now(), options = {}) {
         stepIdx,
         kind: "cmd",
         tool: "apply_edits:verify",
+        ...inlineBatch,
         ...planFields,
         ...(hasVerificationEvidence ? { terminal: true } : {}),
         failed: editOutcome.verifyResult.failed,
@@ -715,7 +760,8 @@ export function classifyToolEvents(payload, nowMs = Date.now(), options = {}) {
       errorText,
       responseText,
       explicitError,
-      checkMeta
+      checkMeta,
+      baseIsVerify
     );
     if (cmdOutcome.backgroundRunning) {
       return [];
@@ -785,7 +831,8 @@ export function reconcileEventsWithTranscript(events, transcriptTail = null, pre
           "",
           bgTask.text,
           false,
-          ev.checkMeta
+          ev.checkMeta,
+          ev.isVerify
         );
         const isVerify = outcome.failedIsVerify !== undefined ? outcome.failedIsVerify : Boolean(ev.isVerify);
         nextCache[key] = {
@@ -822,7 +869,8 @@ export function reconcileEventsWithTranscript(events, transcriptTail = null, pre
           txErr,
           txStep.content || "",
           txExplicitErr,
-          ev.checkMeta
+          ev.checkMeta,
+          ev.isVerify
         );
         const receipt = outcome.terminal ? outcome : !txExplicitErr && (ev.terminal ? ev : cached?.terminal ? cached : null);
         const terminal = Boolean(receipt);
@@ -883,28 +931,32 @@ export function reconcileEventsWithTranscript(events, transcriptTail = null, pre
           txStep.content || "",
           txExplicitErr
         );
+        const partial = editOut.partialReceipt?.isPartial ? editOut.partialReceipt
+          : (!editOut.editFailed && !editOut.applied ? ev.partialReceipt : null);
         const resolvedWeakening = editOut.editFailed
           ? null
-          : editOut.partialReceipt?.isPartial
+          : partial
             ? filterTestWeakeningByAppliedFiles(
                 ev.testWeakening,
                 ev.testWeakeningDetails,
-                editOut.partialReceipt,
+                partial,
                 ev.editCwd || ""
               )
             : ev.testWeakening || null;
+        const applied = !partial && !editOut.editFailed && (editOut.applied || Boolean(ev.applied));
         nextCache[key] = {
           kind: "edit",
-          ...(hasEv ? { applied: editOut.applied || Boolean(ev.applied) } : {}),
+          ...(hasEv ? { applied } : {}),
           failed: editOut.editFailed,
-          ...(editOut.partialReceipt?.isPartial ? { partialReceipt: editOut.partialReceipt } : {}),
+          ...(partial ? { partialReceipt: partial } : {}),
           planModeWriteBlocked: editOut.planModeWriteBlocked,
           verifyResult: editOut.verifyResult
         };
         resolvedEvents.push({
           ...ev,
           failed: editOut.editFailed,
-          ...(hasEv ? { applied: editOut.applied || Boolean(ev.applied) } : {}),
+          ...applyEditReceipt({ planEvidence: ev.planEvidence, deliveryEvidence: ev.deliveryEvidence },
+            partial, applied, ev.editCwd, ev),
           testWeakening: resolvedWeakening,
           abortedNoWrite: editOut.editFailed,
           planModeWriteBlocked: ev.planModeWriteBlocked || editOut.planModeWriteBlocked,
@@ -944,7 +996,8 @@ export function reconcileEventsWithTranscript(events, transcriptTail = null, pre
           ...ev,
           failed: Boolean(cached.failed),
           abortedNoWrite: Boolean(cached.failed),
-          ...(hasEv ? { applied: Boolean(cached.applied) } : {}),
+          ...applyEditReceipt({ planEvidence: ev.planEvidence, deliveryEvidence: ev.deliveryEvidence },
+            cached.partialReceipt, cached.applied, ev.editCwd, ev),
           testWeakening: resolvedWeakening,
           planModeWriteBlocked: Boolean(ev.planModeWriteBlocked || cached.planModeWriteBlocked),
           pending: false
@@ -1378,10 +1431,10 @@ export function evaluatePreInvocation(payload, events = [], prevStateInput = nul
         nextState.userTurnCount === 0)) ||
       (invocationNum === null && rawLastUserInput !== "" && rawLastUserInput !== nextState.lastUserInput));
 
-  const approvedNotice = isPlanApprovalNotice(inputEnvelope) && (!rawLastUserInput || confirmsPlan(rawLastUserInput));
-  const isPlanFollowup =
-    approvedNotice || (Boolean(transcriptTail?.latestInputFollowsPlan) && confirmsPlan(rawLastUserInput));
-  const inheritedPlanSource = isPlanFollowup
+  const approval = resolvePendingPlanApprovalState(inputEnvelope, transcriptTail, metrics.latestPlanModeBlock,
+    isNewUserTurn ? nowMs : nextState.lastTurnStartTs, effSettings.planFallbackEnabled);
+  const { approvedNotice } = approval;
+  const inheritedPlanSource = approval.isApproved
     ? unwrapUserRequestText(nonEmptyString(transcriptTail?.planRequest) || prevState.lastUserInput)
     : "";
 
@@ -1543,13 +1596,7 @@ export function evaluatePreInvocation(payload, events = [], prevStateInput = nul
 
   // 3. Priority 1: Read-only Plan Mode blocked artifact write_file
   // Sources: (a) real Antigravity PreToolUse denial in transcript.jsonl, (b) PostToolUse event fallback.
-  const txPlanBlock = transcriptTail?.latestPlanModeDenial || null;
-  const evPlanBlock =
-    metrics.latestPlanModeBlock &&
-    (nextState.lastTurnStartTs === 0 || metrics.latestPlanModeBlock.ts >= nextState.lastTurnStartTs - 5000)
-      ? metrics.latestPlanModeBlock
-      : null;
-  const activePlanBlock = effSettings.planFallbackEnabled ? txPlanBlock || evPlanBlock : null;
+  const activePlanBlock = approval.requiresConfirmation ? approval.activePlanBlock : null;
 
   if (activePlanBlock && activePlanBlock.key !== (nextState.lastPlanBlockAlertKey || "")) {
     nextState.lastPlanBlockAlertKey = activePlanBlock.key;
@@ -1615,12 +1662,8 @@ export function evaluatePreInvocation(payload, events = [], prevStateInput = nul
     !alreadyTriggeredPlanBoost &&
     !blockedByTailState
   ) {
-    const sameInput = inputEnvelope === latestTranscriptInput || inputEnvelope === unwrapUserRequestText(latestTranscriptInput);
-    const clickedApproval = isPlanApprovalNotice(inputEnvelope) || (sameInput && isPlanApprovalNotice(latestTranscriptInput));
-    const confirmedInChat = confirmsPlan(rawLastUserInput);
-    if ((clickedApproval && (!rawLastUserInput || confirmedInChat)) ||
-        (sameInput && transcriptTail?.latestInputFollowsPlan && confirmedInChat)) {
-      if (effSettings.planTier === "free" && (txPlanBlock || transcriptTail?.awaitingUserApprovalOrQuestion && !clickedApproval)) {
+    if (approval.isApproved) {
+      if (effSettings.planTier === "free" && transcriptTail?.awaitingUserApprovalOrQuestion && !approvedNotice) {
         return { nextState, injectStep: null, shouldResetEvents, reasonCode: "awaiting_approval", stateChanged, metrics };
       }
       nextState.lastPlanBoostKey = planBoostKey;
@@ -1832,9 +1875,9 @@ export function evaluatePreInvocation(payload, events = [], prevStateInput = nul
       nextState,
       injectStep: buildInjectStep({
         uiOnly,
-        userMarkdown: `> **[agy-cmd → 建议 /goal]** 检测到无人值守持续修复诉求（当前自动重试为关闭状态）。可复制：\`/goal ${summary}\``,
+        userMarkdown: `> **[agy-cmd → 建议 /goal]** 检测到无人值守持续修复诉求（当前自动重试为关闭状态）。可复制：\`/goal ${summary}；范围：<目录>；验证：<测试命令> 全绿；停止：连败 3 次或无可安全推进项\``,
         systemMessage:
-          '[agy-cmd] User asked for an unattended fix-until-green loop while auto-retry is set to off. Put "[agy-cmd → 建议 /goal]" and a copyable "/goal <concise target + acceptance criteria>" on line 1 of your reply, then proceed with fixing.'
+          '[agy-cmd] User asked for an unattended fix-until-green loop while auto-retry is set to off. Put "[agy-cmd → 建议 /goal]" and a copyable "/goal <target>; scope: <dirs>; verify: <test command> green; stop: <hard stop condition>" on line 1 of your reply (fill placeholders from the conversation when known), then proceed with fixing.'
       }),
       shouldResetEvents,
       reasonCode: "suggest_goal",
@@ -2006,29 +2049,15 @@ export function evaluatePreToolUse(payload, events = [], prevStateInput = null, 
     return { decision: "allow", reason: "", reasonCode: "plan_fallback_disabled" };
   }
 
-  if (prevState.swarmActive || transcriptTail?.hasSwarmActivity) {
-    return { decision: "allow", reason: "", reasonCode: "swarm_active_skip" };
-  }
-
-  const latestTranscriptInput = nonEmptyString(transcriptTail?.latestUserInput);
-  const rawPayloadInput = nonEmptyString(payload.lastUserInput ?? payload.last_user_input);
-  const inputEnvelope = rawPayloadInput || latestTranscriptInput;
-  const rawLastUserInput = unwrapUserRequestText(inputEnvelope);
-
-  const approvedNotice =
-    isPlanApprovalNotice(inputEnvelope) && (!rawLastUserInput || confirmsPlan(rawLastUserInput));
-  const confirmedInChat = Boolean(transcriptTail?.latestInputFollowsPlan) && confirmsPlan(rawLastUserInput);
-  if (approvedNotice || confirmedInChat) {
+  const inputEnvelope = nonEmptyString(payload.lastUserInput ?? payload.last_user_input) || nonEmptyString(transcriptTail?.latestUserInput);
+  const { resolvedEvents } = reconcileEventsWithTranscript(events, transcriptTail, prevState.resolvedSteps);
+  const approval = resolvePendingPlanApprovalState(inputEnvelope, transcriptTail, analyzeEventMetrics(resolvedEvents).latestPlanModeBlock,
+    prevState.lastTurnStartTs, effSettings.planFallbackEnabled);
+  if (approval.isApproved) {
     return { decision: "allow", reason: "", reasonCode: "plan_already_approved" };
   }
 
-  const safeEvents = Array.isArray(events) ? events : [];
-  const turnFloorTs = prevState.lastTurnStartTs > 0 ? prevState.lastTurnStartTs - 5000 : 0;
-  const hasEventPlanBlock = safeEvents.some(
-    (ev) => ev && ev.planModeWriteBlocked && (turnFloorTs === 0 || (Number(ev.ts) || 0) >= turnFloorTs)
-  );
-  const hasActivePlanDenial = Boolean(transcriptTail?.latestPlanModeDenial || hasEventPlanBlock);
-  if (!hasActivePlanDenial) {
+  if (!approval.requiresConfirmation) {
     return { decision: "allow", reason: "", reasonCode: "no_plan_denial" };
   }
 
@@ -2210,35 +2239,28 @@ export function evaluateStop(payload, events = [], prevStateInput = null, option
   const stalePlanFailure = plan && metrics.lastFailureIsVerify && effectiveEvents.some(ev =>
     ev.failed && ev.kind === "cmd" && ev.ts === metrics.latestFailureTs && ev.planEvidence?.key === plan.key &&
     Number.isSafeInteger(ev.stepIdx) && plan.scopes[ev.planEvidence.checked?.scope]?.editStep > ev.stepIdx);
+  const latestFailures = effectiveEvents.filter(ev => ev.failed && ev.ts === metrics.latestFailureTs);
   const staleGateFailure = Boolean(
     deliveryGate &&
     !skipDeliveryGate &&
     gatePendingChecks.length > 0 &&
     !gateFailedCheck &&
     metrics.lastFailureIsVerify &&
-    effectiveEvents.some((ev, idx) => {
-      if (
-        !ev.failed ||
-        ev.kind !== "cmd" ||
-        ev.ts !== metrics.latestFailureTs ||
-        ev.deliveryEvidence?.key !== deliveryGate.key
-      ) {
+    latestFailures.length > 0 &&
+    latestFailures.every(ev => {
+      if (ev.kind !== "cmd" || ev.deliveryEvidence?.key !== deliveryGate.key) {
         return false;
       }
-      const evOrder = deliveryEventOrder(ev, idx);
+      const evOrder = deliveryEventOrder(ev);
       const checkedEntries = Array.isArray(ev.deliveryEvidence?.checked) ? ev.deliveryEvidence.checked : [];
       if (checkedEntries.length === 0) return false;
-      return checkedEntries.some(entry => {
+      return checkedEntries.every(entry => {
         const runKey = pathKey(entry?.runDir || "");
         if (!runKey) return false;
-        const sc = deliveryGate.scopes?.[runKey];
-        if (sc && sc.editStep !== undefined && sc.editStep > evOrder) return true;
-        return Object.values(deliveryGate.scopes || {}).some(
-          item =>
-            item.editStep !== undefined &&
-            item.editStep > evOrder &&
-            pathKey(item.root || "") === runKey
-        );
+        const scopes = Object.entries(deliveryGate.scopes || {}).filter(([key, sc]) =>
+          (key === runKey || pathKey(sc.root || "") === runKey) && deliveryEditOrders(sc).length);
+        return scopes.length > 0 && scopes.every(([, sc]) =>
+          deliveryEditOrders(sc).some(edit => compareDeliveryOrder(edit, evOrder) === 1));
       });
     })
   );

@@ -20,11 +20,11 @@
 | --- | --- | --- | --- | --- |
 | 主会话 / Orchestrator | 日常开发默认留主会话；Orchestrator 由规划模型（默认 Neon）只读规划、执行模型（默认 Hydrogen）落地，遇阻（如验证连败 2 次、异常或用户插话）自动回交规划模型 | 普通会话全端；Orchestrator 看当前模型选择器 | 普通会话全套餐；Orchestrator 面向合资格 Pro / Ultra / Enterprise | 沿用当前模型 |
 | Subagents（`invoke_subagent`） | 查一条调用链或验一个页面等单项独立旁支，主会话复核 | App、CLI、IDE 扩展、Antigravity IDE | 全套餐 | 用宿主开放角色；不可用留主会话 |
-| `/goal` | 单一明确目标持续推进，按测试或产物验收 | App、CLI、IDE 扩展、Antigravity IDE | 全套餐 | 普通会话按同一验收条件推进 |
+| `/goal` | 单一明确目标持续推进，按测试或产物验收；长程任务在独立 worktree 中每批单独 commit 作回滚点（替代 CLI 专属 `/undo`、`/rewind`），模板见 [multi-agent-playbooks.md](multi-agent-playbooks.md) | App、CLI、IDE 扩展、Antigravity IDE | 全套餐 | 普通会话按同一验收条件推进 |
 | `/boost` | 竞态、疑难算法或高耦合故障，需多假设独立挑战与验证 | App、CLI、IDE 扩展、Antigravity IDE | 付费 | 提可反驳假设，用同一复现实验逐项验证 |
 | `/swarm` | 可拆成互不撞文件的独立 Lane（多模块写码、多视角只读评审、只读排障、Best-of-N、多模型匿名评议） | App（`v2.30.0+` 侧栏 `Board · Members · Graph`；`v2.33.0+` 含商业/企业账户，受组织策略约束）、CLI（预览） | 全套餐（组织账户受策略约束） | 单写手分模块实施，按需补只读核查 |
 | `/run-workflow` | ≥5 个同质对象跑同一检查并交结构化结果，或把高频 Swarm 流程固化为脚本 | App、CLI | 全套餐 | 主会话顺序分批；纯匹配用本地命令 |
-| `/teamwork` | 跨天、多里程碑仓库迁移或系统重写，需分阶段独立审计 | App、CLI、IDE 扩展、Antigravity IDE | 付费 | 在实施计划中拆里程碑逐项验收 |
+| `/teamwork` | 跨天、多里程碑仓库迁移或系统重写，需分阶段独立审计 | App、CLI、IDE 扩展、Antigravity IDE | 付费 | 在实施计划中拆里程碑逐项验收；跨会话用 `PROGRESS.md`、`ADR/`、`TASKS.md`（含待确认项）交接 |
 
 入口以当前客户端实际开放为准。免费安全模式默认抑制 Swarm / Workflow 主动调度以保周配额（单次多成员 Swarm 约耗单会话 4～5 倍配额）；App 支持时用户可手动点名使用，IDE 走上表末列路径。Orchestrator 使用固定推理配置，单会话 effort 覆盖不生效。[模型与账户条件](https://antigravity.google/docs/models#orchestrator) · [Swarm](https://antigravity.google/docs/swarm) · [Dynamic Workflows](https://antigravity.google/docs/dynamic-workflows)
 

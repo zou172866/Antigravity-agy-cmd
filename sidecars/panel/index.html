@@ -763,7 +763,7 @@
           aria-pressed="false"
           title="默认关闭。开启后仅对同主版本且通过 SHA-256 校验的 Release 自动静默升级，单版本失败自动熔断，跨大版本仍需手动确认。"
         >自动更新：关</button>
-        <span class="ver-pill">v2.7.5</span>
+        <span class="ver-pill">v2.7.6</span>
       </div>
     </div>
 
@@ -1262,7 +1262,8 @@
           network: "连接 GitHub 时发生网络错误。",
           localVersion: "无法读取本地插件版本号。",
           busy: "正在执行另一次更新，请稍候。",
-          releaseChanged: "目标版本已变化或不再高于当前版本。",
+          releaseChanged: "目标版本或发行资产已变化，请重新检查更新。",
+          noVerifiedAsset: "当前发布缺少带 SHA-256 摘要的正式资产。请查看 GitHub Release，或使用本机安装脚本更新。",
           releaseCheck: "连接 GitHub 检查版本时失败。",
           download: "从 GitHub 下载更新压缩包失败。",
           redirect: "下载更新包时拦截到未授权的重定向域名。",
@@ -1347,7 +1348,12 @@
         } else if (state === "available") {
           titleText = `发现新版本：v${avail.currentVersion || currentPluginVersion || "--"} → v${avail.latestVersion}`;
           showUpdateBtn = true;
-          updateBtnText = "立即更新";
+          if (avail.assetUrl && avail.assetSha256) {
+            detailText = `${avail.assetName || "正式发行包"} · SHA-256 ${avail.assetSha256}`;
+          } else {
+            detailText = formatVersionError({ reason: "noVerifiedAsset" }, true);
+            updateBtnText = "重新检查";
+          }
           releaseHref = isSafeReleaseUrl(avail.releaseUrl) ? avail.releaseUrl : GITHUB_RELEASES_URL;
         } else if (state === "updating") {
           titleText = "正在下载并校验更新包…";
@@ -1496,7 +1502,8 @@
       }
 
       async function runPluginUpdate() {
-        const targetVersion = versionCheckState.available?.latestVersion;
+        const available = versionCheckState.available;
+        const targetVersion = available?.latestVersion;
         if (!targetVersion || versionCheckState.updating || versionCheckState.checking) return null;
         versionCheckState.updating = true;
         versionCheckState.updated = false;
@@ -1504,7 +1511,12 @@
         versionCheckState.manual = true;
         renderVersionUpdateUi();
         try {
-          const res = await callVersionApi("/api/update", { version: targetVersion });
+          const res = await callVersionApi("/api/update", {
+            version: targetVersion,
+            assetName: available.assetName,
+            assetUrl: available.assetUrl,
+            assetSha256: available.assetSha256
+          });
           const data = res?.data;
           if (!data || (data.status !== "updated" && data.status !== "error")) {
             versionCheckState.lastUpdate = { status: "error", reason: "install" };
@@ -1532,7 +1544,13 @@
       }
 
       function handleVersionUpdateClick() {
-        if (versionCheckState.manual && versionCheckState.lastCheck?.status === "error" && !versionCheckState.available) {
+        const available = versionCheckState.available;
+        if (
+          (available && (!available.assetUrl || !available.assetSha256)) ||
+          ["releaseChanged", "noVerifiedAsset"].includes(versionCheckState.lastUpdate?.reason) ||
+          (versionCheckState.manual && versionCheckState.lastCheck?.status === "error" && !available)
+        ) {
+          versionCheckState.available = null;
           return checkForUpdates(true, { fresh: true });
         }
         return runPluginUpdate();

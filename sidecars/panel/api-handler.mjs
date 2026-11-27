@@ -15,7 +15,7 @@ import {
 } from "../../hooks/lib/settings.mjs";
 import { readState } from "../../hooks/lib/state.mjs";
 import { createVersionChecker, parseVersion, readLocalVersion } from "./version-check.mjs";
-import { createPluginUpdater, evaluateAutoInstallEligibility } from "./version-update.mjs";
+import { createPluginUpdater, evaluateAutoInstallEligibility, verifiedAssetIdentity } from "./version-update.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -32,7 +32,7 @@ export const AUTO_UPDATE_ACK_ROUTE = "/api/auto-update-ack";
 const STAR_PROMPT_ALLOWED_KEYS = new Set(["state"]);
 const STAR_PROMPT_ALLOWED_STATES = new Set(STAR_PROMPT_TERMINAL_STATES);
 const VERSION_CHECK_ALLOWED_KEYS = new Set(["mode", "fresh"]);
-const PLUGIN_UPDATE_ALLOWED_KEYS = new Set(["version"]);
+const PLUGIN_UPDATE_ALLOWED_KEYS = new Set(["version", "assetName", "assetUrl", "assetSha256"]);
 const AUTO_UPDATE_ACK_ALLOWED_KEYS = new Set(["dismissNotice"]);
 const NON_CIRCUIT_AUTO_FAIL_REASONS = new Set(["gitCheckout", "notInstalled", "managedByHost", "busy", "releaseChanged"]);
 
@@ -359,11 +359,19 @@ export async function handlePluginUpdate(
       body: { ok: false, error: "Invalid or missing 'version' SemVer string" }
     };
   }
+  const hasAsset = Object.keys(rawData).some((key) => key !== "version");
+  const expectedAsset = hasAsset ? verifiedAssetIdentity(rawData, { strictNameMatch: true }) : undefined;
+  if (hasAsset && !expectedAsset) {
+    return {
+      status: 400,
+      body: { ok: false, error: "Expected a release asset URL and SHA-256 digest, with an optional archive filename" }
+    };
+  }
   const resolvedUpdater = updater || getDefaultPluginUpdater();
   let result;
   _updateInFlight = true;
   try {
-    result = await resolvedUpdater(parsed.version);
+    result = await resolvedUpdater(parsed.version, { expectedAsset });
   } finally {
     _updateInFlight = false;
   }
@@ -481,7 +489,7 @@ export async function runAutoUpdateCycle({
     }
 
     const updOut = await handlePluginUpdate(
-      { version: eligibility.targetVersion },
+      { version: eligibility.targetVersion, ...eligibility.expectedAsset },
       { stateDir, updater, onUpdated, automatic: true, nowIso }
     );
     const updBody = updOut?.body;

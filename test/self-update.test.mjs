@@ -648,8 +648,9 @@ test("version-update: atomic ZIP & TAR.GZ self-update, case-insensitive FS, roll
       "new-case-v250"
     );
 
-    // 4. TAR.GZ fallback upgrade (2.5.0 -> 2.6.0) when release has no verified ZIP asset
+    // 4. A .tgz release asset uses the same mandatory digest check as ZIP.
     const v260Tar = packBundleAsTarGz(collectRepoBundleFiles("2.6.0"));
+    const tarUrl = `https://github.com/${REPO}/releases/download/v2.6.0/agy-cmd-v2.6.0.tgz`;
     const tarUpdater = createPluginUpdater({
       sidecarDirectory: path.join(installedRoot, "sidecars", "panel"),
       pluginsDirectory: pluginsDir,
@@ -659,11 +660,14 @@ test("version-update: atomic ZIP & TAR.GZ self-update, case-insensitive FS, roll
         currentVersion: "2.5.0",
         latestVersion: "2.6.0",
         releaseTag: "v2.6.0",
-        releaseUrl: `https://github.com/${REPO}/releases/tag/v2.6.0`
+        releaseUrl: `https://github.com/${REPO}/releases/tag/v2.6.0`,
+        assetName: "agy-cmd-v2.6.0.tgz",
+        assetUrl: tarUrl,
+        assetSha256: sha256Hex(v260Tar)
       }),
       downloadOptions: {
         fetchImpl: async (url) => {
-          assert.equal(url, `https://api.github.com/repos/${REPO}/tarball/v2.6.0`);
+          assert.equal(url, tarUrl);
           return { ok: true, status: 200, headers: new Map(), arrayBuffer: async () => v260Tar };
         }
       }
@@ -671,6 +675,7 @@ test("version-update: atomic ZIP & TAR.GZ self-update, case-insensitive FS, roll
     const tarRes = await tarUpdater("2.6.0");
     assert.equal(tarRes.ok, true);
     assert.equal(tarRes.status, "updated");
+    assert.equal(tarRes.verifiedSha256, sha256Hex(v260Tar));
     assert.equal(readLocalVersion(installedRoot), "2.6.0");
 
     // 5. Tampered agents/cmd-verifier.md & broken relative import rejected before touching disk
@@ -781,6 +786,91 @@ test("version-update: atomic ZIP & TAR.GZ self-update, case-insensitive FS, roll
   }
 });
 
+test("manual and automatic updates pin the selected official asset across the fresh release check", async (t) => {
+  const tmp = makeTmpDir("agy-cmd-pin-");
+  t.after(() => fs.rmSync(tmp, { recursive: true, force: true }));
+  resetUpdateRuntimeFlags();
+  const version = "2.5.0";
+  const zip = packBundleAsZip(collectRepoBundleFiles(version));
+  const asset = {
+    assetName: "agy-cmd-v2.5.0.zip",
+    assetUrl: `https://github.com/${REPO}/releases/download/v2.5.0/agy-cmd-v2.5.0.zip`,
+    assetSha256: sha256Hex(zip)
+  };
+  const release = { status: "update", currentVersion: "2.4.0", latestVersion: version, releaseTag: "v2.5.0", ...asset };
+  const missingAsset = { assetName: undefined, assetUrl: undefined, assetSha256: undefined };
+  const cases = [
+    [missingAsset, "noVerifiedAsset"],
+    [{ assetSha256: undefined }, "noVerifiedAsset"],
+    [{ assetSha256: "0".repeat(64) }, "releaseChanged"],
+    [{ assetName: "agy-cmd-2.5.0.zip" }, "releaseChanged"],
+    [{ assetUrl: asset.assetUrl.replace(/v2\.5\.0\.zip$/, "2.5.0.zip") }, "releaseChanged"]
+  ];
+
+  function snapshotFiles(root, dir = root) {
+    const snapshot = {};
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const file = path.join(dir, entry.name);
+      if (entry.isDirectory()) Object.assign(snapshot, snapshotFiles(root, file));
+      else snapshot[path.relative(root, file)] = sha256Hex(fs.readFileSync(file));
+    }
+    return snapshot;
+  }
+
+  for (const mode of ["manual", "auto"]) {
+    const root = path.join(tmp, mode, "plugins", "agy-cmd");
+    writeBundleToDir(root, collectRepoBundleFiles(release.currentVersion, {
+      [UPDATE_MARKER_NAME]: JSON.stringify({ pid: 99999999, phase: "replacing" })
+    }));
+    const initial = snapshotFiles(root);
+    let fresh;
+    let downloads = 0;
+    const updater = createPluginUpdater({
+      sidecarDirectory: path.join(root, "sidecars", "panel"),
+      markerOptions: { isPidAlive: () => false },
+      checkVersion: async (requestMode, options) => {
+        assert.equal(requestMode, "manual");
+        assert.deepEqual(options, { fresh: true });
+        return fresh;
+      },
+      downloadOptions: {
+        fetchImpl: async (url) => {
+          downloads++;
+          assert.equal(url, asset.assetUrl);
+          return { ok: true, status: 200, headers: new Map(), arrayBuffer: async () => zip };
+        }
+      }
+    });
+    const install = async () => {
+      if (mode === "manual") return (await handlePluginUpdate({ version, ...asset }, { updater })).body;
+      return (await runAutoUpdateCycle({
+        checker: async () => release,
+        updater,
+        env: { AGY_CMD_AUTO_UPDATE_CHECK: "1", AGY_CMD_AUTO_UPDATE_INSTALL: "1" }
+      })).result;
+    };
+    for (const [changes, reason] of cases) {
+      fresh = { ...release, ...changes };
+      const result = await install();
+      assert.equal(result.reason, reason, mode);
+      assert.equal(downloads, 0);
+      assert.deepEqual(snapshotFiles(root), initial);
+    }
+    // Existing version-only API callers must also refuse releases without a digest.
+    fresh = { ...release, ...missingAsset };
+    assert.equal((await handlePluginUpdate({ version }, { updater })).body.reason, "noVerifiedAsset");
+    assert.equal(downloads, 0);
+    assert.deepEqual(snapshotFiles(root), initial);
+
+    fresh = { ...release, assetSha256: asset.assetSha256.toUpperCase() };
+    const result = await install();
+    assert.equal(result.status, "updated", mode);
+    assert.equal(result.verifiedSha256, asset.assetSha256);
+    assert.equal(downloads, 1);
+    assert.equal(readLocalVersion(root), version);
+  }
+});
+
 test("server & api-handler: POST+CSRF security on /api/version and /api/update, autoUpdateCheck gating & busy flags", async () => {
   const stateDir = makeTmpDir("agy-cmd-api-");
   const csrf = "self-update-csrf-token-abcdef0123456789";
@@ -866,7 +956,20 @@ test("server & api-handler: POST+CSRF security on /api/version and /api/update, 
       });
       assert.equal(r.status, 400);
     }
-    for (const bad of [{}, { version: "not-semver" }, { version: "2.5.0", extra: 1 }]) {
+    const validAsset = {
+      version: "2.5.0",
+      assetUrl: `https://github.com/${REPO}/releases/download/v2.5.0/agy-cmd-v2.5.0.zip`,
+      assetSha256: "e".repeat(64)
+    };
+    for (const bad of [
+      {}, { version: "not-semver" }, { version: "2.5.0", extra: 1 },
+      { version: "2.5.0", assetName: "agy-cmd-v2.5.0.zip" },
+      { version: "2.5.0", assetSha256: validAsset.assetSha256 },
+      { ...validAsset, assetSha256: "f" }, { ...validAsset, assetSha256: null },
+      { ...validAsset, assetUrl: "https://example.invalid/agy-cmd.zip" },
+      { ...validAsset, assetName: "../other.zip" },
+      { ...validAsset, assetName: "agy-cmd-2.5.0.zip" }
+    ]) {
       const r = await httpRawRequest(port, UPDATE_ROUTE, {
         headers: { "Content-Type": "application/json", "X-Agy-Cmd-Csrf": csrf },
         body: JSON.stringify(bad)
@@ -1092,11 +1195,21 @@ test("Sidecar UI index.html: startup auto-check, retry fresh:true, update flow, 
         currentVersion: "2.4.1",
         latestVersion: "2.5.0",
         releaseTag: "v2.5.0",
-        releaseUrl: `https://github.com/${REPO}/releases/tag/v2.5.0`
+        releaseUrl: `https://github.com/${REPO}/releases/tag/v2.5.0`,
+        ...(versionReplyMode !== "missing-asset" && {
+          assetName: "agy-cmd-v2.5.0.zip",
+          assetUrl: `https://github.com/${REPO}/releases/download/v2.5.0/agy-cmd-v2.5.0.zip`,
+          assetSha256: "a".repeat(64)
+        })
       });
     }
     if (urlPath === UPDATE_ROUTE) {
-      assert.deepEqual(body, { version: "2.5.0" });
+      assert.deepEqual(body, {
+        version: "2.5.0",
+        assetName: "agy-cmd-v2.5.0.zip",
+        assetUrl: `https://github.com/${REPO}/releases/download/v2.5.0/agy-cmd-v2.5.0.zip`,
+        assetSha256: "a".repeat(64)
+      });
       stateVersion = "2.5.0";
       return mk({
         ok: true,
@@ -1157,6 +1270,10 @@ test("Sidecar UI index.html: startup auto-check, retry fresh:true, update flow, 
   assert.equal(getEl("version-update-banner").dataset.state, "check-error");
   assert.equal(getEl("version-update-btn").textContent, "重试");
 
+  versionReplyMode = "missing-asset";
+  await getEl("version-update-btn").trigger("click");
+  assert.equal(getEl("version-update-btn").textContent, "重新检查");
+  assert.match(getEl("version-detail-text").textContent, /缺少带 SHA-256 摘要/);
   versionReplyMode = "update";
   await getEl("version-update-btn").trigger("click");
   assert.deepEqual(requests.at(-1), { urlPath: VERSION_ROUTE, body: { mode: "manual", fresh: true } });
@@ -1201,7 +1318,10 @@ test("auto-update-install: 4 guardrails (opt-in default off, SHA-256 required, s
   // 1. Pure 4-guardrail eligibility checks
   assert.deepEqual(
     evaluateAutoInstallEligibility({ release: baseRelease, currentVersion: "2.5.0" }),
-    { eligible: true, skipReason: null, targetVersion: "2.5.1" }
+    {
+      eligible: true, skipReason: null, targetVersion: "2.5.1",
+      expectedAsset: { assetName: baseRelease.assetName, assetUrl: baseRelease.assetUrl, assetSha256: validSha }
+    }
   );
   assert.equal(
     evaluateAutoInstallEligibility({
@@ -1213,6 +1333,13 @@ test("auto-update-install: 4 guardrails (opt-in default off, SHA-256 required, s
   assert.equal(
     evaluateAutoInstallEligibility({
       release: { ...baseRelease, assetUrl: "", assetSha256: "" },
+      currentVersion: "2.5.0"
+    }).skipReason,
+    "noVerifiedAsset"
+  );
+  assert.equal(
+    evaluateAutoInstallEligibility({
+      release: { ...baseRelease, assetUrl: "https://example.invalid/agy-cmd-v2.5.1.zip" },
       currentVersion: "2.5.0"
     }).skipReason,
     "noVerifiedAsset"
