@@ -41,19 +41,19 @@ Run the pinned one-line installer for your OS (downloads the official release ZI
 **Windows (PowerShell):**
 
 ```powershell
-irm https://raw.githubusercontent.com/zou172866/Antigravity-agy-cmd/v2.7.6/install.ps1 | iex
+irm https://raw.githubusercontent.com/zou172866/Antigravity-agy-cmd/v2.8.0/install.ps1 | iex
 ```
 
 **macOS / Linux:**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zou172866/Antigravity-agy-cmd/v2.7.6/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/zou172866/Antigravity-agy-cmd/v2.8.0/install.sh | sh
 ```
 
 ### Other Install Options
 
 - **Offline stable ZIP (with SHA-256 verification)**: download the official ZIP and `SHA256SUMS.txt` from [GitHub Releases](https://github.com/zou172866/Antigravity-agy-cmd/releases/latest):
-  - Verify and install directly: `.\install.ps1 --archive .\agy-cmd-v2.7.6.zip --checksums .\SHA256SUMS.txt` (Windows) or `sh ./install.sh --archive ./agy-cmd-v2.7.6.zip --checksums ./SHA256SUMS.txt` (macOS / Linux).
+  - Verify and install directly: `.\install.ps1 --archive .\agy-cmd-v2.8.0.zip --checksums .\SHA256SUMS.txt` (Windows) or `sh ./install.sh --archive ./agy-cmd-v2.8.0.zip --checksums ./SHA256SUMS.txt` (macOS / Linux).
   - Or extract and run `.\install.ps1` (Windows) / `sh ./install.sh` (macOS / Linux) inside the unpacked folder.
 - **Manual Git clone** (a `.git` checkout inside `plugins/agy-cmd` disables Sidecar self-update to protect your working tree; update with `git pull` or use the one-line installer above):
 

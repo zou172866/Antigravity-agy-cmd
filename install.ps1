@@ -3,15 +3,15 @@
   Pinned-release, SHA-256-verified Windows installer for agy-cmd.
   Supports:
     - Pinned remote release install:
-        irm https://raw.githubusercontent.com/zou172866/Antigravity-agy-cmd/v2.7.6/install.ps1 | iex
+        irm https://raw.githubusercontent.com/zou172866/Antigravity-agy-cmd/v2.8.0/install.ps1 | iex
     - Local checkout / extracted archive install:
         .\install.ps1
     - Offline SHA-256-verified ZIP install:
-        .\install.ps1 --archive .\agy-cmd-v2.7.6.zip --checksums .\SHA256SUMS.txt
+        .\install.ps1 --archive .\agy-cmd-v2.8.0.zip --checksums .\SHA256SUMS.txt
 #>
 $ErrorActionPreference = "Stop"
 $ScriptPath = $MyInvocation.MyCommand.Path
-$DefaultVersion = "v2.7.6"
+$DefaultVersion = "v2.8.0"
 $ReleaseDownloadBase = "https://github.com/zou172866/Antigravity-agy-cmd/releases/download"
 
 function Fail-Install([string]$Message, [int]$Code = 1) {

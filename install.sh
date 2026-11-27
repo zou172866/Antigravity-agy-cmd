@@ -2,14 +2,14 @@
 # Pinned-release, SHA-256-verified POSIX installer for agy-cmd.
 # Supports:
 #   - Pinned remote release install:
-#       curl -fsSL https://raw.githubusercontent.com/zou172866/Antigravity-agy-cmd/v2.7.6/install.sh | sh
+#       curl -fsSL https://raw.githubusercontent.com/zou172866/Antigravity-agy-cmd/v2.8.0/install.sh | sh
 #   - Local checkout / extracted archive install:
 #       sh ./install.sh
 #   - Offline SHA-256-verified ZIP install:
-#       sh ./install.sh --archive ./agy-cmd-v2.7.6.zip --checksums ./SHA256SUMS.txt
+#       sh ./install.sh --archive ./agy-cmd-v2.8.0.zip --checksums ./SHA256SUMS.txt
 set -eu
 
-DEFAULT_VERSION="v2.7.6"
+DEFAULT_VERSION="v2.8.0"
 RELEASE_DOWNLOAD_BASE="https://github.com/zou172866/Antigravity-agy-cmd/releases/download"
 
 if ! command -v node >/dev/null 2>&1; then

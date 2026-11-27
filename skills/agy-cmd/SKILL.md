@@ -3,7 +3,7 @@ name: agy-cmd
 description: Antigravity 桌面端/IDE 高阶能力自动路由与内置斜杠指令参谋。用于开关路由、调自动重试/交付门禁/会员 Boost，或查询对比 /grill-me、/plan、/goal、/boost、/swarm、/run-workflow 等内置指令（禁混 CLI 专属命令）。
 ---
 
-# agy-cmd：高阶能力自动路由与指令参谋（v2.7.6）
+# agy-cmd：高阶能力自动路由与指令参谋（v2.8.0）
 
 四项能力：**常驻精简规则**（`rules/AGENTS.md`）、**零稳态开销钩子**（`hooks.json`：`SessionStart` / `PreToolUse` / `PostToolUse` / `PreInvocation` / `Stop`）、**右侧 Sidecar 面板**（`sidecar://agy-cmd/panel/`）与**按需指令参谋**。
 
