@@ -13,10 +13,11 @@ import {
   isSubagentPayload,
   parseHookPayload,
   readStdin,
+  resolveConversationId,
   resolveStateDir
 } from "./lib/common.mjs";
 import { readSettings, updateSettings } from "./lib/settings.mjs";
-import { isSubagentTranscript, resolveTranscriptPath } from "./lib/transcript.mjs";
+import { resolveTranscriptPath, resolveWorkerTranscriptIdentity } from "./lib/transcript.mjs";
 
 export async function runSessionStart(rawInput, env = process.env, nowIso = new Date().toISOString()) {
   const payload = parseHookPayload(rawInput);
@@ -30,12 +31,12 @@ export async function runSessionStart(rawInput, env = process.env, nowIso = new 
     return {};
   }
 
+  const stateDir = resolveStateDir(env);
+  const convId = resolveConversationId(payload, env);
   const transcriptPath = resolveTranscriptPath(payload);
-  if (transcriptPath && isSubagentTranscript(transcriptPath)) {
+  if (transcriptPath && resolveWorkerTranscriptIdentity(transcriptPath, { stateDir, convId }).isSubagent) {
     return {};
   }
-
-  const stateDir = resolveStateDir(env);
   try {
     const settings = readSettings(stateDir);
     if (settings.onboardingShown || settings.configuredByUser) {

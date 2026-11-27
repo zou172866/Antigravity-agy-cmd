@@ -11,6 +11,7 @@
  *   4. Repo-wide multi-day migration/rewrite -> suggest `/teamwork`
  */
 import {
+  detectHostSurface,
   isDirectRun,
   isSubagentPayload,
   isUiOnlyMode,
@@ -20,6 +21,7 @@ import {
   resolveStateDir
 } from "./lib/common.mjs";
 import { evaluatePreInvocation } from "./lib/detector.mjs";
+import { detectHostVersion, recordHostDiagnostic } from "./lib/diagnostics.mjs";
 import { readSettings } from "./lib/settings.mjs";
 import {
   clearEvents,
@@ -32,8 +34,8 @@ import {
 } from "./lib/state.mjs";
 import {
   inspectTranscriptTail,
-  isSubagentTranscript,
-  resolveTranscriptPath
+  resolveTranscriptPath,
+  resolveWorkerTranscriptIdentity
 } from "./lib/transcript.mjs";
 
 export async function runPreInvocation(rawInput, env = process.env, nowMs = Date.now()) {
@@ -42,18 +44,43 @@ export async function runPreInvocation(rawInput, env = process.env, nowMs = Date
     return {};
   }
 
-  const transcriptPath = resolveTranscriptPath(payload);
-  if (transcriptPath && isSubagentTranscript(transcriptPath)) {
-    return {};
-  }
-
   const stateDir = resolveStateDir(env);
   const convId = resolveConversationId(payload, env);
+  const transcriptPath = resolveTranscriptPath(payload);
+  if (transcriptPath) {
+    const workerId = resolveWorkerTranscriptIdentity(transcriptPath, { stateDir, convId, nowMs });
+    if (workerId.isSubagent) {
+      return {};
+    }
+    if (workerId.status === "unknown" && workerId.source !== "fork_window_gap") {
+      recordHostDiagnostic(stateDir, {
+        surface: detectHostSurface(payload),
+        hostVersion: detectHostVersion(payload, env),
+        reason: "worker_identity_unknown"
+      });
+    }
+  }
   const uiOnly = isUiOnlyMode(env);
 
   try {
     const settings = readSettings(stateDir);
     const transcriptTail = transcriptPath ? inspectTranscriptTail(transcriptPath) : null;
+    if (transcriptTail?.adapter) {
+      const st = transcriptTail.adapter.readStatus;
+      if (st === "malformed" || st === "unreadable" || st === "truncated_empty") {
+        recordHostDiagnostic(stateDir, {
+          surface: detectHostSurface(payload),
+          hostVersion: detectHostVersion(payload, env),
+          reason: "transcript_parse_unknown"
+        });
+      } else if (transcriptTail.tailRolledOverWithoutUserInput) {
+        recordHostDiagnostic(stateDir, {
+          surface: detectHostSurface(payload),
+          hostVersion: detectHostVersion(payload, env),
+          reason: "transcript_rolled_over_unknown"
+        });
+      }
+    }
 
     if (!convId) {
       const decision = evaluatePreInvocation(payload, [], createDefaultState(), {

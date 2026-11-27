@@ -1021,3 +1021,34 @@ test("P1 Batch B · B-2: settings lock timeout aborts writes with 503 preserving
   assert.equal(merged.deliveryTestGateEnabled, true);
   assert.equal(merged.planFallbackEnabled, false);
 });
+
+test("P1 Batch C · Panel exposes stratified Stop outcome & hostDiagnostics", async (t) => {
+  const dir = makeTmpDir("agy-cmd-c-panel-");
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const env = makeEnv(dir);
+  const convId = "panel-stop-strat";
+  updateSettings(dir, { autoRetryMode: "count", autoRetryMax: 1, autoRetryScope: "all_failures" });
+  await runPreInvocation({ conversationId: convId, invocationNum: 0, initialNumSteps: 1, lastUserInput: "修测试" }, env, 1000);
+  await runPostToolUse(
+    { conversationId: convId, toolCall: { name: "run_command", args: { CommandLine: "npm test" } }, error: "exit 1" },
+    env,
+    1010
+  );
+  // 1st stop -> continue (failed / auto_continue)
+  const s1 = await runStop({ conversationId: convId, terminationReason: "NO_TOOL_CALL", fullyIdle: true }, env, 1020);
+  assert.equal(s1.decision, "continue");
+  const st1 = dispatchPanelApi("/api/state", { conversationId: convId }, { stateDir: dir });
+  assert.equal(st1.status, 200);
+  assert.equal(st1.body.activeSession?.lastStopOutcome?.verificationStatus, "failed");
+  assert.equal(st1.body.activeSession?.lastStopOutcome?.verificationStatusZh, "验证失败");
+  assert.equal(st1.body.activeSession?.lastStopOutcome?.exitReason, "auto_continue");
+  assert.equal(typeof st1.body.hostDiagnostics?.totals, "object");
+
+  // 2nd stop with no new progress -> allow via no_progress_guard, still tagged `failed` (not falsely `passed`)
+  const s2 = await runStop({ conversationId: convId, terminationReason: "NO_TOOL_CALL", fullyIdle: true }, env, 1030);
+  assert.equal(s2.decision, "allow");
+  const st2 = dispatchPanelApi("/api/state", { conversationId: convId }, { stateDir: dir });
+  assert.equal(st2.body.activeSession?.lastStopOutcome?.verificationStatus, "failed");
+  assert.equal(st2.body.activeSession?.lastStopOutcome?.exitReason, "no_progress_guard");
+  assert.match(st2.body.activeSession?.lastStopOutcome?.exitReasonZh || "", /无新进展/);
+});

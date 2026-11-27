@@ -20,8 +20,8 @@ import { readSettings } from "./lib/settings.mjs";
 import { appendEvents, readState } from "./lib/state.mjs";
 import {
   findTranscriptStep,
-  isSubagentTranscript,
-  resolveTranscriptPath
+  resolveTranscriptPath,
+  resolveWorkerTranscriptIdentity
 } from "./lib/transcript.mjs";
 
 export async function runPostToolUse(rawInput, env = process.env, nowMs = Date.now()) {
@@ -30,8 +30,10 @@ export async function runPostToolUse(rawInput, env = process.env, nowMs = Date.n
     return {};
   }
 
+  const stateDir = resolveStateDir(env);
+  const convId = resolveConversationId(payload, env);
   const transcriptPath = resolveTranscriptPath(payload);
-  if (transcriptPath && isSubagentTranscript(transcriptPath)) {
+  if (transcriptPath && resolveWorkerTranscriptIdentity(transcriptPath, { stateDir, convId, nowMs }).isSubagent) {
     return {};
   }
 
@@ -46,8 +48,6 @@ export async function runPostToolUse(rawInput, env = process.env, nowMs = Date.n
       ? findTranscriptStep(transcriptPath, stepIdx)
       : null;
 
-  const stateDir = resolveStateDir(env);
-  const convId = resolveConversationId(payload, env);
   if (!convId) {
     return {};
   }

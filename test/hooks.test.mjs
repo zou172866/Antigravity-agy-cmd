@@ -34,7 +34,13 @@ import {
   withSessionLock,
   writeState
 } from "../hooks/lib/state.mjs";
-import { inspectTranscriptTail, isSubagentTranscript } from "../hooks/lib/transcript.mjs";
+import {
+  inspectSubagentTranscript,
+  inspectTranscriptTail,
+  isSubagentTranscript,
+  resolveWorkerTranscriptIdentity
+} from "../hooks/lib/transcript.mjs";
+import { readHostDiagnostics } from "../hooks/lib/diagnostics.mjs";
 import { runSessionStart } from "../hooks/session-start.mjs";
 import { runPreToolUse } from "../hooks/pre-tool-use.mjs";
 import { runPostToolUse } from "../hooks/post-tool-use.mjs";
@@ -5221,4 +5227,169 @@ test("P1 Batch B · B-3: session lock prevents lost appends during compaction, s
   const finalRaceState = readState(dir, convRace);
   assert.ok(finalRaceState.rev >= 5, `Expected monotonic rev >= 5, got ${finalRaceState.rev}`);
   assert.equal(finalRaceState.userTurnCount, 5);
+});
+
+test("P1 Batch C · H1 + B6: tri-state transcript adapter blocks unknown green/approval, records privacy-safe diagnostics, and persists worker positive evidence across >320KB rollover", async (t) => {
+  const dir = makeTmpDir("agy-cmd-c-h1b6-");
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const env = makeEnv(dir, { ANTIGRAVITY_CONVERSATION_ID: "" });
+
+  // 1. Malformed / unknown-schema transcript returns tri-state `unknown` and NEVER marks pending verification green
+  const badTx = path.join(dir, "malformed.jsonl");
+  fs.writeFileSync(badTx, "not-valid-json\n{still broken\n", "utf8");
+  const badTail = inspectTranscriptTail(badTx);
+  assert.equal(badTail.adapter.readStatus, "malformed");
+  assert.equal(badTail.adapter.states.planApproval, "unknown");
+  assert.equal(badTail.adapter.states.toolReceipts, "unknown");
+
+  const recUnknown = reconcileEventsWithTranscript(
+    [{ kind: "cmd", tool: "run_command", stepIdx: 4, failed: false, pending: true, isVerify: true, cmd: "npm test" }],
+    badTail,
+    {}
+  );
+  assert.equal(recUnknown.unknownReceipts, 1);
+  assert.equal(recUnknown.resolvedEvents[0].evidenceUnknown, true);
+  assert.equal(recUnknown.resolvedEvents[0].terminal, false);
+
+  // PreInvocation against malformed transcript records aggregate count in diagnostics.json (no user text/paths)
+  const secretPrompt = "sk-secret-DO-NOT-LOG 帮我查一下";
+  await runPreInvocation(
+    { conversationId: "diag-c1", transcriptPath: badTx, hostSurface: "app", hostVersion: "2.40.1", invocationNum: 0, initialNumSteps: 1, lastUserInput: secretPrompt },
+    env,
+    1000
+  );
+  const diagRaw = fs.readFileSync(path.join(dir, "diagnostics.json"), "utf8");
+  assert.equal(diagRaw.includes("DO-NOT-LOG"), false);
+  assert.equal(diagRaw.includes(badTx), false);
+  const diag = readHostDiagnostics(dir);
+  assert.ok(diag.totals.transcript_parse_unknown >= 1);
+  assert.ok(diag.buckets["app@2.40.1"]?.counts?.transcript_parse_unknown >= 1);
+
+  // 2. Structured plan waiting works WITHOUT relying on `[agy-cmd → /plan 审批]` display badge text
+  const structuredPlanTx = path.join(dir, "structured-plan.jsonl");
+  fs.writeFileSync(
+    structuredPlanTx,
+    [
+      JSON.stringify({ step_index: 0, type: "USER_INPUT", content: "<USER_REQUEST>\n重构四个模块\n</USER_REQUEST>" }),
+      JSON.stringify({ step_index: 1, type: "GENERIC", status: "ERROR", error: "Plan mode is read-only: write_file denied" }),
+      JSON.stringify({
+        step_index: 2,
+        type: "PLANNER_RESPONSE",
+        awaiting_user_approval: true,
+        content: "## 实施计划\n1. 更新模块 A\n2. 更新模块 B\n请确认是否执行。"
+      })
+    ].join("\n") + "\n",
+    "utf8"
+  );
+  const structuredTail = inspectTranscriptTail(structuredPlanTx);
+  assert.equal(structuredTail.awaitingUserApprovalOrQuestion, true);
+  assert.equal(structuredTail.adapter.states.planApproval, "confirmed");
+
+  // 3. B6: Forked Swarm worker confirmed when `<swarm_worker>` is in window stays isolated even after >320KB rolls it out of BOTH head & tail; rewind invalidates!
+  const workerId = "fork-worker-roll-1";
+  const workerTx = path.join(dir, "fork-roll.jsonl");
+  const bigChunk = "z".repeat(16 * 1024);
+  const initialLines = [
+    JSON.stringify({ step_index: 0, type: "USER_INPUT", content: "<USER_REQUEST>\n/swarm big task\n</USER_REQUEST>" }),
+    ...Array.from({ length: 5 }, (_, i) => JSON.stringify({ step_index: i + 1, type: "GENERIC", content: bigChunk })),
+    JSON.stringify({ step_index: 6, type: "SYSTEM_MESSAGE", content: "<swarm_worker>You are @lane-a.</swarm_worker>" })
+  ];
+  fs.writeFileSync(workerTx, initialLines.join("\n") + "\n", "utf8");
+  const firstCheck = resolveWorkerTranscriptIdentity(workerTx, { stateDir: dir, convId: workerId, nowMs: 2000 });
+  assert.equal(firstCheck.isSubagent, true);
+  assert.equal(firstCheck.status, "confirmed");
+
+  // Append >300KB of ordinary steps so `<swarm_worker>` falls strictly between 64KB head and 256KB tail
+  const extraLines = Array.from({ length: 20 }, (_, i) =>
+    JSON.stringify({ step_index: 7 + i, type: "GENERIC", content: bigChunk })
+  );
+  fs.appendFileSync(workerTx, extraLines.join("\n") + "\n", "utf8");
+  // Raw stateless inspect cannot see the rolled-out marker, but generation-bound positive evidence STILL confirms worker!
+  assert.equal(inspectSubagentTranscript(workerTx).rolledPastWindow, true);
+  const secondCheck = resolveWorkerTranscriptIdentity(workerTx, { stateDir: dir, convId: workerId, nowMs: 3000 });
+  assert.equal(secondCheck.isSubagent, true);
+  assert.equal(secondCheck.status, "confirmed");
+  assert.match(secondCheck.source, /^persisted:/);
+
+  // Hooks remain silent and write ZERO sessions/<workerId>.state.json
+  assert.deepEqual(
+    await runPreInvocation({ conversationId: workerId, transcriptPath: workerTx, invocationNum: 0, initialNumSteps: 30, lastUserInput: "修挂掉的测试" }, env, 3100),
+    {}
+  );
+  assert.equal(fs.existsSync(path.join(dir, "sessions", `${workerId}.state.json`)), false);
+
+  // Rewind/truncate the transcript to a smaller size (before `<swarm_worker>`) -> positive evidence MUST invalidate!
+  fs.writeFileSync(
+    workerTx,
+    JSON.stringify({ step_index: 0, type: "USER_INPUT", content: "<USER_REQUEST>\n新任务\n</USER_REQUEST>" }) + "\n",
+    "utf8"
+  );
+  const rewoundCheck = resolveWorkerTranscriptIdentity(workerTx, { stateDir: dir, convId: workerId, nowMs: 4000 });
+  assert.equal(rewoundCheck.isSubagent, false);
+});
+
+test("P1 Batch C · Stop stratification: separates verificationStatus (passed/not_run/failed/user_exempt/insufficient_evidence) from exitReason", () => {
+  const settings = { autoRetryMode: "count", autoRetryMax: 1, autoRetryScope: "smart", deliveryTestGateEnabled: true };
+
+  // 1. passed + all_green_or_no_failure
+  const passed = evaluateStop(
+    { terminationReason: "NO_TOOL_CALL", fullyIdle: true, lastUserInput: "修好测试" },
+    [
+      { kind: "edit", failed: false, ts: 1000, files: ["src/a.js"] },
+      { kind: "cmd", failed: false, isVerify: true, ts: 1010, cmd: "npm test" }
+    ],
+    { lastTurnStartTs: 990 },
+    { nowMs: 1020, settings: { ...settings, deliveryTestGateEnabled: false } }
+  );
+  assert.equal(passed.decision, "allow");
+  assert.equal(passed.verificationStatus, "passed");
+  assert.equal(passed.exitReason, "all_green_or_no_failure");
+  assert.equal(passed.nextState.lastStopOutcome.verificationStatus, "passed");
+
+  // 2. user_exempt + term_user_canceled
+  const canceled = evaluateStop(
+    { terminationReason: "USER_CANCELED", fullyIdle: true },
+    [{ kind: "cmd", failed: true, isVerify: true, ts: 1000, cmd: "npm test" }],
+    { lastTurnStartTs: 990 },
+    { nowMs: 1020, settings }
+  );
+  assert.equal(canceled.decision, "allow");
+  assert.equal(canceled.verificationStatus, "user_exempt");
+  assert.equal(canceled.exitReason, "term_user_canceled");
+
+  // 3. failed + retry_limit_reached (allow stop because budget exhausted, NOT because tests passed!)
+  const capped = evaluateStop(
+    { terminationReason: "NO_TOOL_CALL", fullyIdle: true, lastUserInput: "修好测试" },
+    [
+      { kind: "edit", failed: false, ts: 1000, files: ["src/a.js"] },
+      { kind: "cmd", failed: true, isVerify: true, ts: 1010, cmd: "npm test" }
+    ],
+    { lastTurnStartTs: 990, turnAutoRetries: 1, lastContinueEventSig: "prev" },
+    { nowMs: 1020, settings: { ...settings, deliveryTestGateEnabled: false } }
+  );
+  assert.equal(capped.decision, "allow");
+  assert.equal(capped.verificationStatus, "failed");
+  assert.equal(capped.exitReason, "retry_limit_reached");
+
+  // 4. insufficient_evidence + not_fully_idle
+  const bgRunning = evaluateStop(
+    { terminationReason: "NO_TOOL_CALL", fullyIdle: false },
+    [],
+    { lastTurnStartTs: 990 },
+    { nowMs: 1020, settings }
+  );
+  assert.equal(bgRunning.decision, "allow");
+  assert.equal(bgRunning.verificationStatus, "insufficient_evidence");
+  assert.equal(bgRunning.exitReason, "not_fully_idle");
+
+  // 5. not_run + awaiting_user_input
+  const waiting = evaluateStop(
+    { terminationReason: "NO_TOOL_CALL", fullyIdle: true, lastUserInput: "重构模块" },
+    [],
+    { lastTurnStartTs: 990 },
+    { nowMs: 1020, settings, transcriptTail: { awaitingUserApprovalOrQuestion: true } }
+  );
+  assert.equal(waiting.decision, "allow");
+  assert.equal(waiting.verificationStatus, "not_run");
+  assert.equal(waiting.exitReason, "awaiting_user_input");
 });

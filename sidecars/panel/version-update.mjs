@@ -33,6 +33,7 @@ const REQUIRED_FILES = [
   "hooks/stop.mjs",
   "hooks/lib/common.mjs",
   "hooks/lib/detector.mjs",
+  "hooks/lib/diagnostics.mjs",
   "hooks/lib/plan-verification.mjs",
   "hooks/lib/settings.mjs",
   "hooks/lib/state.mjs",
@@ -1053,6 +1054,7 @@ export function createPluginUpdater({
         version: releaseParsed.version,
         releaseTag: release.releaseTag,
         releaseUrl: release.releaseUrl,
+        verifiedAssetName: asset.assetName || "",
         verifiedSha256: asset.assetSha256
       };
     } catch (error) {

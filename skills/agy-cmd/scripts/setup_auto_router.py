@@ -589,6 +589,8 @@ def normalize_auto_update_state(raw: object) -> dict:
         "lastAutoUpdatedFrom": "",
         "lastAutoUpdatedAt": "",
         "lastAutoUpdatedUrl": "",
+        "lastAutoUpdatedAssetName": "",
+        "lastAutoUpdatedSha256": "",
         "failedVersion": "",
         "failedReason": "",
         "failedAt": "",
@@ -600,11 +602,14 @@ def normalize_auto_update_state(raw: object) -> dict:
         return val.strip()[:limit] if isinstance(val, str) else ""
 
     raw_url = _norm(raw.get("lastAutoUpdatedUrl"), 256)
+    raw_sha = _norm(raw.get("lastAutoUpdatedSha256"), 64).lower()
     return {
         "lastAutoUpdatedVersion": _norm(raw.get("lastAutoUpdatedVersion"), 32),
         "lastAutoUpdatedFrom": _norm(raw.get("lastAutoUpdatedFrom"), 32),
         "lastAutoUpdatedAt": _norm(raw.get("lastAutoUpdatedAt"), 64),
         "lastAutoUpdatedUrl": raw_url if raw_url.startswith(f"{GITHUB_REPO_URL}/releases/") else "",
+        "lastAutoUpdatedAssetName": _norm(raw.get("lastAutoUpdatedAssetName"), 96),
+        "lastAutoUpdatedSha256": raw_sha if re.match(r"^[0-9a-f]{64}$", raw_sha) else "",
         "failedVersion": _norm(raw.get("failedVersion"), 32),
         "failedReason": _norm(raw.get("failedReason"), 64),
         "failedAt": _norm(raw.get("failedAt"), 64),

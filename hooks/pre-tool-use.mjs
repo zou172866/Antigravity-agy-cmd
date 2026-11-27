@@ -18,8 +18,8 @@ import { readSettings } from "./lib/settings.mjs";
 import { createDefaultState, readEvents, readState } from "./lib/state.mjs";
 import {
   inspectTranscriptTail,
-  isSubagentTranscript,
-  resolveTranscriptPath
+  resolveTranscriptPath,
+  resolveWorkerTranscriptIdentity
 } from "./lib/transcript.mjs";
 
 export async function runPreToolUse(rawInput, env = process.env) {
@@ -33,13 +33,12 @@ export async function runPreToolUse(rawInput, env = process.env) {
     return { decision: "allow" };
   }
 
-  const transcriptPath = resolveTranscriptPath(payload);
-  if (transcriptPath && isSubagentTranscript(transcriptPath)) {
-    return { decision: "allow" };
-  }
-
   const stateDir = resolveStateDir(env);
   const convId = resolveConversationId(payload, env);
+  const transcriptPath = resolveTranscriptPath(payload);
+  if (transcriptPath && resolveWorkerTranscriptIdentity(transcriptPath, { stateDir, convId }).isSubagent) {
+    return { decision: "allow" };
+  }
 
   try {
     const settings = readSettings(stateDir);

@@ -5,9 +5,27 @@ import {
   nonEmptyString,
   unwrapUserRequestText
 } from "./common.mjs";
+import {
+  computeTranscriptGeneration,
+  lookupConfirmedWorkerIdentity,
+  recordConfirmedWorkerIdentity
+} from "./diagnostics.mjs";
 
 const HEAD_READ_BYTES = 64 * 1024;
 const TAIL_READ_BYTES = 256 * 1024;
+
+const KNOWN_STEP_TYPES = new Set([
+  "USER_INPUT",
+  "PLANNER_RESPONSE",
+  "SYSTEM_MESSAGE",
+  "GENERIC",
+  "TOOL_CALL",
+  "TOOL_RESULT",
+  "THINKING",
+  "METADATA"
+]);
+const STRUCTURED_PLAN_MARKER_RE = /<!--\s*agy-cmd:awaiting-(?:plan-approval|user-input)\s*-->/i;
+const INLINE_PLAN_HEADING_RE = /(?:^|\n)\s*#{1,3}\s*(?:实施计划|修改方案|变更方案|Implementation Plan|Proposed Plan)\b/i;
 
 const SUBAGENT_MSG_RE = /\[Message\]\s+timestamp=[^\n]*\bsender=/;
 const SWARM_WORKER_SYS_RE =
@@ -122,11 +140,13 @@ export function resolveTranscriptPath(payload = {}) {
 }
 
 function readTranscriptHeadRaw(transcriptPath, maxBytes = HEAD_READ_BYTES) {
-  if (!transcriptPath) return { steps: [], truncatedTail: "", truncated: false };
+  if (!transcriptPath) return { steps: [], truncatedTail: "", truncated: false, fileSize: 0, readStatus: "missing" };
   let fd = null;
   try {
     const st = fs.statSync(transcriptPath);
-    if (!st.isFile() || st.size === 0) return { steps: [], truncatedTail: "", truncated: false };
+    if (!st.isFile() || st.size === 0) {
+      return { steps: [], truncatedTail: "", truncated: false, fileSize: 0, readStatus: "empty" };
+    }
     const readLen = Math.min(st.size, maxBytes);
     const truncated = st.size > readLen;
     const buf = Buffer.allocUnsafe(readLen);
@@ -144,9 +164,11 @@ function readTranscriptHeadRaw(transcriptPath, maxBytes = HEAD_READ_BYTES) {
         raw = "";
       }
     }
-    return { steps: parseJsonLines(raw), truncatedTail, truncated };
+    const steps = parseJsonLines(raw);
+    const readStatus = steps.length === 0 && !truncatedTail ? "malformed" : "ok";
+    return { steps, truncatedTail, truncated, fileSize: st.size, readStatus };
   } catch {
-    return { steps: [], truncatedTail: "", truncated: false };
+    return { steps: [], truncatedTail: "", truncated: false, fileSize: 0, readStatus: "unreadable" };
   } finally {
     if (fd !== null) {
       try {
@@ -172,12 +194,14 @@ function parseNonNegStepIdx(rawIdx) {
 }
 
 function readTranscriptTailRaw(transcriptPath, maxBytes = TAIL_READ_BYTES) {
-  const empty = { entries: [], truncated: false, fileSize: 0 };
+  const empty = { entries: [], truncated: false, fileSize: 0, malformedLines: 0, readStatus: "missing" };
   if (!transcriptPath) return empty;
   let fd = null;
   try {
     const st = fs.statSync(transcriptPath);
-    if (!st.isFile() || st.size === 0) return empty;
+    if (!st.isFile() || st.size === 0) {
+      return { entries: [], truncated: false, fileSize: 0, malformedLines: 0, readStatus: "empty" };
+    }
     const offset = Math.max(0, st.size - maxBytes);
     const truncated = offset > 0;
     const readLen = st.size - offset;
@@ -188,11 +212,12 @@ function readTranscriptTailRaw(transcriptPath, maxBytes = TAIL_READ_BYTES) {
     if (truncated) {
       const firstNl = buf.indexOf(0x0a, 0);
       if (firstNl < 0 || firstNl >= bytesRead) {
-        return { entries: [], truncated: true, fileSize: st.size };
+        return { entries: [], truncated: true, fileSize: st.size, malformedLines: 0, readStatus: "truncated_empty" };
       }
       pos = firstNl + 1;
     }
     const entries = [];
+    let malformedLines = 0;
     while (pos < bytesRead) {
       const nextNl = buf.indexOf(0x0a, pos);
       const end = nextNl >= 0 && nextNl < bytesRead ? nextNl : bytesRead;
@@ -204,14 +229,24 @@ function readTranscriptTailRaw(transcriptPath, maxBytes = TAIL_READ_BYTES) {
         const obj = JSON.parse(line);
         if (obj && typeof obj === "object" && !Array.isArray(obj)) {
           entries.push({ step: obj, byteOffset });
+        } else {
+          malformedLines += 1;
         }
       } catch {
-        // Ignore partial or malformed lines safely
+        malformedLines += 1;
       }
     }
-    return { entries, truncated, fileSize: st.size };
+    const readStatus =
+      entries.length === 0
+        ? malformedLines > 0
+          ? "malformed"
+          : truncated
+            ? "truncated_empty"
+            : "empty"
+        : "ok";
+    return { entries, truncated, fileSize: st.size, malformedLines, readStatus };
   } catch {
-    return empty;
+    return { entries: [], truncated: false, fileSize: 0, malformedLines: 0, readStatus: "unreadable" };
   } finally {
     if (fd !== null) {
       try {
@@ -242,18 +277,30 @@ function hasSwarmWorkerSystemStep(steps) {
   );
 }
 
-export function isSubagentTranscript(transcriptPath) {
-  if (!transcriptPath) return false;
-  const { steps: head, truncatedTail, truncated } = readTranscriptHeadRaw(transcriptPath, HEAD_READ_BYTES);
-  if (head.length === 0 && !truncatedTail) return false;
+export function inspectSubagentTranscript(transcriptPath) {
+  if (!transcriptPath) {
+    return { status: "not_applicable", isSubagent: false, source: "none", rolledPastWindow: false };
+  }
+  const { steps: head, truncatedTail, truncated, fileSize, readStatus } = readTranscriptHeadRaw(
+    transcriptPath,
+    HEAD_READ_BYTES
+  );
+  if (readStatus === "unreadable" || readStatus === "malformed") {
+    return { status: "unknown", isSubagent: false, source: readStatus, rolledPastWindow: false };
+  }
+  if (head.length === 0 && !truncatedTail) {
+    return { status: "not_applicable", isSubagent: false, source: "empty", rolledPastWindow: false };
+  }
 
-  if (hasSwarmWorkerSystemStep(head)) return true;
+  if (hasSwarmWorkerSystemStep(head)) {
+    return { status: "confirmed", isSubagent: true, source: "swarm_worker_head", rolledPastWindow: false };
+  }
   if (
     truncatedTail &&
     /"type"\s*:\s*"SYSTEM_MESSAGE"/.test(truncatedTail) &&
     SWARM_WORKER_SYS_RE.test(truncatedTail)
   ) {
-    return true;
+    return { status: "confirmed", isSubagent: true, source: "swarm_worker_head_truncated", rolledPastWindow: false };
   }
 
   const sample = head.slice(0, 12);
@@ -290,19 +337,74 @@ export function isSubagentTranscript(transcriptPath) {
   if (hasUserInput) {
     // A Swarm worker spawned via `fork: "coordinator"` inherits the coordinator's
     // opening USER_INPUT, then receives a `<swarm_worker>` SYSTEM_MESSAGE later in the log.
+    const rolledPastWindow = fileSize > HEAD_READ_BYTES + TAIL_READ_BYTES;
     if (truncated) {
       const tailSteps = readTranscriptTail(transcriptPath, TAIL_READ_BYTES);
       if (hasSwarmWorkerSystemStep(tailSteps)) {
-        return true;
+        return { status: "confirmed", isSubagent: true, source: "swarm_worker_tail", rolledPastWindow };
       }
     }
-    return false;
+    return {
+      status: rolledPastWindow ? "unknown" : "not_applicable",
+      isSubagent: false,
+      source: rolledPastWindow ? "fork_window_gap" : "main_user_input",
+      rolledPastWindow
+    };
   }
-  if (hasSubagentMessage) return true;
-  if (systemHeadCount >= 2 && (sample[0]?.type === "SYSTEM_MESSAGE" || (sample.length === 0 && /"type"\s*:\s*"SYSTEM_MESSAGE"/.test(truncatedTail)))) {
-    return true;
+  if (hasSubagentMessage) {
+    return { status: "confirmed", isSubagent: true, source: "subagent_message", rolledPastWindow: false };
   }
-  return false;
+  if (
+    systemHeadCount >= 2 &&
+    (sample[0]?.type === "SYSTEM_MESSAGE" ||
+      (sample.length === 0 && /"type"\s*:\s*"SYSTEM_MESSAGE"/.test(truncatedTail)))
+  ) {
+    return { status: "confirmed", isSubagent: true, source: "system_head", rolledPastWindow: false };
+  }
+  return { status: "not_applicable", isSubagent: false, source: "unmatched", rolledPastWindow: false };
+}
+
+export function isSubagentTranscript(transcriptPath) {
+  return inspectSubagentTranscript(transcriptPath).isSubagent;
+}
+
+/**
+ * Resolve worker/subagent identity with positive-evidence persistence across rolling windows,
+ * bound to `(convId, transcript generation)` so rewinds/forks invalidate cleanly.
+ */
+export function resolveWorkerTranscriptIdentity(
+  transcriptPath,
+  { stateDir = "", convId = "", nowMs = Date.now() } = {}
+) {
+  const inspected = inspectSubagentTranscript(transcriptPath);
+  if (!transcriptPath) return inspected;
+
+  if (inspected.isSubagent) {
+    if (stateDir && convId) {
+      const gen = computeTranscriptGeneration(transcriptPath);
+      if (gen) {
+        recordConfirmedWorkerIdentity(stateDir, convId, gen, inspected.source, nowMs);
+      }
+    }
+    return inspected;
+  }
+
+  if (stateDir && convId) {
+    const gen = computeTranscriptGeneration(transcriptPath);
+    if (gen) {
+      const persisted = lookupConfirmedWorkerIdentity(stateDir, convId, gen, nowMs);
+      if (persisted?.confirmed) {
+        return {
+          status: "confirmed",
+          isSubagent: true,
+          source: `persisted:${persisted.source}`,
+          rolledPastWindow: inspected.rolledPastWindow
+        };
+      }
+    }
+  }
+
+  return inspected;
 }
 
 export function stripTranscriptStepHeaders(content) {
@@ -365,6 +467,18 @@ function requestsPlanFeedback(call) {
  * - latestUserInput: most recent USER_INPUT step content (fallback if payload.lastUserInput is omitted)
  */
 export function inspectTranscriptTail(transcriptPath) {
+  const buildAdapter = (readStatus, malformedLines = 0, unknownStepTypes = 0, states = {}) => ({
+    schemaVersion: 1,
+    readStatus,
+    malformedLines,
+    unknownStepTypes,
+    states: {
+      planApproval: states.planApproval || "not_applicable",
+      bgTasks: states.bgTasks || "not_applicable",
+      swarm: states.swarm || "not_applicable",
+      toolReceipts: states.toolReceipts || "not_applicable"
+    }
+  });
   const empty = {
     stepsByIndex: new Map(),
     taskResultsByStepIdx: new Map(),
@@ -384,15 +498,30 @@ export function inspectTranscriptTail(transcriptPath) {
     latestSwarmEndKey: "",
     latestSwarmEndStep: null,
     tailRolledOverWithoutUserInput: false,
-    awaitingUserApprovalOrQuestion: false
+    awaitingUserApprovalOrQuestion: false,
+    truncated: false,
+    adapter: buildAdapter("missing")
   };
   if (!transcriptPath) return empty;
 
-  const { entries, truncated, fileSize } = readTranscriptTailRaw(transcriptPath, TAIL_READ_BYTES);
+  const { entries, truncated, fileSize, malformedLines, readStatus } = readTranscriptTailRaw(
+    transcriptPath,
+    TAIL_READ_BYTES
+  );
   if (entries.length === 0) {
+    const isUnknownRead = readStatus === "unreadable" || readStatus === "malformed" || readStatus === "truncated_empty";
     return {
       ...empty,
-      tailRolledOverWithoutUserInput: Boolean(truncated && fileSize > 0)
+      truncated: Boolean(truncated),
+      tailRolledOverWithoutUserInput: Boolean(truncated && fileSize > 0),
+      adapter: buildAdapter(
+        readStatus,
+        malformedLines,
+        0,
+        isUnknownRead
+          ? { planApproval: "unknown", bgTasks: "unknown", swarm: "unknown", toolReceipts: "unknown" }
+          : {}
+      )
     };
   }
 
@@ -416,10 +545,14 @@ export function inspectTranscriptTail(transcriptPath) {
   let latestSwarmEndKey = "";
   let latestSwarmEndStep = null;
   let pendingSwarmTeardownCheck = false;
+  let unknownStepTypes = 0;
 
   for (const { step, byteOffset } of entries) {
     const idx = parseNonNegStepIdx(step.step_index);
     const stepKey = idx !== null ? `step:${idx}` : `byte:${byteOffset}`;
+    if (typeof step.type === "string" && step.type && !KNOWN_STEP_TYPES.has(step.type)) {
+      unknownStepTypes += 1;
+    }
 
     if (step.type === "USER_INPUT") {
       latestInputFollowsPlan = waitingForPlanReply;
@@ -500,7 +633,20 @@ export function inspectTranscriptTail(transcriptPath) {
         pendingSwarmTeardownCheck = sawTeardownProbeCall;
       }
       const calledAskQuestion = pCalls.some((c) => nonEmptyString(c?.name) === "ask_question");
-      const showsPlan = /^\s*(?:\*\*)?\[agy-cmd\s*→\s*\/plan\s*审批\]/.test(pContent);
+      const structuredAwaitFlag = Boolean(
+        step.awaiting_user_approval === true ||
+          step.awaitingUserApproval === true ||
+          step.metadata?.awaitingUserApproval === true ||
+          step.metadata?.waitingForUser === true ||
+          STRUCTURED_PLAN_MARKER_RE.test(pContent)
+      );
+      const inlinePlanAfterDenial = Boolean(
+        latestPlanModeDenial && pCalls.length === 0 && INLINE_PLAN_HEADING_RE.test(pContent)
+      );
+      const showsLegacyPlanBadge = /^\s*(?:\*\*)?\[agy-cmd\s*→\s*\/plan\s*审批\]/.test(pContent);
+      const showsPlan = Boolean(
+        structuredAwaitFlag || inlinePlanAfterDenial || showsLegacyPlanBadge
+      );
       if (calledAskQuestion || pCalls.length > 0 || showsPlan) {
         waitingForPlanReply = !calledAskQuestion && (showsPlan || pCalls.some(requestsPlanFeedback));
         if (waitingForPlanReply) {
@@ -517,7 +663,7 @@ export function inspectTranscriptTail(transcriptPath) {
       const calledPlanWrite = pCalls.some((c) => isPlanWriteToolCall(c));
       const hasApprovalOrGrillBadge =
         /\[agy-cmd\s*→\s*\/(?:plan\s*审批|grill-me\s*追问)\]/.test(pContent);
-      if (calledAskQuestion || calledPlanWrite || hasApprovalOrGrillBadge) {
+      if (calledAskQuestion || calledPlanWrite || structuredAwaitFlag || inlinePlanAfterDenial || hasApprovalOrGrillBadge) {
         awaitingUserApprovalOrQuestion = true;
       } else if (pCalls.length > 0) {
         // Subsequent non-plan/non-question tool calls mean execution resumed after user answered
@@ -602,6 +748,34 @@ export function inspectTranscriptTail(transcriptPath) {
     }
   }
 
+  const tailRolledOverWithoutUserInput = Boolean(truncated && !latestUserInputKey && fileSize > 0);
+  const allUnknownTypes = entries.length > 0 && unknownStepTypes === entries.length;
+  const highMalformed = malformedLines > 0 && entries.length === 0;
+  const planApprovalState =
+    allUnknownTypes || highMalformed || tailRolledOverWithoutUserInput
+      ? "unknown"
+      : latestPlanModeDenial || latestInputFollowsPlan || awaitingUserApprovalOrQuestion
+        ? "confirmed"
+        : "not_applicable";
+  const bgTasksState =
+    allUnknownTypes || highMalformed
+      ? "unknown"
+      : taskResultsByStepIdx.size > 0 || hasBgTaskCompletionSinceUserInput
+        ? "confirmed"
+        : "not_applicable";
+  const swarmState =
+    allUnknownTypes || highMalformed
+      ? "unknown"
+      : swarmLifecycle === "active" || swarmLifecycle === "ended"
+        ? "confirmed"
+        : "not_applicable";
+  const toolReceiptsState =
+    allUnknownTypes || highMalformed
+      ? "unknown"
+      : stepsByIndex.size > 0 || taskResultsByStepIdx.size > 0
+        ? "confirmed"
+        : "not_applicable";
+
   return {
     stepsByIndex,
     taskResultsByStepIdx,
@@ -620,8 +794,20 @@ export function inspectTranscriptTail(transcriptPath) {
     latestSwarmActivityStep,
     latestSwarmEndKey,
     latestSwarmEndStep,
-    tailRolledOverWithoutUserInput: Boolean(truncated && !latestUserInputKey && fileSize > 0),
-    awaitingUserApprovalOrQuestion
+    tailRolledOverWithoutUserInput,
+    awaitingUserApprovalOrQuestion,
+    truncated: Boolean(truncated),
+    adapter: buildAdapter(
+      allUnknownTypes ? "malformed" : readStatus,
+      malformedLines,
+      unknownStepTypes,
+      {
+        planApproval: planApprovalState,
+        bgTasks: bgTasksState,
+        swarm: swarmState,
+        toolReceipts: toolReceiptsState
+      }
+    )
   };
 }
 

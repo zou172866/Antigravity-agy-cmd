@@ -1872,3 +1872,114 @@ test("P1 Batch B · B-4: dead-PID replacing marker blocks reload, journal recove
   assert.equal(fs.existsSync(committedWork), false);
   assert.equal(readLocalVersion(root), "2.6.0");
 });
+
+test("P1 Batch C · U1: pre/post SHA-256 asset display and oldest-supported (2.2.0) -> current -> N+1 offline upgrade matrix", async (t) => {
+  const tmpBase = makeTmpDir("agy-cmd-u1-matrix-");
+  const stateDir = makeTmpDir("agy-cmd-u1-state-");
+  t.after(() => {
+    resetUpdateRuntimeFlags();
+    fs.rmSync(tmpBase, { recursive: true, force: true });
+    fs.rmSync(stateDir, { recursive: true, force: true });
+  });
+  resetUpdateRuntimeFlags();
+
+  const pluginsDir = path.join(tmpBase, "cfg", "plugins");
+  const root = path.join(pluginsDir, "agy-cmd");
+  const pinnedNode = process.platform === "win32" ? "C:\\Program Files\\nodejs\\node.exe" : "/usr/local/bin/node";
+
+  // 1. Oldest supported v2.2.0 minimal layout (pre-PreToolUse, pre-assets, pre-plan-verification) -> current bundle (2.8.0)
+  const oldestFiles = new Map([
+    ["plugin.json", Buffer.from(JSON.stringify({ name: "agy-cmd", version: "2.2.0" }, null, 2) + "\n")],
+    ["package.json", Buffer.from(JSON.stringify({ name: "agy-cmd", version: "2.2.0" }, null, 2) + "\n")],
+    ["hooks.json", Buffer.from('{"agy-cmd-router":{}}\n')],
+    ["rules/AGENTS.md", Buffer.from("# old v2.2.0 rules\n")],
+    ["rules/my-override.local.md", Buffer.from("# preserve user local rule\n")],
+    ["sidecars/panel/sidecar.json", Buffer.from(JSON.stringify({ command: pinnedNode, args: ["server.mjs"], restart_policy: "always" }, null, 2) + "\n")],
+    ["sidecars/panel/server.mjs", Buffer.from("// old v2.2.0 server\n")],
+    ["legacy-v220-obsolete.mjs", Buffer.from("// should be removed\n")]
+  ]);
+  writeBundleToDir(root, oldestFiles);
+
+  const curZip = packBundleAsZip(collectRepoBundleFiles("2.8.0"), "agy-cmd-v2.8.0");
+  const curSha = sha256Hex(curZip);
+  const curAssetUrl = `https://github.com/${REPO}/releases/download/v2.8.0/agy-cmd-v2.8.0.zip`;
+  const curRelease = {
+    ok: true,
+    status: "update",
+    currentVersion: "2.2.0",
+    latestVersion: "2.8.0",
+    releaseTag: "v2.8.0",
+    releaseUrl: `https://github.com/${REPO}/releases/tag/v2.8.0`,
+    assetName: "agy-cmd-v2.8.0.zip",
+    assetUrl: curAssetUrl,
+    assetSha256: curSha,
+    assetFormat: "zip"
+  };
+
+  const mkUpdater = (rel, zipBuf) =>
+    createPluginUpdater({
+      sidecarDirectory: path.join(root, "sidecars", "panel"),
+      pluginsDirectory: pluginsDir,
+      checkVersion: async () => rel,
+      downloadOptions: {
+        fetchImpl: async (url) => {
+          assert.equal(url, rel.assetUrl);
+          return { ok: true, status: 200, headers: new Map(), arrayBuffer: async () => zipBuf };
+        }
+      }
+    });
+
+  // Auto-update path records verifiedAssetName & verifiedSha256 in settings autoUpdateState
+  updateSettings(stateDir, { autoUpdateCheck: true, autoUpdateInstall: true });
+  const rOldToCur = await runAutoUpdateCycle({
+    stateDir,
+    checker: async () => curRelease,
+    updater: mkUpdater(curRelease, curZip),
+    currentVersion: "2.2.0",
+    env: {}
+  });
+  assert.equal(rOldToCur.action, "updated");
+  assert.equal(rOldToCur.result.verifiedAssetName, "agy-cmd-v2.8.0.zip");
+  assert.equal(rOldToCur.result.verifiedSha256, curSha);
+  assert.equal(readLocalVersion(root), "2.8.0");
+  assert.equal(fs.existsSync(path.join(root, "legacy-v220-obsolete.mjs")), false);
+  assert.equal(fs.readFileSync(path.join(root, "rules/my-override.local.md"), "utf8"), "# preserve user local rule\n");
+  assert.equal(JSON.parse(fs.readFileSync(path.join(root, "sidecars/panel/sidecar.json"), "utf8")).command, pinnedNode);
+  const savedAuto = readSettings(stateDir).autoUpdateState;
+  assert.equal(savedAuto.lastAutoUpdatedAssetName, "agy-cmd-v2.8.0.zip");
+  assert.equal(savedAuto.lastAutoUpdatedSha256, curSha);
+
+  // 2. N (2.8.0) -> N+1 (2.9.0) with forward-compatible read-only verifier fields succeeds cleanly
+  const realVerifier = fs.readFileSync(path.join(REPO_ROOT, "agents/cmd-verifier.md"), "utf8");
+  const nextVerifier = realVerifier
+    .replace('tools: ["read_file"]', 'tools: ["read_file", "view_file", "grep_search"]')
+    .replace("model: inherit", "model: inherit\ncommandExecutionPolicy: off");
+  const nextZip = packBundleAsZip(collectRepoBundleFiles("2.9.0", { "agents/cmd-verifier.md": nextVerifier }), "agy-cmd-v2.9.0");
+  const nextSha = sha256Hex(nextZip);
+  const nextRel = {
+    ok: true,
+    status: "update",
+    currentVersion: "2.8.0",
+    latestVersion: "2.9.0",
+    releaseTag: "v2.9.0",
+    releaseUrl: `https://github.com/${REPO}/releases/tag/v2.9.0`,
+    assetName: "agy-cmd-v2.9.0.zip",
+    assetUrl: `https://github.com/${REPO}/releases/download/v2.9.0/agy-cmd-v2.9.0.zip`,
+    assetSha256: nextSha,
+    assetFormat: "zip"
+  };
+  const rCurToNext = await handlePluginUpdate(
+    { version: "2.9.0", assetName: nextRel.assetName, assetUrl: nextRel.assetUrl, assetSha256: nextSha },
+    { stateDir, updater: mkUpdater(nextRel, nextZip) }
+  );
+  assert.equal(rCurToNext.body.status, "updated");
+  assert.equal(rCurToNext.body.verifiedAssetName, "agy-cmd-v2.9.0.zip");
+  assert.equal(rCurToNext.body.verifiedSha256, nextSha);
+  assert.equal(readLocalVersion(root), "2.9.0");
+  assert.equal(JSON.parse(fs.readFileSync(path.join(root, "sidecars/panel/sidecar.json"), "utf8")).command, pinnedNode);
+
+  // 3. Panel HTML renders both pre-install asset+SHA-256 and post-install verified asset+SHA-256
+  const html = renderPanelHtml("u1-csrf");
+  assert.match(html, /待校验资产：/);
+  assert.match(html, /已通过 SHA-256 校验/);
+});

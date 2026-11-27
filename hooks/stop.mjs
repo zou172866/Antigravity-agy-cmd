@@ -12,6 +12,7 @@
  *   4. Subagent & explicit `/goal` isolation
  */
 import {
+  detectHostSurface,
   isDirectRun,
   isSubagentPayload,
   parseHookPayload,
@@ -20,12 +21,13 @@ import {
   resolveStateDir
 } from "./lib/common.mjs";
 import { evaluateStop } from "./lib/detector.mjs";
+import { detectHostVersion, recordHostDiagnostic } from "./lib/diagnostics.mjs";
 import { readSettings, recordAutoRetryStat } from "./lib/settings.mjs";
 import { readEvents, readState, withSessionLock, writeState } from "./lib/state.mjs";
 import {
   inspectTranscriptTail,
-  isSubagentTranscript,
-  resolveTranscriptPath
+  resolveTranscriptPath,
+  resolveWorkerTranscriptIdentity
 } from "./lib/transcript.mjs";
 
 export async function runStop(rawInput, env = process.env, nowMs = Date.now()) {
@@ -34,13 +36,12 @@ export async function runStop(rawInput, env = process.env, nowMs = Date.now()) {
     return { decision: "allow" };
   }
 
-  const transcriptPath = resolveTranscriptPath(payload);
-  if (transcriptPath && isSubagentTranscript(transcriptPath)) {
-    return { decision: "allow" };
-  }
-
   const stateDir = resolveStateDir(env);
   const convId = resolveConversationId(payload, env);
+  const transcriptPath = resolveTranscriptPath(payload);
+  if (transcriptPath && resolveWorkerTranscriptIdentity(transcriptPath, { stateDir, convId, nowMs }).isSubagent) {
+    return { decision: "allow" };
+  }
   if (!convId) {
     return { decision: "allow" };
   }
@@ -48,6 +49,16 @@ export async function runStop(rawInput, env = process.env, nowMs = Date.now()) {
   try {
     const settings = readSettings(stateDir);
     const transcriptTail = transcriptPath ? inspectTranscriptTail(transcriptPath) : null;
+    if (transcriptTail?.adapter) {
+      const st = transcriptTail.adapter.readStatus;
+      if (st === "malformed" || st === "unreadable" || st === "truncated_empty") {
+        recordHostDiagnostic(stateDir, {
+          surface: detectHostSurface(payload),
+          hostVersion: detectHostVersion(payload, env),
+          reason: "transcript_parse_unknown"
+        });
+      }
+    }
 
     const verdict = withSessionLock(stateDir, convId, () => {
       const prevState = readState(stateDir, convId);

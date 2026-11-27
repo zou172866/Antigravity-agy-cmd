@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { sanitizeConversationId } from "../../hooks/lib/common.mjs";
+import { readHostDiagnostics } from "../../hooks/lib/diagnostics.mjs";
 import {
   evaluateStarPrompt,
   formatDeliveryGateSummaryZh,
@@ -184,6 +185,44 @@ function countTrackedSessions(stateDir) {
   }
 }
 
+const VERIFICATION_STATUS_ZH = Object.freeze({
+  passed: "验证通过",
+  not_run: "未运行验证",
+  failed: "验证失败",
+  user_exempt: "用户豁免",
+  insufficient_evidence: "证据不足"
+});
+
+const EXIT_REASON_ZH = Object.freeze({
+  all_green_or_no_failure: "全部通过或无失败",
+  retry_inactive: "未触发自动重试",
+  retry_limit_reached: "已达自动重试上限",
+  no_progress_guard: "无新进展刹车放行",
+  not_fully_idle: "存在运行中后台任务",
+  awaiting_user_input: "等待用户审批或回复",
+  native_goal_active: "原生 /goal 接管",
+  native_autonomy_active: "原生自治/Swarm 接管",
+  delivery_gate_invalid_custom_command: "自定义验证命令无效",
+  delivery_gate_missing_verification: "交付门禁提醒补测",
+  approved_plan_missing_verification: "计划补验提醒",
+  auto_continue: "自动续跑修复",
+  term_user_canceled: "用户手动取消"
+});
+
+function formatStopOutcomeForPanel(outcome) {
+  if (!outcome || typeof outcome !== "object") return null;
+  const vStatus = typeof outcome.verificationStatus === "string" ? outcome.verificationStatus : "not_run";
+  const exitReason = typeof outcome.exitReason === "string" ? outcome.exitReason : String(outcome.reasonCode || "");
+  return {
+    decision: outcome.decision === "continue" ? "continue" : "allow",
+    verificationStatus: vStatus,
+    verificationStatusZh: VERIFICATION_STATUS_ZH[vStatus] || "未知",
+    exitReason,
+    exitReasonZh: EXIT_REASON_ZH[exitReason] || exitReason || "—",
+    ts: Number(outcome.ts || 0)
+  };
+}
+
 export function buildPanelStatePayload(stateDir, rawConvId = "", { markStarTriggered = true } = {}) {
   const starPrompt = evaluateStarPrompt(stateDir, { markTriggered: markStarTriggered });
   const settings = readSettings(stateDir);
@@ -193,14 +232,15 @@ export function buildPanelStatePayload(stateDir, rawConvId = "", { markStarTrigg
   if (typeof rawConvId === "string" && rawConvId.trim()) {
     const safeId = sanitizeConversationId(rawConvId.trim());
     const statePath = path.join(stateDir, "sessions", `${safeId}.state.json`);
-    if (fs.existsSync(statePath)) {
+    if (safeId && fs.existsSync(statePath)) {
       const st = readState(stateDir, safeId);
       activeSession = {
         conversationId: safeId.slice(0, 12),
         userTurnCount: st.userTurnCount || 0,
         turnAutoRetries: st.turnAutoRetries || 0,
         debugTurnStreak: st.debugTurnStreak || 0,
-        swarmActive: Boolean(st.swarmActive)
+        swarmActive: Boolean(st.swarmActive),
+        lastStopOutcome: formatStopOutcomeForPanel(st.lastStopOutcome)
       };
     }
   }
@@ -213,7 +253,9 @@ export function buildPanelStatePayload(stateDir, rawConvId = "", { markStarTrigg
           version: autoState.lastAutoUpdatedVersion,
           previousVersion: autoState.lastAutoUpdatedFrom || "",
           updatedAt: autoState.lastAutoUpdatedAt || "",
-          releaseUrl: autoState.lastAutoUpdatedUrl || ""
+          releaseUrl: autoState.lastAutoUpdatedUrl || "",
+          assetName: autoState.lastAutoUpdatedAssetName || "",
+          verifiedSha256: autoState.lastAutoUpdatedSha256 || ""
         }
       : null;
 
@@ -234,7 +276,8 @@ export function buildPanelStatePayload(stateDir, rawConvId = "", { markStarTrigg
           ? "Pro/Ultra 会员 · 已手动关闭 /boost 自动接入"
           : "免费版安全模式 · 已屏蔽付费口令防报错",
     trackedSessions,
-    activeSession
+    activeSession,
+    hostDiagnostics: readHostDiagnostics(stateDir)
   };
 }
 
@@ -401,6 +444,8 @@ export async function handlePluginUpdate(
           lastAutoUpdatedFrom: result.previousVersion || "",
           lastAutoUpdatedAt: ts,
           lastAutoUpdatedUrl: result.releaseUrl || "",
+          lastAutoUpdatedAssetName: result.verifiedAssetName || expectedAsset?.assetName || "",
+          lastAutoUpdatedSha256: result.verifiedSha256 || expectedAsset?.assetSha256 || "",
           failedVersion: "",
           failedReason: "",
           failedAt: ""
@@ -411,6 +456,8 @@ export async function handlePluginUpdate(
           lastAutoUpdatedFrom: "",
           lastAutoUpdatedAt: "",
           lastAutoUpdatedUrl: "",
+          lastAutoUpdatedAssetName: "",
+          lastAutoUpdatedSha256: "",
           failedVersion: "",
           failedReason: "",
           failedAt: ""
@@ -459,7 +506,9 @@ export function handleAutoUpdateAck(stateDir, rawData) {
       lastAutoUpdatedVersion: "",
       lastAutoUpdatedFrom: "",
       lastAutoUpdatedAt: "",
-      lastAutoUpdatedUrl: ""
+      lastAutoUpdatedUrl: "",
+      lastAutoUpdatedAssetName: "",
+      lastAutoUpdatedSha256: ""
     });
   }
   return {

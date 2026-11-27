@@ -89,6 +89,8 @@ export function normalizeAutoUpdateState(raw) {
     lastAutoUpdatedFrom: "",
     lastAutoUpdatedAt: "",
     lastAutoUpdatedUrl: "",
+    lastAutoUpdatedAssetName: "",
+    lastAutoUpdatedSha256: "",
     failedVersion: "",
     failedReason: "",
     failedAt: ""
@@ -98,11 +100,14 @@ export function normalizeAutoUpdateState(raw) {
   }
   const normStr = (v, maxLen = 64) => (typeof v === "string" ? v.trim().slice(0, maxLen) : "");
   const rawUrl = normStr(raw.lastAutoUpdatedUrl, 256);
+  const rawSha = normStr(raw.lastAutoUpdatedSha256, 64).toLowerCase();
   return {
     lastAutoUpdatedVersion: normStr(raw.lastAutoUpdatedVersion, 32),
     lastAutoUpdatedFrom: normStr(raw.lastAutoUpdatedFrom, 32),
     lastAutoUpdatedAt: normStr(raw.lastAutoUpdatedAt, 64),
     lastAutoUpdatedUrl: rawUrl.startsWith(`${GITHUB_REPO_URL}/releases/`) ? rawUrl : "",
+    lastAutoUpdatedAssetName: normStr(raw.lastAutoUpdatedAssetName, 96),
+    lastAutoUpdatedSha256: /^[0-9a-f]{64}$/.test(rawSha) ? rawSha : "",
     failedVersion: normStr(raw.failedVersion, 32),
     failedReason: normStr(raw.failedReason, 64),
     failedAt: normStr(raw.failedAt, 64)

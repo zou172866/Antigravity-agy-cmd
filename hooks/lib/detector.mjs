@@ -65,7 +65,8 @@ function resolvePendingPlanApprovalState(inputEnvelope, transcriptTail, eventBlo
   const confirmed = confirmsPlan(request);
   const approvedNotice = (isPlanApprovalNotice(inputEnvelope) || (matchesTranscript && isPlanApprovalNotice(transcriptInput))) &&
     (!request || confirmed);
-  const chatApproval = confirmed && transcriptTail?.latestInputFollowsPlan && (!transcriptInput || matchesTranscript);
+  const planAdapterUnknown = transcriptTail?.adapter?.states?.planApproval === "unknown";
+  const chatApproval = !planAdapterUnknown && confirmed && transcriptTail?.latestInputFollowsPlan && (!transcriptInput || matchesTranscript);
   const recentEvent = eventBlock && eventBlock.ts >= turnStartedAt - 5000 ? eventBlock : null;
   const txDenial = transcriptTail?.latestPlanModeDenial;
   const block = enabled ? txDenial || recentEvent : null;
@@ -875,6 +876,10 @@ export function reconcileEventsWithTranscript(events, transcriptTail = null, pre
 
   const stepsByIndex = transcriptTail?.stepsByIndex instanceof Map ? transcriptTail.stepsByIndex : null;
   const taskResults = transcriptTail?.taskResultsByStepIdx instanceof Map ? transcriptTail.taskResultsByStepIdx : null;
+  const receiptsAdapterUnknown = transcriptTail?.adapter?.states?.toolReceipts === "unknown";
+  const tailTruncated = Boolean(transcriptTail?.truncated);
+  let unknownReceipts = 0;
+  let pendingOutOfWindow = 0;
 
   const activeStepKeys = new Set();
 
@@ -981,6 +986,16 @@ export function reconcileEventsWithTranscript(events, transcriptTail = null, pre
 
       if (ev.backgroundRunning) {
         // Still waiting for background task completion
+        if (receiptsAdapterUnknown) {
+          unknownReceipts += 1;
+        }
+        continue;
+      }
+
+      if (ev.pending && (receiptsAdapterUnknown || (tailTruncated && stepIdx !== null))) {
+        if (receiptsAdapterUnknown) unknownReceipts += 1;
+        else pendingOutOfWindow += 1;
+        resolvedEvents.push({ ...ev, terminal: false, evidenceUnknown: true });
         continue;
       }
 
@@ -1090,6 +1105,13 @@ export function reconcileEventsWithTranscript(events, transcriptTail = null, pre
         continue;
       }
 
+      if (ev.pending && (receiptsAdapterUnknown || (tailTruncated && stepIdx !== null))) {
+        if (receiptsAdapterUnknown) unknownReceipts += 1;
+        else pendingOutOfWindow += 1;
+        resolvedEvents.push({ ...ev, applied: false, evidenceUnknown: true });
+        continue;
+      }
+
       resolvedEvents.push(ev);
       continue;
     }
@@ -1104,7 +1126,13 @@ export function reconcileEventsWithTranscript(events, transcriptTail = null, pre
   }
 
   const cacheChanged = JSON.stringify(prevCache) !== JSON.stringify(prunedCache);
-  return { resolvedEvents, nextResolvedSteps: prunedCache, cacheChanged };
+  return {
+    resolvedEvents,
+    nextResolvedSteps: prunedCache,
+    cacheChanged,
+    unknownReceipts,
+    pendingOutOfWindow
+  };
 }
 
 function extractProseForIntent(rawText) {
@@ -2410,27 +2438,61 @@ export function evaluateStop(payload, events = [], prevStateInput = null, option
   // Safety Brake 1: Always honor user cancellation, errors, and host invocation/token ceilings
   const rawTerm = nonEmptyString(payload.terminationReason ?? payload.termination_reason) || "NO_TOOL_CALL";
   const termReason = rawTerm.toUpperCase();
-  if (!NORMAL_STOP_REASONS.has(termReason) || STOP_ALLOW_REASONS.has(termReason)) {
-    return {
-      decision: "allow",
-      reason: "",
-      reasonCode: `term_${termReason.toLowerCase()}`,
-      nextState: prevState,
-      stateChanged: false,
-      metrics: null
+  const stopNowMs = Number.isFinite(Number(options.nowMs)) ? Number(options.nowMs) : Date.now();
+  const finalizeStop = (res, verificationStatus, exitReason = res.reasonCode) => {
+    const out = {
+      ...res,
+      verificationStatus,
+      exitReason
     };
+    const prevOut = out.nextState?.lastStopOutcome;
+    const nextOut = {
+      decision: out.decision,
+      verificationStatus,
+      exitReason,
+      reasonCode: out.reasonCode,
+      ts: stopNowMs
+    };
+    const outcomeChanged =
+      !prevOut ||
+      prevOut.decision !== nextOut.decision ||
+      prevOut.verificationStatus !== nextOut.verificationStatus ||
+      prevOut.exitReason !== nextOut.exitReason ||
+      prevOut.reasonCode !== nextOut.reasonCode;
+    if (out.nextState && outcomeChanged) {
+      out.nextState = { ...out.nextState, lastStopOutcome: nextOut };
+      out.stateChanged = true;
+    }
+    return out;
+  };
+
+  if (!NORMAL_STOP_REASONS.has(termReason) || STOP_ALLOW_REASONS.has(termReason)) {
+    return finalizeStop(
+      {
+        decision: "allow",
+        reason: "",
+        reasonCode: `term_${termReason.toLowerCase()}`,
+        nextState: prevState,
+        stateChanged: false,
+        metrics: null
+      },
+      termReason === "USER_CANCELED" ? "user_exempt" : "not_run"
+    );
   }
 
   // Safety Brake 2: Wait for running background tasks instead of forcing premature loops
   if (payload.fullyIdle === false || payload.fully_idle === false) {
-    return {
-      decision: "allow",
-      reason: "",
-      reasonCode: "not_fully_idle",
-      nextState: prevState,
-      stateChanged: false,
-      metrics: null
-    };
+    return finalizeStop(
+      {
+        decision: "allow",
+        reason: "",
+        reasonCode: "not_fully_idle",
+        nextState: prevState,
+        stateChanged: false,
+        metrics: null
+      },
+      "insufficient_evidence"
+    );
   }
 
   let nextState = { ...prevState };
@@ -2439,6 +2501,11 @@ export function evaluateStop(payload, events = [], prevStateInput = null, option
 
   const reconciled = reconcileEventsWithTranscript(events, transcriptTail, nextState.resolvedSteps);
   const effectiveEvents = reconciled.resolvedEvents;
+  const hasUnknownEvidence = Boolean(
+    reconciled.unknownReceipts > 0 ||
+      reconciled.pendingOutOfWindow > 0 ||
+      transcriptTail?.adapter?.states?.toolReceipts === "unknown"
+  );
   if (reconciled.cacheChanged) {
     nextState.resolvedSteps = reconciled.nextResolvedSteps;
     stateChanged = true;
@@ -2462,14 +2529,17 @@ export function evaluateStop(payload, events = [], prevStateInput = null, option
     ? extractActiveSlashCommands(rawLastUserInput)
     : new Set(Array.isArray(savedSignals?.activeSlash) ? savedSignals.activeSlash : []);
   if (activeSlash.has("goal")) {
-    return {
-      decision: "allow",
-      reason: "",
-      reasonCode: "native_goal_active",
-      nextState,
-      stateChanged,
-      metrics: null
-    };
+    return finalizeStop(
+      {
+        decision: "allow",
+        reason: "",
+        reasonCode: "native_goal_active",
+        nextState,
+        stateChanged,
+        metrics: null
+      },
+      "user_exempt"
+    );
   }
   const wantsLeadingSwarm = hasFreshInput
     ? LEADING_SWARM_SLASH_RE.test(rawLastUserInput)
@@ -2519,14 +2589,17 @@ export function evaluateStop(payload, events = [], prevStateInput = null, option
   }
 
   if (hasActiveSwarm || wantsLeadingAutonomy) {
-    return {
-      decision: "allow",
-      reason: "",
-      reasonCode: "native_autonomy_active",
-      nextState,
-      stateChanged,
-      metrics: null
-    };
+    return finalizeStop(
+      {
+        decision: "allow",
+        reason: "",
+        reasonCode: "native_autonomy_active",
+        nextState,
+        stateChanged,
+        metrics: null
+      },
+      "user_exempt"
+    );
   }
 
   const intentProse = hasFreshInput ? extractProseForIntent(rawLastUserInput) : "";
@@ -2540,14 +2613,17 @@ export function evaluateStop(payload, events = [], prevStateInput = null, option
   const metrics = analyzeEventMetrics(effectiveEvents, turnFloorTs);
   // Automatic pause recognition: never interrupt /plan approval or /grill-me ask_question waits
   if (transcriptTail?.awaitingUserApprovalOrQuestion) {
-    return {
-      decision: "allow",
-      reason: "",
-      reasonCode: "awaiting_user_input",
-      nextState,
-      stateChanged,
-      metrics
-    };
+    return finalizeStop(
+      {
+        decision: "allow",
+        reason: "",
+        reasonCode: "awaiting_user_input",
+        nextState,
+        stateChanged,
+        metrics
+      },
+      "not_run"
+    );
   }
 
   // Smart automatic classification (zero explicit user declaration needed):
@@ -2596,14 +2672,17 @@ export function evaluateStop(payload, events = [], prevStateInput = null, option
       ? evaluateDeliveryGateStatus(deliveryGate, effSettings.deliveryTestCommand)
       : { pendingChecks: [], failedChecks: [], untestedScopes: [], invalidCustomCommand: null, allPassed: true };
   if (gateStatus.invalidCustomCommand && deliveryGate?.wroteSource) {
-    return {
-      decision: "allow",
-      reason: "",
-      reasonCode: "delivery_gate_invalid_custom_command",
-      nextState,
-      stateChanged,
-      metrics
-    };
+    return finalizeStop(
+      {
+        decision: "allow",
+        reason: "",
+        reasonCode: "delivery_gate_invalid_custom_command",
+        nextState,
+        stateChanged,
+        metrics
+      },
+      "insufficient_evidence"
+    );
   }
   const gateFailedCheck = gateStatus.failedChecks[0] || null;
   const gatePendingChecks = gateStatus.pendingChecks;
@@ -2728,15 +2807,30 @@ export function evaluateStop(payload, events = [], prevStateInput = null, option
     }
   }
 
+  const hasTurnVerifyPass = Boolean(metrics.latestPassTs >= turnFloorTs && metrics.latestPassTs > 0);
+  const hasUntestedScopes = Boolean(gateStatus.untestedScopes && gateStatus.untestedScopes.length > 0);
+  const inferAllowVerificationStatus = () => {
+    if (userSkipTests || turnOverride?.mode === "off" || explicitNoEdit) return "user_exempt";
+    if (hasUnresolvedTurnFailure) return "failed";
+    if (hasUnknownEvidence || hasUntestedScopes) return "insufficient_evidence";
+    if (gatePendingChecks.length > 0 || checks.length > 0) return "not_run";
+    if (hasTurnVerifyPass) return "passed";
+    if (metrics.hasTurnEdit || plan?.wroteSource || deliveryGate?.wroteSource) return "not_run";
+    return "not_run";
+  };
+
   if (!retryPolicy.active) {
-    return {
-      decision: "allow",
-      reason: "",
-      reasonCode: "retry_inactive",
-      nextState,
-      stateChanged,
-      metrics
-    };
+    return finalizeStop(
+      {
+        decision: "allow",
+        reason: "",
+        reasonCode: "retry_inactive",
+        nextState,
+        stateChanged,
+        metrics
+      },
+      inferAllowVerificationStatus()
+    );
   }
 
   const gateNudges = Number(deliveryGate?.consecutiveNoTestNudges || 0);
@@ -2756,14 +2850,17 @@ export function evaluateStop(payload, events = [], prevStateInput = null, option
       nextState.lastContinueEventSig = "";
       stateChanged = true;
     }
-    return {
-      decision: "allow",
-      reason: "",
-      reasonCode: "all_green_or_no_failure",
-      nextState,
-      stateChanged,
-      metrics
-    };
+    return finalizeStop(
+      {
+        decision: "allow",
+        reason: "",
+        reasonCode: "all_green_or_no_failure",
+        nextState,
+        stateChanged,
+        metrics
+      },
+      inferAllowVerificationStatus()
+    );
   }
 
   // Safety Brake 4: No-progress stall guard (if last continuation ran zero new substantive
@@ -2785,14 +2882,17 @@ export function evaluateStop(payload, events = [], prevStateInput = null, option
   if ((nextState.turnAutoRetries || 0) > 0 && nextState.lastContinueEventSig === currentEventSig) {
     nextState.lastContinueEventSig = "";
     stateChanged = true;
-    return {
-      decision: "allow",
-      reason: "",
-      reasonCode: "no_progress_guard",
-      nextState,
-      stateChanged,
-      metrics
-    };
+    return finalizeStop(
+      {
+        decision: "allow",
+        reason: "",
+        reasonCode: "no_progress_guard",
+        nextState,
+        stateChanged,
+        metrics
+      },
+      hasUnresolvedTurnFailure ? "failed" : hasUnknownEvidence ? "insufficient_evidence" : "not_run"
+    );
   }
 
   const execNum = parseNonNegInt(payload.executionNum ?? payload.execution_num);
@@ -2812,14 +2912,17 @@ export function evaluateStop(payload, events = [], prevStateInput = null, option
   const completedRetries = Math.max(nextState.turnAutoRetries || 0, hostRetries);
 
   if (retryPolicy.mode === "count" && completedRetries >= retryPolicy.max) {
-    return {
-      decision: "allow",
-      reason: "",
-      reasonCode: "retry_limit_reached",
-      nextState,
-      stateChanged,
-      metrics
-    };
+    return finalizeStop(
+      {
+        decision: "allow",
+        reason: "",
+        reasonCode: "retry_limit_reached",
+        nextState,
+        stateChanged,
+        metrics
+      },
+      hasUnresolvedTurnFailure ? "failed" : hasUnknownEvidence ? "insufficient_evidence" : "not_run"
+    );
   }
 
   const nextRetryNum = completedRetries + 1;
@@ -2850,28 +2953,41 @@ export function evaluateStop(payload, events = [], prevStateInput = null, option
   if (gateMissingCheck) {
     nextState.deliveryGate = { ...deliveryGate, consecutiveNoTestNudges: gateNudges + 1 };
     const tasks = gatePendingChecks.map(({ dir, command }) => JSON.stringify(dir) + " → " + command).join("；");
-    return {
-      decision: "continue",
-      reasonCode: "delivery_gate_missing_verification",
-      nextState,
-      stateChanged,
-      metrics,
-      reason:
-        "[agy-cmd 交付测试门禁] 本轮已修改源码，尚缺最后一次修改之后的完整测试通过结果。请在以下目录运行对应验证命令并确认全部通过后再交付：" +
-        tasks +
-        "。若环境不可用或存在必须由用户确认的阻塞，请直接说明缺测项与原因并停下（无需再运行命令）。" +
-        auditSuffix
-    };
+    return finalizeStop(
+      {
+        decision: "continue",
+        reasonCode: "delivery_gate_missing_verification",
+        nextState,
+        stateChanged,
+        metrics,
+        reason:
+          "[agy-cmd 交付测试门禁] 本轮已修改源码，尚缺最后一次修改之后的完整测试通过结果。请在以下目录运行对应验证命令并确认全部通过后再交付：" +
+          tasks +
+          "。若环境不可用或存在必须由用户确认的阻塞，请直接说明缺测项与原因并停下（无需再运行命令）。" +
+          auditSuffix
+      },
+      hasUnknownEvidence ? "insufficient_evidence" : "not_run"
+    );
   }
 
   if (missingCheck) {
     nextState.freePlan = { ...plan, reminded: true };
     const tasks = checks.map(({ dir, command }) => JSON.stringify(dir) + " → " + command).join("；");
-    return {
-      decision: "continue", reasonCode: "approved_plan_missing_verification", nextState, stateChanged, metrics,
-      reason: "[agy-cmd 计划补验] 本次计划已修改源码，尚缺最后一次修改之后的项目验证结果。请在以下目录运行对应检查并等待终态：" +
-        tasks + "。若环境不可用或用户要求跳过，请在交付中说明缺测项和原因。" + auditSuffix
-    };
+    return finalizeStop(
+      {
+        decision: "continue",
+        reasonCode: "approved_plan_missing_verification",
+        nextState,
+        stateChanged,
+        metrics,
+        reason:
+          "[agy-cmd 计划补验] 本次计划已修改源码，尚缺最后一次修改之后的项目验证结果。请在以下目录运行对应检查并等待终态：" +
+          tasks +
+          "。若环境不可用或用户要求跳过，请在交付中说明缺测项和原因。" +
+          auditSuffix
+      },
+      hasUnknownEvidence ? "insufficient_evidence" : "not_run"
+    );
   }
 
   const progressTag =
@@ -2885,12 +3001,15 @@ export function evaluateStop(payload, events = [], prevStateInput = null, option
     `请勿提前收工，继续定位根因、修改代码并重新运行验证命令；若遇到必须由用户确认的阻塞问题而无法自行推进，请直接说明原因并停下（无需再运行命令）。` +
     auditSuffix;
 
-  return {
-    decision: "continue",
-    reason,
-    reasonCode: "auto_continue",
-    nextState,
-    stateChanged,
-    metrics
-  };
+  return finalizeStop(
+    {
+      decision: "continue",
+      reason,
+      reasonCode: "auto_continue",
+      nextState,
+      stateChanged,
+      metrics
+    },
+    "failed"
+  );
 }

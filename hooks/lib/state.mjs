@@ -146,6 +146,7 @@ export function createDefaultState() {
     turnAllowTestWeakening: false,
     turnAuditFloorTs: 0,
     turnAuditFloorStep: -1,
+    lastStopOutcome: null,
     resolvedSteps: {}
   };
 }

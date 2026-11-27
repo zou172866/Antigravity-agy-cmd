@@ -1005,6 +1005,9 @@
           <span class="status-muted">当前会话处于 Swarm 协调器豁免模式</span>
           <button id="btn-resume-normal" class="link-btn" type="button">恢复普通会话</button>
         </div>
+        <div class="status-line" id="row-stop-outcome" hidden>
+          <span class="status-muted" id="lbl-stop-outcome">—</span>
+        </div>
         <div class="status-line" style="margin-top:2px">
           <span class="status-muted">累计自动拦截续跑：<strong id="lbl-total-retries">0</strong> 次</span>
           <button id="btn-reset-stats" class="link-btn" type="button">清零统计</button>
@@ -1146,6 +1149,8 @@
       const lblGateStatus = $("lbl-gate-status");
       const rowSwarmResume = $("row-swarm-resume");
       const btnResumeNormal = $("btn-resume-normal");
+      const rowStopOutcome = $("row-stop-outcome");
+      const lblStopOutcome = $("lbl-stop-outcome");
       const lblTotalRetries = $("lbl-total-retries");
       const btnResetStats = $("btn-reset-stats");
       const toastEl = $("toast");
@@ -1357,7 +1362,7 @@
           titleText = `发现新版本：v${avail.currentVersion || currentPluginVersion || "--"} → v${avail.latestVersion}`;
           showUpdateBtn = true;
           if (avail.assetUrl && avail.assetSha256) {
-            detailText = `${avail.assetName || "正式发行包"} · SHA-256 ${avail.assetSha256}`;
+            detailText = `待校验资产：${avail.assetName || "正式发行包"} · SHA-256 ${avail.assetSha256}`;
           } else {
             detailText = formatVersionError({ reason: "noVerifiedAsset" }, true);
             updateBtnText = "重新检查";
@@ -1365,17 +1370,28 @@
           releaseHref = isSafeReleaseUrl(avail.releaseUrl) ? avail.releaseUrl : GITHUB_RELEASES_URL;
         } else if (state === "updating") {
           titleText = "正在下载并校验更新包…";
-          detailText = `v${avail?.currentVersion || currentPluginVersion || "--"} → v${avail?.latestVersion || "--"}`;
+          const assetPart = avail?.assetName ? ` · ${avail.assetName}` : "";
+          detailText = `v${avail?.currentVersion || currentPluginVersion || "--"} → v${avail?.latestVersion || "--"}${assetPart}`;
         } else if (state === "updated") {
           const targetVer = versionCheckState.lastUpdate?.version || avail?.latestVersion || "--";
+          const verifiedAsset = versionCheckState.lastUpdate?.verifiedAssetName || avail?.assetName || "";
+          const verifiedSha = versionCheckState.lastUpdate?.verifiedSha256 || "";
+          const verifyPart = verifiedSha
+            ? `已通过 SHA-256 校验（${verifiedAsset || "正式发行包"} · ${verifiedSha}）。`
+            : "";
           titleText = `已更新至 v${targetVer}`;
-          detailText = versionCheckState.reloadPending
-            ? "正在重载面板… 重启或重载 Antigravity 后 Hooks 与规则将生效。"
-            : "插件文件已更新完成，请重新加载窗口或重启 Antigravity 生效。";
+          detailText =
+            verifyPart +
+            (versionCheckState.reloadPending
+              ? "正在重载面板… 重启或重载 Antigravity 后 Hooks 与规则将生效。"
+              : "插件文件已更新完成，请重新加载窗口或重启 Antigravity 生效。");
         } else if (state === "auto-updated") {
           const prevPart = autoNotice.previousVersion ? `（原 v${autoNotice.previousVersion}）` : "";
+          const verifyPart = autoNotice.verifiedSha256
+            ? `已通过 SHA-256 校验（${autoNotice.assetName || "正式发行包"} · ${autoNotice.verifiedSha256}）。`
+            : "";
           titleText = `已自动更新至 v${autoNotice.version}${prevPart}`;
-          detailText = "面板已自动重载；重载窗口或重启 Antigravity 后规则与配置将完整生效。";
+          detailText = `${verifyPart}面板已自动重载；重载窗口或重启 Antigravity 后规则与配置将完整生效。`;
           releaseHref = isSafeReleaseUrl(autoNotice.releaseUrl) ? autoNotice.releaseUrl : GITHUB_RELEASES_URL;
         } else if (state === "check-error") {
           titleText = "检查更新失败。";
@@ -1799,6 +1815,15 @@
         }
         setElementHidden(deliveryOffWarn, !(gateOn && s.autoRetryMode === "off"));
         setElementHidden(rowSwarmResume, !(data.activeSession && data.activeSession.swarmActive === true));
+        const stopOut = data.activeSession?.lastStopOutcome;
+        if (rowStopOutcome && lblStopOutcome) {
+          if (stopOut && stopOut.verificationStatusZh) {
+            lblStopOutcome.textContent = `最近停机：${stopOut.verificationStatusZh} · 原因：${stopOut.exitReasonZh || stopOut.exitReason || "—"}`;
+            setElementHidden(rowStopOutcome, false);
+          } else {
+            setElementHidden(rowStopOutcome, true);
+          }
+        }
 
         lblSummary.textContent = data.summaryZh || "";
         lblBoostStatus.textContent = data.boostStatusZh || "";
