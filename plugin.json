@@ -2,8 +2,8 @@
   "$schema": "https://antigravity.google/schemas/v1/plugin.json",
   "name": "agy-cmd",
   "displayName": "agy-cmd (自动路由与防停机面板)",
-  "version": "2.7.3",
-  "description": "Antigravity 桌面端/IDE 高阶能力自动路由插件（v2.7.3）：多智能体与 Swarm 隔离调度、Plan Mode 硬拦截、交付测试门禁、Stop 防停机自动续跑、右侧边栏面板与 SHA-256 在线自更新。",
+  "version": "2.7.4",
+  "description": "Antigravity 桌面端/IDE 高阶能力自动路由插件（v2.7.4）：多智能体与 Swarm 隔离调度、Plan Mode 硬拦截、交付测试门禁、Stop 防停机自动续跑、右侧边栏面板与 SHA-256 在线自更新。",
   "logo": "assets/logo.svg",
   "author": {
     "name": "zou172866",

@@ -15,8 +15,10 @@ import { isPlanApprovalNotice, stripTranscriptStepHeaders } from "./transcript.m
 import {
   advanceDeliveryGate,
   advancePlan,
+  allowsTestWeakening,
   deliveryEventOrder,
   deliveryGateToolEvidence,
+  detectTestAssertionWeakening,
   evaluateDeliveryGateStatus,
   matchesCustomCheckCommand,
   pathKey,
@@ -546,6 +548,11 @@ export function classifyToolEvents(payload, nowMs = Date.now(), options = {}) {
       explicitError
     );
 
+    const testWeakening =
+      !hasArtifactMeta && !looksLikePlanPath && !editOutcome.editFailed
+        ? detectTestAssertionWeakening(bareTool, effectiveArgs)
+        : null;
+
     const emitInlineVerify = Boolean(hasVerify && editOutcome.verifyResult);
     const pendingEdit = Boolean(
       needsPreInvocationResolve && (bareTool === "apply_edits" || !explicitError)
@@ -558,6 +565,7 @@ export function classifyToolEvents(payload, nowMs = Date.now(), options = {}) {
         kind: "edit",
         ...planFields,
         ...(hasVerificationEvidence && editOutcome.applied ? { applied: true } : {}),
+        ...(testWeakening ? { testWeakening } : {}),
         tool: bareTool,
         failed: editOutcome.editFailed,
         abortedNoWrite: editOutcome.editFailed,
@@ -1084,6 +1092,63 @@ export function resolveEffectiveRetryPolicy(
   };
 }
 
+function collectActiveTestWeakening(events, turnFloorTs = 0, deliveryGateEnabled = false) {
+  let sawActiveFailure = false;
+  const files = new Set();
+  let addedSkip = 0;
+  let droppedAssert = 0;
+  let matchCount = 0;
+  let latestTs = 0;
+
+  for (let i = 0; i < events.length; i++) {
+    const ev = events[i];
+    if (!ev || typeof ev !== "object" || ev.pending || ev.backgroundRunning) continue;
+    const evTs = Number(ev.ts) || i + 1;
+
+    if (ev.kind === "cmd") {
+      if (ev.isReadOnlyCmd || ev.isBenignSearchCmd) continue;
+      if (ev.failed) {
+        sawActiveFailure = true;
+      } else if (evTs < turnFloorTs && ev.isVerify) {
+        // A clean passing verification before the current turn started clears stale prior failure context.
+        sawActiveFailure = false;
+      }
+      continue;
+    }
+
+    if (ev.kind === "edit" && !ev.failed && ev.testWeakening && evTs >= turnFloorTs) {
+      if (!deliveryGateEnabled && !sawActiveFailure) continue;
+      const w = ev.testWeakening;
+      const sk = Number(w.addedSkip) || 0;
+      const dr = Number(w.droppedAssert) || 0;
+      if (sk <= 0 && dr <= 0) continue;
+      addedSkip += sk;
+      droppedAssert += dr;
+      matchCount += 1;
+      if (evTs > latestTs) latestTs = evTs;
+      for (const f of Array.isArray(w.files) ? w.files : []) {
+        if (f && files.size < 5) files.add(f);
+      }
+    }
+  }
+
+  if (matchCount === 0) return null;
+  const fileList = [...files];
+  return {
+    files: fileList,
+    addedSkip,
+    droppedAssert,
+    sig: `${matchCount}:${latestTs}:${addedSkip}:${droppedAssert}:${fileList.join(",")}`
+  };
+}
+
+function formatTestWeakeningDetailZh(audit) {
+  const parts = [];
+  if (audit.addedSkip > 0) parts.push(`新增 ${audit.addedSkip} 处跳过标记`);
+  if (audit.droppedAssert > 0) parts.push(`净删减 ${audit.droppedAssert} 处断言`);
+  return parts.join("、");
+}
+
 /**
  * Pure PreInvocation decision engine.
  * Returns { nextState, injectStep, shouldResetEvents, reasonCode, stateChanged, metrics }.
@@ -1231,6 +1296,7 @@ export function evaluatePreInvocation(payload, events = [], prevStateInput = nul
     nextState.turnAutoRetries = 0;
     nextState.turnBaseExecutionNum = null;
     nextState.lastContinueEventSig = "";
+    nextState.testAuditNoticedSig = "";
     nextState.turnRetryOverride = parseTurnRetryOverride(intentProse);
     nextState.turnUnattendedGoal = Boolean(
       UNATTENDED_GOAL_RE.test(intentProse) ||
@@ -1252,6 +1318,7 @@ export function evaluatePreInvocation(payload, events = [], prevStateInput = nul
       nextState.turnAutoRetries = 0;
       nextState.turnBaseExecutionNum = null;
       nextState.lastContinueEventSig = "";
+      nextState.testAuditNoticedSig = "";
       nextState.lastPlanBoostKey = "";
       nextState.lastPlanBoostNoticeHash = "";
       nextState.lastPlanBoostPromptKey = "";
@@ -1470,14 +1537,27 @@ export function evaluatePreInvocation(payload, events = [], prevStateInput = nul
     }
   }
 
+  const auditTurnFloorTs = nextState.lastTurnStartTs > 0 ? nextState.lastTurnStartTs - 1000 : 0;
+  const activeTestWeakening = !allowsTestWeakening(intentProse)
+    ? collectActiveTestWeakening(effectiveEvents, auditTurnFloorTs, effSettings.deliveryTestGateEnabled)
+    : null;
+
   const plan = nextState.freePlan;
   if (plan?.wroteSource && effSettings.freePlanReviewEnabled && !uiOnly && !plan.reviewRequested &&
       !plan.skipReview && !activeSlash.size && !activePlanBlock && !transcriptTail?.awaitingUserApprovalOrQuestion) {
     nextState.freePlan = { ...plan, reviewRequested: true };
+    let auditExtra = "";
+    if (activeTestWeakening) {
+      nextState.testAuditNoticedSig = activeTestWeakening.sig;
+      auditExtra =
+        ` Also flag these audited test edits for strict assertion-integrity review: ${activeTestWeakening.files.join(", ")} (${formatTestWeakeningDetailZh(activeTestWeakening)}).`;
+    }
     return {
       nextState, shouldResetEvents, stateChanged: true, metrics, reasonCode: "approved_free_plan_review",
       injectStep: buildInjectStep({ systemMessage:
-        "[agy-cmd] This approved implementation has one optional independent review. Finish all planned edits yourself and run relevant project checks first (honor any user skip). Before final delivery, call invoke_subagent once with TypeName='cmd-verifier' and Workspace='inherit'. Send the acceptance criteria, this task's relative paths and diff excerpts only, applicable root/nested AGENTS.md or GEMINI.md paths, and actual check commands and terminal results or the concrete reason they could not run. The reviewer reads and reports specification gaps first, then risks and missing tests with file locations and counterexamples. Address blockers and verify the final changes yourself. If unavailable, over quota or unsuccessful, report that the independent review was not completed and finish on the main thread. Do not retry the role or start a second reviewer. Respect later user requests to stop or skip review." })
+        "[agy-cmd] This approved implementation has one optional independent review. Finish all planned edits yourself and run relevant project checks first (honor any user skip). Before final delivery, call invoke_subagent once with TypeName='cmd-verifier' and Workspace='inherit'. Context isolation is mandatory: Do NOT pass main-session reasoning, self-justifications, summaries, or chat history. Send ONLY: (1) the acceptance criteria, (2) this task's repo-relative paths and diff excerpts, (3) applicable root/nested AGENTS.md or GEMINI.md paths, and (4) actual check commands with raw terminal results (or the concrete reason they could not run)." +
+        auditExtra +
+        " The reviewer audits correctness/edge counterexamples, API/dependency authenticity and assertion integrity, and traceable terminal evidence, replying with Verdict / Blocking / Missing Evidence. Address blockers and verify the final changes yourself. If unavailable, over quota or unsuccessful, report that the independent review was not completed and finish on the main thread. Do not retry the role or start a second reviewer. Respect later user requests to stop or skip review." })
     };
   }
 
@@ -1701,6 +1781,34 @@ export function evaluatePreInvocation(payload, events = [], prevStateInput = nul
         metrics
       };
     }
+  }
+
+  // 8. Priority 6: Frozen Rules soft audit for suspected test assertion weakening (soft notice only, never hard-blocks)
+  if (
+    activeTestWeakening &&
+    activeTestWeakening.sig !== nextState.testAuditNoticedSig &&
+    !uiOnly &&
+    activeSlash.size === 0 &&
+    !activePlanBlock &&
+    !transcriptTail?.awaitingUserApprovalOrQuestion
+  ) {
+    nextState.testAuditNoticedSig = activeTestWeakening.sig;
+    stateChanged = true;
+    const filesLabel = activeTestWeakening.files.join("、");
+    const detail = formatTestWeakeningDetailZh(activeTestWeakening);
+    return {
+      nextState,
+      injectStep: buildInjectStep({
+        uiOnly,
+        systemMessage:
+          `[agy-cmd 测试断言审计] 检测到在近期测试失败或交付门禁开启期间，对测试文件（${filesLabel}）存在疑似弱化校验的改动（${detail}）。` +
+          `请自查是否为强行跑绿而删改/跳过断言；若属于合法测试重构，请在最终交付回复中向用户明确列出删改/跳过的用例与原因（本次仅做软审计提醒，不阻断正常交付）。`
+      }),
+      shouldResetEvents,
+      reasonCode: "test_assertion_weakening_audit",
+      stateChanged,
+      metrics
+    };
   }
 
   return {
@@ -2131,6 +2239,13 @@ export function evaluateStop(payload, events = [], prevStateInput = null, option
   nextState.lastContinueEventSig = currentEventSig;
   stateChanged = true;
 
+  const stopTestWeakening = !allowsTestWeakening(intentProse)
+    ? collectActiveTestWeakening(effectiveEvents, turnFloorTs, effSettings.deliveryTestGateEnabled)
+    : null;
+  const auditSuffix = stopTestWeakening
+    ? `另检测到测试文件（${stopTestWeakening.files.join("、")}）存在疑似弱化校验改动（${formatTestWeakeningDetailZh(stopTestWeakening)}），请核对并恢复必要断言，或在交付时向用户明示删改/跳过原因。`
+    : "";
+
   if (gateMissingCheck) {
     nextState.deliveryGate = { ...deliveryGate, consecutiveNoTestNudges: gateNudges + 1 };
     const tasks = gatePendingChecks.map(({ dir, command }) => JSON.stringify(dir) + " → " + command).join("；");
@@ -2143,7 +2258,8 @@ export function evaluateStop(payload, events = [], prevStateInput = null, option
       reason:
         "[agy-cmd 交付测试门禁] 本轮已修改源码，尚缺最后一次修改之后的完整测试通过结果。请在以下目录运行对应验证命令并确认全部通过后再交付：" +
         tasks +
-        "。若环境不可用或存在必须由用户确认的阻塞，请直接说明缺测项与原因并停下（无需再运行命令）。"
+        "。若环境不可用或存在必须由用户确认的阻塞，请直接说明缺测项与原因并停下（无需再运行命令）。" +
+        auditSuffix
     };
   }
 
@@ -2153,7 +2269,7 @@ export function evaluateStop(payload, events = [], prevStateInput = null, option
     return {
       decision: "continue", reasonCode: "approved_plan_missing_verification", nextState, stateChanged, metrics,
       reason: "[agy-cmd 计划补验] 本次计划已修改源码，尚缺最后一次修改之后的项目验证结果。请在以下目录运行对应检查并等待终态：" +
-        tasks + "。若环境不可用或用户要求跳过，请在交付中说明缺测项和原因。"
+        tasks + "。若环境不可用或用户要求跳过，请在交付中说明缺测项和原因。" + auditSuffix
     };
   }
 
@@ -2165,7 +2281,8 @@ export function evaluateStop(payload, events = [], prevStateInput = null, option
   const cmdHint = failedCheckLabel ? `（最近失败：${failedCheckLabel}）` : "";
   const reason =
     `[agy-cmd 自动续跑 ${progressTag}] 检测到验证/测试尚未全绿通过${cmdHint}。` +
-    `请勿提前收工，继续定位根因、修改代码并重新运行验证命令；若遇到必须由用户确认的阻塞问题而无法自行推进，请直接说明原因并停下（无需再运行命令）。`;
+    `请勿提前收工，继续定位根因、修改代码并重新运行验证命令；若遇到必须由用户确认的阻塞问题而无法自行推进，请直接说明原因并停下（无需再运行命令）。` +
+    auditSuffix;
 
   return {
     decision: "continue",

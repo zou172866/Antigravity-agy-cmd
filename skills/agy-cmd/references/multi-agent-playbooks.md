@@ -4,14 +4,21 @@
 
 ---
 
-## 一、四条分流判据（含负向否决门）
+## 一、拆并行前两步机械判据与四条分流
+
+动手拆并行前，先按以下两步机械核对，过不了直接留单会话：
+
+- **机械判据 1 · 数据假边测试**：步骤 B 是否必须读取步骤 A 的输出？若整条链路都是真数据依赖，直接走单会话 / Loop / `/boost`，不硬拆并行。
+- **机械判据 2 · 隐式资源边检查**：两段 Prompt 表面互不相干，但会写同一文件、共享配置/锁、抢同一测试端口、共用 GPU/内存或撞同一限流 API 吗？只要共享可变资源就存在隐式边，必须隔离独立 worktree / 端口，或加边串行。
+
+过关后再按四条分流（含负向否决门）：
 
 1. **先判能否拆出无冲突 Lane**：前后强依赖或紧耦合改动禁止强行并行（多人撞改重叠代码反而拉低成功率）→ 留在主会话 / Orchestrator，单点疑难走 `/boost`。
 2. **单点深挖 vs 宽而独立**：单点疑难需独立检验多假设选 `/boost`；多模块或多视角可独立并行（含 3～4 个相似修复用 `@fix-1..N` 编号池）选 `/swarm`。
 3. **是否需要互相对话 / 互看 Diff**：Worker 须在留言板协商接口、跨模型审 Diff 或做 Best-of-N / 匿名评议，选 `/swarm`；同质检查各自交 JSON 结果由脚本汇总（或把跑顺的 Swarm 固化复用），选 `/run-workflow`。
 4. **单次交付 vs 跨天里程碑**：一次交付可验收走 `/swarm`；跨天分里程碑审计与上下文交接选 `/teamwork`。[官方场景对照](https://antigravity.google/docs/teamwork)
 
-> **共享资源提醒**：目录分开后，共用的 GPU、内存或测试端口仍会撞车；并行实验或集成测试在启动前须先约定资源认领与释放时机。
+> **`/plan` 衔接提示**：`/plan` 产出多模块实施计划时，建议直接标出**可并行任务组**与**串行依赖**，获批后可无缝衔接 `/swarm execute our plan`。
 
 ---
 
@@ -101,10 +108,31 @@
 /swarm 请 @design-neon（Gemini 4 Neon）、@design-carbon（Gemini 4 Carbon）和 @design-opus（Claude Opus 5.5）分别给出新设置页的独立设计方案（严格只读）。再派三位新裁判在隐藏模型名的前提下逐项打分，最后合并最强思路输出一份规格说明并停下。
 ```
 
-**Workflow · 同质对象独立交回结果（App）**
+**Workflow 1 · 菱形工业模板（Diamond：已知规模批量检查 / 迁移，App）**
+
+标准四段骨架：`Fan-out`（便宜模型并发）→ `Reduce`（纯 Python 代码去重与计数，0 Token）→ `Verify`（独立洁净上下文强模型挑刺）→ `Synthesize`（单节点汇总）。三条防爆硬护栏：
+- **首轮 `CAP` 硬上限**：首轮强制限 `<= 20` 项且设总 Agent 硬上限，看清实际耗时与配额再放量。
+- **Fan-in Guard（完整性守卫）**：Reduce 脚本核对 `returned_count` 与 `expected_count`，报告顶部显式列出 `missing / failed` 清单，严禁拿残缺集当完整报告交付。
+- **分层汇聚（Layered Fan-in）**：扇出超过 `30～40` 项时，先按 `15～20` 项分批做中间摘要，再进最终单节点汇总，防止上下文坍塌。
 
 ```text
-/run-workflow 对照 @docs/package-rules.md 逐包检查 @packages/。每个 agent 的任务书都给出包路径、适用规则和判据，用 JSON Schema 要求返回包名、pass/fail/error 及证据。逐项捕获异常并记录失败包，保留其他结果；最后输出统计和待复查清单。
+/run-workflow 对照 @docs/package-rules.md 批量检查 @packages/，按四段菱形骨架执行：
+1. Fan-out（CAP 硬上限）：先取前 20 个目标（设总 Agent 上限 25），用便宜模型并发跑每项任务书（含路径、规则、判据与严格 JSON Schema：item/status/issues/evidence），逐项 try/except 捕获超时与异常。
+2. Reduce（纯 Python，0 Token）：按 item 去重合并，核对 returned_count 与 expected_count，分离 passed / failed / missing 清单，禁止跳过失败项。若有效结果超过 35 项，先每 15～20 项分组做中间摘要（Layered Fan-in）。
+3. Verify（洁净上下文强模型）：把高危/失败项的相对路径、Diff 或代码证据交给独立强模型核查假阳性（不传前序推理过程）。
+4. Synthesize（单节点汇总）：顶部显式给出 expected / returned / missing / failed 计数与残缺项清单，再输出分级整改表。
+```
+
+**Workflow 2 · 未知规模猎错 / 重构收敛模板（App）**
+
+适合“不知道全库还有多少同类缺陷/技术债”的场景，靠纯代码历史去重与双停机条件防死循环烧额：
+
+```text
+/run-workflow 在 @src/ 开展未知规模缺陷猎杀（设总 Agent 硬上限 30、单轮批次上限 15）：
+1. 并行发现：每轮用便宜模型分片扫描未覆盖区域，按 JSON Schema 返回 (file, line, rule_id, snippet)。
+2. 历史去重（纯 Python，0 Token）：按 (file, line, rule_id) 签名过滤历轮已记录项，仅保留本轮净新增候选。
+3. 独立校验：将本轮净新增候选及对应代码片段交给独立洁净上下文强模型复核，剔除假阳性并产出可复现证据。
+4. 自动停机：连续 2 轮验证后净新增为 0 或触及总 Agent 硬上限立即停机，由单节点汇总去重后的最终修复清单（顶部标明覆盖率与未扫/失败分片）。
 ```
 
 **Teamwork · 多个里程碑分别验收（付费）**
@@ -125,7 +153,8 @@ Teamwork 范围访谈按允许范围选完整性模式：日常工程用 `develo
 
 ## 五、Swarm 启动前自检清单（Pre-launch Checklist）
 
-- [ ] **无冲突 Lane**：无共享核心文件、无前后强依赖；拆不开就留在主会话 / Orchestrator 或走 `/boost`。
+- [ ] **假边测试通过**：各 Lane 间无真数据前后依赖（步骤 B 无需读取步骤 A 的输出）；强依赖或紧耦合改动留在主会话 / Orchestrator 或走 `/boost`。
+- [ ] **隐式资源边清零**：核对共享文件、公共配置/锁、测试端口、GPU/内存与限流 API；有共享可变资源就隔离 worktree/端口或加边串行。
 - [ ] **确定性验收**：验收条件写成明确命令或可观测指标（如 `npm test`、`go test -race ./...`、`0 console errors`）。
 - [ ] **三层选模**：Coordinator 用 Orchestrator（Neon）、Worker 用 Hydrogen、`@verifier` 换另一模型（如 Carbon）。
 - [ ] **硬证据与省配额路由**：要求仓库相对路径 + 1-based 行号、禁删断言；Worker 完工发 `@verifier [done]`，未阻塞勿 `@coordinator`。

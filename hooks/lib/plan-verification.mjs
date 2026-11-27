@@ -955,3 +955,132 @@ export function evaluateDeliveryGateStatus(gate, customCommand = "") {
     allPassed: pendingChecks.length === 0 && failedChecks.length === 0
   };
 }
+
+// ============================================================================
+// Frozen Rules: Test Assertion Weakening Soft Audit (zero extra file I/O)
+// ============================================================================
+
+const TEST_FILE_RE =
+  /(?:\.(?:test|spec)\.[cm]?[jt]sx?$|(?:^|[\\/])test_[^\\/]+\.py$|_test\.py$|_test\.go$|(?:^|[\\/])tests[\\/][^\\/]+\.rs$|(?:Test|Tests|Spec)\.(?:java|kt|cs|dart|swift)$|_(?:test|spec)\.(?:rb|dart|ex|exs)$)/i;
+const DUNDER_TESTS_DIR_RE = /(?:^|[\\/])__tests__[\\/]/i;
+
+const TEST_SKIP_MARKER_RE =
+  /(?:\b(?:it|test|describe|suite|context|specify)\s*\.\s*(?:skip|todo)\s*\(|\b(?:xit|xtest|xdescribe|xcontext|xspecify)\s*\(|\b(?:test|it)\s*\([^)\n]*,\s*\{\s*skip\s*:\s*true\b|@\s*pytest\.mark\.(?:skip|skipif|xfail)\b|@\s*unittest\.skip(?:If|Unless)?\b|\bpytest\.skip\s*\(|\bself\.skipTest\s*\(|\b[tb]\.[sS]kip(?:f|Now)?\s*\(|#\[\s*ignore\b|@(?:Disabled|Ignore)\b|\[\s*(?:Ignore\b|Fact\s*\(\s*Skip\s*=))/g;
+
+const TEST_ASSERTION_RE =
+  /(?:\bassert(?:\.[A-Za-z_$][\w$]*)?\s*\(|(?:^|[;:])\s*assert\s+(?![=])|\bexpect\s*\(|\bassert(?:_[a-z_]+)?!\s*\(|\bassert_[a-z_]+\s*\(|\bself\.assert[A-Z]\w*\s*\(|\b[tb]\.(?:Error|Fatal|Fail)(?:f|Now)?\s*\(|\b(?:require|assert)\.[A-Z]\w*\s*\(|\bAssert\.[A-Z]\w*\s*\()/g;
+
+const ALLOW_TEST_WEAKENING_ZH_RE =
+  /(?:(?:删掉?|删除|移除|去掉|清理|先?跳过|暂时跳过|禁用|注释掉?|加\s*\.?skip|标记\s*skip|忽略)[^。\n，,;；]{0,16}(?:这[个些条批]?|该|旧|过时|冗余|重复|flaky|不稳定|失败的?)?(?:测试|用例|单测|断言|assert|expect|test|spec)|(?:测试|用例|单测|断言)[^。\n，,;；]{0,12}(?:删掉?|删除|移除|去掉|先?跳过|禁用|注释掉?|加\s*\.?skip))/i;
+
+const ALLOW_TEST_WEAKENING_EN_RE =
+  /\b(?:remove|delete|drop|skip|disable|ignore|comment\s+out|mark\s+as\s+skip(?:ped)?)\s+(?:(?:the|this|these|that|old|legacy|obsolete|flaky|failing|redundant|unit|existing)\s+){0,3}(?:tests?|test\s+cases?|specs?|assertions?)\b/i;
+
+export function isTestFilePath(filePath) {
+  if (typeof filePath !== "string" || !filePath.trim()) return false;
+  const cleaned = filePath.trim().replace(/^(['"])([\s\S]+)\1$/, "$2");
+  if (!cleaned || EXAMPLE.test(cleaned)) return false;
+  if (TEST_FILE_RE.test(cleaned)) return true;
+  return DUNDER_TESTS_DIR_RE.test(cleaned) && SOURCE.test(cleaned);
+}
+
+function shortTestFileLabel(filePath) {
+  const parts = String(filePath || "").replace(/\\/g, "/").split("/").filter(Boolean);
+  if (parts.length === 0) return "";
+  return parts.length >= 2 ? `${parts[parts.length - 2]}/${parts[parts.length - 1]}` : parts[0];
+}
+
+function countPatternMatches(lines, re) {
+  let total = 0;
+  for (const line of lines) {
+    if (PURE_COMMENT_LINE_RE.test(line)) continue;
+    re.lastIndex = 0;
+    const matches = line.match(re);
+    if (matches) total += matches.length;
+  }
+  return total;
+}
+
+/**
+ * Reuse edit tool hunk arguments (zero disk I/O) to detect suspected test weakening:
+ * newly added skip/ignore markers or net reduction of existing assertions in test files.
+ * Whole-file writes without a before-image are conservatively ignored.
+ */
+export function detectTestAssertionWeakening(tool, args) {
+  if (!args || typeof args !== "object") return null;
+  if (tool === "write_file" || tool === "write_to_file") return null;
+  if (tool === "apply_edits" && args.dryRun === true) return null;
+
+  const target = args.Path ?? args.path ?? args.TargetFile ?? args.targetFile ?? args.filePath ?? args.AbsolutePath;
+  const edits =
+    tool === "apply_edits"
+      ? decoded(args.edits)
+      : decoded(args.ReplacementChunks ?? args.replacementChunks ?? [args]);
+  if (!Array.isArray(edits)) return null;
+
+  const perFile = new Map();
+  for (const edit of edits) {
+    if (!edit || typeof edit !== "object") continue;
+    const rawFile = decoded(tool === "apply_edits" ? edit.path : target);
+    if (typeof rawFile !== "string" || !isTestFilePath(rawFile)) continue;
+    const hunks = decoded(edit.hunks) ?? [edit];
+    if (!Array.isArray(hunks)) continue;
+
+    const label = shortTestFileLabel(rawFile);
+    if (!label) continue;
+    const stats = perFile.get(label) || { oldSkips: 0, newSkips: 0, oldAsserts: 0, newAsserts: 0 };
+
+    for (const h of hunks) {
+      if (!h || typeof h !== "object") continue;
+      const before = sourceText(h.target ?? h.Target ?? h.TargetContent ?? h.old_text ?? h.oldText ?? h.find);
+      const after = sourceText(h.replacement ?? h.Replacement ?? h.ReplacementContent ?? h.new_text ?? h.newText ?? h.replace);
+      if (typeof before !== "string" || typeof after !== "string") continue;
+
+      const oldLines = before.split(/\r?\n/);
+      const newLines = after.split(/\r?\n/);
+      let first = 0;
+      let lastOld = oldLines.length;
+      let lastNew = newLines.length;
+      while (first < lastOld && first < lastNew && oldLines[first] === newLines[first]) first++;
+      while (lastOld > first && lastNew > first && oldLines[lastOld - 1] === newLines[lastNew - 1]) {
+        lastOld--;
+        lastNew--;
+      }
+      const oldChanged = oldLines.slice(first, lastOld);
+      const newChanged = newLines.slice(first, lastNew);
+      if (oldChanged.length === 0 && newChanged.length === 0) continue;
+
+      stats.oldSkips += countPatternMatches(oldChanged, TEST_SKIP_MARKER_RE);
+      stats.newSkips += countPatternMatches(newChanged, TEST_SKIP_MARKER_RE);
+      stats.oldAsserts += countPatternMatches(oldChanged, TEST_ASSERTION_RE);
+      stats.newAsserts += countPatternMatches(newChanged, TEST_ASSERTION_RE);
+    }
+
+    perFile.set(label, stats);
+  }
+
+  let addedSkip = 0;
+  let droppedAssert = 0;
+  const files = [];
+  for (const [label, stats] of perFile.entries()) {
+    const skipDelta = Math.max(0, stats.newSkips - stats.oldSkips);
+    const assertDelta = stats.oldAsserts > 0 ? Math.max(0, stats.oldAsserts - stats.newAsserts) : 0;
+    if (skipDelta > 0 || assertDelta > 0) {
+      addedSkip += skipDelta;
+      droppedAssert += assertDelta;
+      if (files.length < 5) files.push(label);
+    }
+  }
+
+  if (addedSkip === 0 && droppedAssert === 0) return null;
+  return { files, addedSkip, droppedAssert };
+}
+
+export function allowsTestWeakening(text) {
+  const stripped = String(text || "").replace(/```[\s\S]*?```/g, " ");
+  const normalized = stripped.replace(
+    /(?:(?:别|不要|请勿|勿|不应|不可|不能|不许|禁止|严禁)\s*(?:删掉?|删除|移除|去掉|删减|跳过|禁用|注释掉?|弱化)|\b(?:do\s+not|don['’]t|never|must\s+not|avoid)\s+(?:skip|remove|delete|disable|drop|weaken|comment\s+out)\b)[^。.!！?？;\n,，]*/gi,
+    "保留"
+  );
+  return ALLOW_TEST_WEAKENING_ZH_RE.test(normalized) || ALLOW_TEST_WEAKENING_EN_RE.test(normalized);
+}

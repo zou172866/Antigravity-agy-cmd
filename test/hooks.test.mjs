@@ -30,7 +30,13 @@ import { runPostToolUse } from "../hooks/post-tool-use.mjs";
 import { runPreInvocation } from "../hooks/pre-invocation.mjs";
 import { runStop } from "../hooks/stop.mjs";
 import { readSettings, updateSettings } from "../hooks/lib/settings.mjs";
-import { planPreferences, requestedProjectCheck } from "../hooks/lib/plan-verification.mjs";
+import {
+  allowsTestWeakening,
+  detectTestAssertionWeakening,
+  isTestFilePath,
+  planPreferences,
+  requestedProjectCheck
+} from "../hooks/lib/plan-verification.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PLUGIN_ROOT = path.resolve(__dirname, "..");
@@ -3019,4 +3025,241 @@ test("zero-edit env probes (run_checks & read-only run_command) and confirm-befo
     ).decision,
     "continue"
   );
+});
+
+test("Frozen Rules: test assertion weakening soft audit (positive triggers, zero-FP guardrails, user exemption, and verifier desensitization)", async (t) => {
+  // 1. Test file path recognition & example/source exclusions
+  for (const okPath of [
+    "test/hooks.test.mjs",
+    "src/auth.spec.ts",
+    "tests/test_router.py",
+    "pkg/worker_test.go",
+    "src/__tests__/card.tsx",
+    "tests/integration.rs",
+    "OrderServiceTest.java"
+  ]) {
+    assert.equal(isTestFilePath(okPath), true, okPath);
+  }
+  for (const nonTestPath of [
+    "src/app.ts",
+    "examples/demo.test.js",
+    "fixtures/test_sample.py",
+    "README.md"
+  ]) {
+    assert.equal(isTestFilePath(nonTestPath), false, nonTestPath);
+  }
+
+  // 2. Pure hunk diff detection (zero file I/O) across JS / Python / Go and anti-FP cases
+  assert.deepEqual(
+    detectTestAssertionWeakening("edit_file", {
+      Path: "test/auth.test.mjs",
+      Target: 'test("validates token", () => {\n  assert.equal(ok, true);\n});',
+      Replacement: 'test.skip("validates token", () => {\n  assert.equal(ok, true);\n});'
+    }),
+    { files: ["test/auth.test.mjs"], addedSkip: 1, droppedAssert: 0 }
+  );
+  assert.deepEqual(
+    detectTestAssertionWeakening("edit_file", {
+      Path: "tests/test_api.py",
+      Target: "def test_login():\n    assert resp.status == 200\n    assert resp.ok",
+      Replacement: "@pytest.mark.skip(reason='flaky')\ndef test_login():\n    assert resp.status == 200"
+    }),
+    { files: ["tests/test_api.py"], addedSkip: 1, droppedAssert: 1 }
+  );
+  assert.deepEqual(
+    detectTestAssertionWeakening("apply_edits", {
+      edits: [
+        {
+          path: "pkg/queue_test.go",
+          hunks: [
+            {
+              target: "func TestCancel(t *testing.T) {\n\trequire.NoError(t, err)\n}",
+              replacement: "func TestCancel(t *testing.T) {\n\tt.Skip(\"later\")\n}"
+            }
+          ]
+        }
+      ]
+    }),
+    { files: ["pkg/queue_test.go"], addedSkip: 1, droppedAssert: 1 }
+  );
+
+  // Anti-FP: ordinary source file, legitimate new test, equal assertion rewrite, cross-hunk move, comment-only skip, write_file
+  assert.equal(
+    detectTestAssertionWeakening("edit_file", {
+      Path: "src/app.ts",
+      Target: "assert.equal(x, 1);\nreturn x;",
+      Replacement: "test.skip('literal');\nreturn 2;"
+    }),
+    null
+  );
+  assert.equal(
+    detectTestAssertionWeakening("edit_file", {
+      Path: "test/auth.test.mjs",
+      Target: 'test("a", () => {\n  assert.equal(1, 1);\n});',
+      Replacement: 'test("a", () => {\n  assert.equal(1, 1);\n});\ntest("b", () => {\n  assert.equal(2, 2);\n});'
+    }),
+    null
+  );
+  assert.equal(
+    detectTestAssertionWeakening("edit_file", {
+      Path: "test/auth.test.mjs",
+      Target: "assert.equal(res, 1);",
+      Replacement: "assert.deepEqual(res, 1);"
+    }),
+    null
+  );
+  assert.equal(
+    detectTestAssertionWeakening("apply_edits", {
+      edits: [
+        {
+          path: "test/auth.test.mjs",
+          hunks: [
+            { target: "assert.equal(a, 1);\nfoo();", replacement: "foo();" },
+            { target: "bar();", replacement: "bar();\nassert.equal(a, 1);" }
+          ]
+        }
+      ]
+    }),
+    null
+  );
+  assert.equal(
+    detectTestAssertionWeakening("edit_file", {
+      Path: "test/auth.test.mjs",
+      Target: "assert.equal(a, 1);",
+      Replacement: "// note: never use test.skip( here\nassert.equal(a, 1);"
+    }),
+    null
+  );
+  assert.equal(
+    detectTestAssertionWeakening("write_file", {
+      Path: "test/new.test.mjs",
+      Content: 'test.skip("draft", () => {});'
+    }),
+    null
+  );
+
+  // 3. Explicit user exemption & negation guard
+  assert.equal(allowsTestWeakening("请把这个过时的测试用例删掉"), true);
+  assert.equal(allowsTestWeakening("先跳过这个 flaky 用例"), true);
+  assert.equal(allowsTestWeakening("Please skip the legacy test case for now"), true);
+  assert.equal(allowsTestWeakening("修好失败测试，不要删减断言也别跳过用例"), false);
+  assert.equal(allowsTestWeakening("Fix the bug and do not skip tests or drop assertions"), false);
+  assert.equal(allowsTestWeakening("修好报错并跑通单测"), false);
+
+  // 4. End-to-end: failure -> test.skip -> green test triggers soft PreInvocation audit once, Stop stays allow (no hard block)
+  const failEv = classifyToolEvents(
+    {
+      stepIdx: 1,
+      toolCall: { name: "run_command", args: { CommandLine: "npm test" } },
+      toolResponse: "Command exited with code 1."
+    },
+    1000
+  )[0];
+  const skipEditEv = classifyToolEvents(
+    {
+      stepIdx: 2,
+      toolCall: {
+        name: "edit_file",
+        args: {
+          Path: "test/auth.test.mjs",
+          Target: 'test("login", () => {\n  expect(ok).toBe(true);\n});',
+          Replacement: 'test.skip("login", () => {\n  expect(ok).toBe(true);\n});'
+        }
+      },
+      toolResponse: "Made 1 replacement in test/auth.test.mjs at line 1."
+    },
+    1010
+  )[0];
+  const passEv = classifyToolEvents(
+    {
+      stepIdx: 3,
+      toolCall: { name: "run_command", args: { CommandLine: "npm test" } },
+      toolResponse: "Command exited with code 0."
+    },
+    1020
+  )[0];
+
+  const pre1 = evaluatePreInvocation(
+    { invocationNum: 1, lastUserInput: "修好登录单测" },
+    [failEv, skipEditEv, passEv],
+    null,
+    { nowMs: 1030 }
+  );
+  assert.equal(pre1.reasonCode, "test_assertion_weakening_audit");
+  assert.match(pre1.injectStep.systemMessage.systemMessage, /测试断言审计.*test\/auth\.test\.mjs.*新增 1 处跳过标记/);
+  // Second PreInvocation for same edit is deduplicated
+  const pre2 = evaluatePreInvocation(
+    { invocationNum: 2, lastUserInput: "修好登录单测" },
+    [failEv, skipEditEv, passEv],
+    pre1.nextState,
+    { nowMs: 1040 }
+  );
+  assert.equal(pre2.reasonCode, "steady_state");
+  // Stop never hard-blocks when tests are green (soft audit only)
+  const stopGreen = evaluateStop(
+    { terminationReason: "model_stop", fullyIdle: true, lastUserInput: "修好登录单测" },
+    [failEv, skipEditEv, passEv],
+    pre1.nextState,
+    { settings: { autoRetryMode: "count", autoRetryMax: 3, autoRetryScope: "smart" } }
+  );
+  assert.equal(stopGreen.decision, "allow");
+
+  // When tests still fail after weakening, Stop continue attaches audit reminder
+  const failAgain = { ...failEv, ts: 1025, stepIdx: 3 };
+  const stopStillRed = evaluateStop(
+    { terminationReason: "model_stop", fullyIdle: true, lastUserInput: "修好登录单测" },
+    [failEv, skipEditEv, failAgain],
+    pre1.nextState,
+    { settings: { autoRetryMode: "count", autoRetryMax: 3, autoRetryScope: "smart" } }
+  );
+  assert.equal(stopStillRed.decision, "continue");
+  assert.match(stopStillRed.reason, /test\/auth\.test\.mjs.*新增 1 处跳过标记/);
+
+  // 5. No prior failure & delivery gate OFF -> routine test edit never false-fires
+  const preClean = evaluatePreInvocation(
+    { invocationNum: 1, lastUserInput: "重构测试结构" },
+    [skipEditEv],
+    null,
+    { nowMs: 1030, settings: { deliveryTestGateEnabled: false } }
+  );
+  assert.equal(preClean.reasonCode, "steady_state");
+
+  // 6. Delivery Test Gate ON -> triggers soft audit even without a prior failure
+  const preGateOn = evaluatePreInvocation(
+    { invocationNum: 1, lastUserInput: "重构登录测试" },
+    [skipEditEv],
+    null,
+    { nowMs: 1030, settings: { deliveryTestGateEnabled: true } }
+  );
+  assert.equal(preGateOn.reasonCode, "test_assertion_weakening_audit");
+
+  // 7. Explicit user request to skip/remove tests exempts audit completely
+  const preExempt = evaluatePreInvocation(
+    { invocationNum: 1, lastUserInput: "这个登录用例太 flaky，先跳过这个测试" },
+    [failEv, skipEditEv, passEv],
+    null,
+    { nowMs: 1030, settings: { deliveryTestGateEnabled: true } }
+  );
+  assert.equal(preExempt.reasonCode, "steady_state");
+
+  // 8. approved_free_plan_review enforces strict context desensitization & forwards test weakening flags to cmd-verifier
+  const f = await freePlanFixture(t, { settings: { freePlanReviewEnabled: true } });
+  await f.command(3, "npm test", "Command exited with code 1.");
+  await f.post(
+    4,
+    "edit_file",
+    {
+      Path: JSON.stringify(path.join(f.workspace, "app.test.ts")),
+      Target: JSON.stringify('test("ok", () => {\n  assert.equal(1, 1);\n});'),
+      Replacement: JSON.stringify('test.skip("ok", () => {\n});')
+    },
+    "Made 1 replacement in app.test.ts at line 1."
+  );
+  const reviewRes = await f.pre();
+  const reviewMsg = reviewRes.injectSteps?.[0]?.systemMessage?.systemMessage || "";
+  assert.match(reviewMsg, /TypeName='cmd-verifier'.*Workspace='inherit'/);
+  assert.match(reviewMsg, /Do NOT pass main-session reasoning, self-justifications, summaries, or chat history/);
+  assert.match(reviewMsg, /app\.test\.ts.*新增 1 处跳过标记、净删减 1 处断言/);
+  // Follow-up PreInvocation does not duplicate the audit notice already folded into cmd-verifier dispatch
+  assert.deepEqual(await f.pre(), {});
 });

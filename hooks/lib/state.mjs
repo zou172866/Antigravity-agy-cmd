@@ -38,6 +38,7 @@ export function createDefaultState() {
     turnAutoRetries: 0,
     turnBaseExecutionNum: null,
     lastContinueEventSig: "",
+    testAuditNoticedSig: "",
     resolvedSteps: {}
   };
 }
