@@ -39,6 +39,9 @@ export function createDefaultState() {
     turnBaseExecutionNum: null,
     lastContinueEventSig: "",
     testAuditNoticedSig: "",
+    turnAllowTestWeakening: false,
+    turnAuditFloorTs: 0,
+    turnAuditFloorStep: -1,
     resolvedSteps: {}
   };
 }

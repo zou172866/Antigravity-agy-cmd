@@ -3263,3 +3263,745 @@ test("Frozen Rules: test assertion weakening soft audit (positive triggers, zero
   // Follow-up PreInvocation does not duplicate the audit notice already folded into cmd-verifier dispatch
   assert.deepEqual(await f.pre(), {});
 });
+
+test("v2.7.4 review regressions 1-3: delayed apply_edits backfill, RUNNING->ERROR zero-write, bestEffort partial attribution, and non-verify command isolation", async (t) => {
+  // Finding 1: Delayed transcript backfill for apply_edits (initial callback has isError:true + omitted toolResponse; transcript later confirms write succeeded + inline verify failed)
+  {
+    const dir = makeTmpDir();
+    t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+    const env = makeEnv(path.join(dir, "data"));
+    const transcriptPath = path.join(dir, "transcript.jsonl");
+    const base = { conversationId: "reg-1", cwd: dir, transcriptPath };
+    fs.writeFileSync(
+      transcriptPath,
+      JSON.stringify({ step_index: 0, type: "USER_INPUT", content: "修好购物车单测" }) + "\n"
+    );
+    assert.deepEqual(await runPreInvocation({ ...base, initialNumSteps: 1, invocationNum: 0 }, env, 1000), {});
+    await runPostToolUse(
+      {
+        ...base,
+        stepIdx: 1,
+        toolCall: { name: "run_command", args: { CommandLine: "npm test" } },
+        toolResponse: "Command exited with code 1."
+      },
+      env,
+      1010
+    );
+    // Initial PostToolUse omits toolResponse and reports isError:true because inline verify failed
+    await runPostToolUse(
+      {
+        ...base,
+        stepIdx: 2,
+        isError: true,
+        toolCall: {
+          name: "mcp_agy-dart_fast_apply_edits",
+          args: {
+            cwd: dir,
+            edits: JSON.stringify([
+              {
+                path: "tests/cart.test.ts",
+                hunks: [
+                  {
+                    target: "expect(total).toBe(10);\nexpect(tax).toBe(1);",
+                    replacement: "expect(total).toBe(10);"
+                  }
+                ]
+              }
+            ]),
+            verify: "npm test"
+          }
+        }
+      },
+      env,
+      1020
+    );
+    // Before transcript backfill arrives, PreInvocation waits silently
+    assert.deepEqual(await runPreInvocation({ ...base, initialNumSteps: 3, invocationNum: 1 }, env, 1030), {});
+    // Transcript confirms write succeeded and inline verify failed
+    fs.appendFileSync(
+      transcriptPath,
+      JSON.stringify({
+        step_index: 2,
+        type: "GENERIC",
+        status: "ERROR",
+        content:
+          "Applied edits to 1 file(s):\n- tests/cart.test.ts: updated (1 match), lines -1\nVerify [FAIL in 45ms] `npm test`:\nAssertionError: expected 9 to be 10"
+      }) + "\n"
+    );
+    const afterBackfill = await runPreInvocation({ ...base, initialNumSteps: 3, invocationNum: 2 }, env, 1040);
+    const msg = afterBackfill.injectSteps?.[0]?.systemMessage?.systemMessage || "";
+    assert.match(msg, /测试断言审计.*tests\/cart\.test\.ts.*净删减 1 处断言/);
+    // Deduplicated on subsequent PreInvocation
+    assert.deepEqual(await runPreInvocation({ ...base, initialNumSteps: 3, invocationNum: 3 }, env, 1050), {});
+  }
+
+  // Finding 2A: Prior test failure + gate OFF + edit transitions pending -> RUNNING -> ERROR (zero writes) stays silent throughout
+  {
+    const dir = makeTmpDir();
+    t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+    const env = makeEnv(path.join(dir, "data"));
+    updateSettings(env.AGY_CMD_STATE_DIR, { deliveryTestGateEnabled: false });
+    const transcriptPath = path.join(dir, "transcript.jsonl");
+    const base = { conversationId: "reg-2a", cwd: dir, transcriptPath };
+    fs.writeFileSync(
+      transcriptPath,
+      JSON.stringify({ step_index: 0, type: "USER_INPUT", content: "修好登录测试" }) + "\n"
+    );
+    assert.deepEqual(await runPreInvocation({ ...base, initialNumSteps: 1, invocationNum: 0 }, env, 2000), {});
+    await runPostToolUse(
+      {
+        ...base,
+        stepIdx: 1,
+        toolCall: { name: "run_command", args: { CommandLine: "npm test" } },
+        toolResponse: "Command exited with code 1."
+      },
+      env,
+      2010
+    );
+    await runPostToolUse(
+      {
+        ...base,
+        stepIdx: 2,
+        toolCall: {
+          name: "edit_file",
+          args: {
+            Path: "tests/auth.test.ts",
+            Target: "expect(ok).toBe(true);\nexpect(role).toBe('admin');",
+            Replacement: "expect(ok).toBe(true);"
+          }
+        }
+      },
+      env,
+      2020
+    );
+    // Stage 1: Pending (not yet in transcript) -> silent
+    assert.deepEqual(await runPreInvocation({ ...base, initialNumSteps: 3, invocationNum: 1 }, env, 2030), {});
+    // Stage 2: RUNNING in transcript -> silent (must not finalize or alert)
+    fs.appendFileSync(
+      transcriptPath,
+      JSON.stringify({ step_index: 2, type: "GENERIC", status: "RUNNING", content: "" }) + "\n"
+    );
+    assert.deepEqual(await runPreInvocation({ ...base, initialNumSteps: 3, invocationNum: 2 }, env, 2040), {});
+    // Stage 3: ERROR in transcript (zero writes) -> silent
+    fs.appendFileSync(
+      transcriptPath,
+      JSON.stringify({
+        step_index: 2,
+        type: "GENERIC",
+        status: "ERROR",
+        error: "Target not found",
+        content: "Atomic edit aborted (0 files modified)"
+      }) + "\n"
+    );
+    assert.deepEqual(await runPreInvocation({ ...base, initialNumSteps: 3, invocationNum: 3 }, env, 2050), {});
+  }
+
+  // Finding 2B: bestEffort partial edit attributes weakening strictly to receipt-confirmed files; counts-only receipt stays unknown (silent)
+  {
+    const priorFail = classifyToolEvents(
+      {
+        stepIdx: 1,
+        toolCall: { name: "run_command", args: { CommandLine: "npm test" } },
+        toolResponse: "Command exited with code 1."
+      },
+      3000
+    )[0];
+
+    const batchArgs = {
+      bestEffort: true,
+      edits: JSON.stringify([
+        { path: "src/app.ts", hunks: [{ target: "return 1;", replacement: "return 2;" }] },
+        {
+          path: "tests/cart.test.ts",
+          hunks: [{ target: "expect(a).toBe(1);\nexpect(b).toBe(2);", replacement: "expect(a).toBe(1);" }]
+        }
+      ])
+    };
+
+    // Case (i): Only src/app.ts succeeded; tests/cart.test.ts failed -> silent
+    const onlySourceEv = classifyToolEvents(
+      {
+        stepIdx: 2,
+        isError: true,
+        toolCall: { name: "apply_edits", args: batchArgs },
+        toolResponse:
+          "Partial edit applied (1/2 file(s) written; 1 file(s) failed — do NOT re-send applied files):\n\nApplied:\n- src/app.ts: updated (1 match), lines +0\n\nFailed (fix only these):\n- tests/cart.test.ts: target not found"
+      },
+      3010
+    )[0];
+    const preOnlySrc = evaluatePreInvocation(
+      { invocationNum: 1, lastUserInput: "修好购物车" },
+      [priorFail, onlySourceEv],
+      null,
+      { nowMs: 3020 }
+    );
+    assert.equal(preOnlySrc.reasonCode, "steady_state");
+
+    // Case (ii): Multi-file partial write where src/app.ts + pkg A test succeeded, pkg B test failed -> count only pkg A
+    const multiBatchArgs = {
+      bestEffort: true,
+      edits: JSON.stringify([
+        { path: "src/app.ts", hunks: [{ target: "return 1;", replacement: "return 2;" }] },
+        {
+          path: "packages/a/tests/a.test.ts",
+          hunks: [{ target: "expect(a).toBe(1);\nexpect(b).toBe(2);", replacement: "expect(a).toBe(1);" }]
+        },
+        {
+          path: "packages/b/tests/b.test.ts",
+          hunks: [{ target: 'test("b", () => {});', replacement: 'test.skip("b", () => {});' }]
+        }
+      ])
+    };
+    const partialAppliedEv = classifyToolEvents(
+      {
+        stepIdx: 2,
+        isError: true,
+        toolCall: { name: "apply_edits", args: multiBatchArgs },
+        toolResponse:
+          "Partial edit applied (2/3 file(s) written; 1 file(s) failed — do NOT re-send applied files):\n\nApplied:\n- src/app.ts: updated (1 match), lines +0\n- packages/a/tests/a.test.ts: updated (1 match), lines -1\n\nFailed (fix only these):\n- packages/b/tests/b.test.ts: target not found"
+      },
+      3010
+    )[0];
+    const prePartialConfirmed = evaluatePreInvocation(
+      { invocationNum: 1, lastUserInput: "修好购物车" },
+      [priorFail, partialAppliedEv],
+      null,
+      { nowMs: 3020 }
+    );
+    assert.equal(prePartialConfirmed.reasonCode, "test_assertion_weakening_audit");
+    const confirmedMsg = prePartialConfirmed.injectStep.systemMessage.systemMessage;
+    assert.match(confirmedMsg, /packages\/a\/tests\/a\.test\.ts.*净删减 1 处断言/);
+    assert.doesNotMatch(confirmedMsg, /packages\/b\/tests\/b\.test\.ts|跳过标记/);
+
+    // Case (iii): Counts-only partial receipt (no file list) -> attribution unknown, stays silent
+    const countsOnlyEv = classifyToolEvents(
+      {
+        stepIdx: 2,
+        isError: true,
+        toolCall: { name: "apply_edits", args: batchArgs },
+        toolResponse: "Partial edit applied (1/2 file(s) written; 1 file(s) failed)"
+      },
+      3010
+    )[0];
+    const preCountsOnly = evaluatePreInvocation(
+      { invocationNum: 1, lastUserInput: "修好购物车" },
+      [priorFail, countsOnlyEv],
+      null,
+      { nowMs: 3020 }
+    );
+    assert.equal(preCountsOnly.reasonCode, "steady_state");
+
+    // Case (iv): Delayed transcript backfill for bestEffort partial write (only src succeeded) + cached replay
+    const pendingPartialEv = classifyToolEvents(
+      {
+        stepIdx: 2,
+        isError: true,
+        toolCall: { name: "apply_edits", args: batchArgs }
+      },
+      3010,
+      { hasTranscriptPath: true }
+    )[0];
+    const txTailOnlySrc = {
+      stepsByIndex: new Map([
+        [
+          2,
+          {
+            step_index: 2,
+            type: "GENERIC",
+            status: "ERROR",
+            content:
+              "Partial edit applied (1/2 file(s) written; 1 file(s) failed):\n\nApplied:\n- src/app.ts: updated (1 match), lines +0\n\nFailed:\n- tests/cart.test.ts: target not found"
+          }
+        ]
+      ]),
+      taskResultsByStepIdx: new Map()
+    };
+    const preDelayedOnlySrc = evaluatePreInvocation(
+      { invocationNum: 1, lastUserInput: "修好购物车" },
+      [priorFail, pendingPartialEv],
+      null,
+      { nowMs: 3020, transcriptTail: txTailOnlySrc }
+    );
+    assert.equal(preDelayedOnlySrc.reasonCode, "steady_state");
+    // Cached replay after transcript tail rolls over also stays silent
+    const preCachedOnlySrc = evaluatePreInvocation(
+      { invocationNum: 2, lastUserInput: "修好购物车" },
+      [priorFail, pendingPartialEv],
+      preDelayedOnlySrc.nextState,
+      { nowMs: 3030 }
+    );
+    assert.equal(preCachedOnlySrc.reasonCode, "steady_state");
+  }
+
+  // Finding 3: 3-way control for ordinary non-verify command failure (`npm run format` exit 1) vs verify failure vs delivery gate ON
+  {
+    const dropEditEv = classifyToolEvents(
+      {
+        stepIdx: 2,
+        toolCall: {
+          name: "edit_file",
+          args: {
+            Path: "tests/cart.test.ts",
+            Target: "expect(a).toBe(1);\nexpect(b).toBe(2);",
+            Replacement: "expect(a).toBe(1);"
+          }
+        },
+        toolResponse: "Made 1 replacement in tests/cart.test.ts at line 1."
+      },
+      4010
+    )[0];
+    const formatFailEv = classifyToolEvents(
+      {
+        stepIdx: 1,
+        toolCall: { name: "run_command", args: { CommandLine: "npm run format" } },
+        toolResponse: "Command exited with code 1."
+      },
+      4000
+    )[0];
+    assert.equal(formatFailEv.isVerify, false);
+    const testFailEv = classifyToolEvents(
+      {
+        stepIdx: 1,
+        toolCall: { name: "run_command", args: { CommandLine: "npm test" } },
+        toolResponse: "Command exited with code 1."
+      },
+      4000
+    )[0];
+    assert.equal(testFailEv.isVerify, true);
+
+    // Control 1: Gate OFF + only format failure -> silent
+    const preFormatOnly = evaluatePreInvocation(
+      { invocationNum: 1, lastUserInput: "整理代码" },
+      [formatFailEv, dropEditEv],
+      null,
+      { nowMs: 4020, settings: { deliveryTestGateEnabled: false } }
+    );
+    assert.equal(preFormatOnly.reasonCode, "steady_state");
+
+    // Control 2: Gate OFF + recent test failure -> alerts
+    const preTestFail = evaluatePreInvocation(
+      { invocationNum: 1, lastUserInput: "修好单测" },
+      [testFailEv, dropEditEv],
+      null,
+      { nowMs: 4020, settings: { deliveryTestGateEnabled: false } }
+    );
+    assert.equal(preTestFail.reasonCode, "test_assertion_weakening_audit");
+
+    // Control 3: Gate ON + no prior failure -> alerts
+    const preGateOnNoFail = evaluatePreInvocation(
+      { invocationNum: 1, lastUserInput: "重构测试" },
+      [dropEditEv],
+      null,
+      { nowMs: 4020, settings: { deliveryTestGateEnabled: true } }
+    );
+    assert.equal(preGateOnNoFail.reasonCode, "test_assertion_weakening_audit");
+  }
+});
+
+test("v2.7.4 review regressions 4-6: negated/unrelated authorization guards, approved-plan authorization inheritance, and late test edit forwarding to cmd-verifier", async (t) => {
+  // Finding 4: Negated clauses & unrelated test-cache requests must NOT exempt audit; explicit skip stays exempt
+  const dropEditEv = classifyToolEvents(
+    {
+      stepIdx: 2,
+      toolCall: {
+        name: "edit_file",
+        args: {
+          Path: "tests/auth.test.ts",
+          Target: "expect(a).toBe(1);\nexpect(b).toBe(2);",
+          Replacement: "expect(a).toBe(1);"
+        }
+      },
+      toolResponse: "Made 1 replacement in tests/auth.test.ts at line 1."
+    },
+    5010
+  )[0];
+
+  for (const mustAlertInput of [
+    "不要为了赶进度而跳过测试",
+    "Do not change the code to skip tests.",
+    "请清理测试缓存，然后重新跑全套",
+    "do not skip tests or drop assertions"
+  ]) {
+    assert.equal(allowsTestWeakening(mustAlertInput), false, mustAlertInput);
+    const res = evaluatePreInvocation(
+      { invocationNum: 1, lastUserInput: mustAlertInput },
+      [dropEditEv],
+      null,
+      { nowMs: 5020, settings: { deliveryTestGateEnabled: true } }
+    );
+    assert.equal(res.reasonCode, "test_assertion_weakening_audit", mustAlertInput);
+  }
+  assert.equal(allowsTestWeakening("先跳过这个测试"), true);
+  assert.equal(
+    evaluatePreInvocation(
+      { invocationNum: 1, lastUserInput: "先跳过这个测试" },
+      [dropEditEv],
+      null,
+      { nowMs: 5020, settings: { deliveryTestGateEnabled: true } }
+    ).reasonCode,
+    "steady_state"
+  );
+
+  // Finding 5: Approved plan preserves original request's weakening authorization across "按计划执行", and re-evaluates on next task
+  {
+    const f = await freePlanFixture(t, {
+      task: "重构认证模块，并删除过时的旧测试用例",
+      settings: { freePlanReviewEnabled: true, deliveryTestGateEnabled: true }
+    });
+    await f.post(
+      3,
+      "edit_file",
+      {
+        Path: JSON.stringify(path.join(f.workspace, "auth.test.ts")),
+        Target: JSON.stringify('test("legacy", () => {\n  expect(a).toBe(1);\n});'),
+        Replacement: JSON.stringify("")
+      },
+      "Made 1 replacement in auth.test.ts at line 1."
+    );
+    const reviewRes = await f.pre();
+    const reviewMsg = reviewRes.injectSteps?.[0]?.systemMessage?.systemMessage || "";
+    assert.match(reviewMsg, /TypeName='cmd-verifier'/);
+    assert.doesNotMatch(reviewMsg, /strict assertion-integrity review|删减|跳过标记/);
+    assert.deepEqual(await f.pre(), {});
+    // New unrelated task resets authorization -> next assertion drop must alert
+    f.append({ step_index: 4, type: "USER_INPUT", content: "修复订单折扣计算 bug" });
+    assert.deepEqual(await f.pre({ invocationNum: 0, initialNumSteps: 5 }), {});
+    await f.post(
+      5,
+      "edit_file",
+      {
+        Path: JSON.stringify(path.join(f.workspace, "order.test.ts")),
+        Target: JSON.stringify("expect(price).toBe(100);\nexpect(discount).toBe(10);"),
+        Replacement: JSON.stringify("expect(price).toBe(100);")
+      },
+      "Made 1 replacement in order.test.ts at line 1."
+    );
+    const newTaskAudit = await f.pre({ invocationNum: 1, initialNumSteps: 5 });
+    const newTaskMsg = newTaskAudit.injectSteps?.[0]?.systemMessage?.systemMessage || "";
+    assert.match(newTaskMsg, /测试断言审计.*order\.test\.ts.*净删减 1 处断言/);
+  }
+
+  // Finding 6: Free plan edits normal source first, then edits test later -> real Hook entrypoints forward test path & count to the single cmd-verifier dispatch with strict isolation
+  {
+    const f = await freePlanFixture(t, {
+      task: "重构折扣计算逻辑",
+      settings: { freePlanReviewEnabled: true, deliveryTestGateEnabled: true }
+    });
+    // 1. Ordinary source edit triggers the initial one-time cmd-verifier instruction
+    await f.edit(3, "src/discount.ts");
+    const firstPre = await f.pre();
+    const firstMsg = firstPre.injectSteps?.[0]?.systemMessage?.systemMessage || "";
+    assert.match(firstMsg, /invoke_subagent once with TypeName='cmd-verifier' and Workspace='inherit'/);
+    assert.doesNotMatch(firstMsg, /discount\.test\.ts/);
+
+    // 2. Later test edit deletes 1 assertion -> next PreInvocation forwards exact path & count to that single cmd-verifier dispatch
+    await f.post(
+      4,
+      "edit_file",
+      {
+        Path: JSON.stringify(path.join(f.workspace, "tests/discount.test.ts")),
+        Target: JSON.stringify("expect(price).toBe(100);\nexpect(discount).toBe(10);"),
+        Replacement: JSON.stringify("expect(price).toBe(100);")
+      },
+      "Made 1 replacement in tests/discount.test.ts at line 1."
+    );
+    const secondPre = await f.pre();
+    const secondMsg = secondPre.injectSteps?.[0]?.systemMessage?.systemMessage || "";
+    assert.match(secondMsg, /single TypeName='cmd-verifier' \(Workspace='inherit'\) dispatch/);
+    assert.match(secondMsg, /do NOT start a second reviewer/);
+    assert.match(secondMsg, /tests\/discount\.test\.ts.*净删减 1 处断言/);
+    assert.match(
+      secondMsg,
+      /pass ONLY: \(1\) the acceptance criteria, \(2\) this task's repo-relative paths and diff excerpts, \(3\) applicable root\/nested AGENTS\.md or GEMINI\.md paths, and \(4\) actual check commands with raw terminal results/
+    );
+    assert.match(secondMsg, /do NOT pass main-session reasoning, self-justifications, summaries, or chat history/);
+    // Deduplicated on third call
+    assert.deepEqual(await f.pre(), {});
+    // Stop still allows cleanly once verification is green
+    await f.command(5, "npm test", "Command exited with code 0.");
+    assert.deepEqual(await f.stop(), { decision: "allow" });
+  }
+});
+
+test("v2.7.4 review regressions 7-8: cross-package basename isolation, multiline/chained skips, string-literal masking, and preserved language coverage", () => {
+  // Finding 7: Stringified apply_edits across packages/a and packages/b with identical basename must NOT cancel out
+  assert.deepEqual(
+    detectTestAssertionWeakening("apply_edits", {
+      edits: JSON.stringify([
+        {
+          path: "packages/a/tests/cart.test.ts",
+          hunks: [{ target: "expect(a).toBe(1);\nexpect(b).toBe(2);", replacement: "expect(a).toBe(1);" }]
+        },
+        {
+          path: "packages/b/tests/cart.test.ts",
+          hunks: [{ target: "expect(x).toBe(1);", replacement: "expect(x).toBe(1);\nexpect(y).toBe(2);" }]
+        }
+      ])
+    }),
+    { files: ["packages/a/tests/cart.test.ts"], addedSkip: 0, droppedAssert: 1 }
+  );
+  // Same-file cross-hunk assertion move remains silent (including ./ normalized equivalent)
+  assert.equal(
+    detectTestAssertionWeakening("apply_edits", {
+      edits: JSON.stringify([
+        {
+          path: "packages/a/tests/cart.test.ts",
+          hunks: [{ target: "expect(a).toBe(1);\nstep1();", replacement: "step1();" }]
+        },
+        {
+          path: "./packages/a/tests/cart.test.ts",
+          hunks: [{ target: "step2();", replacement: "step2();\nexpect(a).toBe(1);" }]
+        }
+      ])
+    }),
+    null
+  );
+
+  // Finding 8: Node multi-line skip option, Jest test.concurrent.skip, Vitest it.skipIf(true), and string literal masking
+  assert.deepEqual(
+    detectTestAssertionWeakening("edit_file", {
+      Path: "test/retry.test.mjs",
+      Target: 'test(\n  "retries once",\n  {\n    timeout: 5000,\n    skip: false,\n  },\n  async () => {\n    assert.equal(1, 1);\n  }\n);',
+      Replacement: 'test(\n  "retries once",\n  {\n    timeout: 5000,\n    skip: true,\n  },\n  async () => {\n    assert.equal(1, 1);\n  }\n);'
+    }),
+    { files: ["test/retry.test.mjs"], addedSkip: 1, droppedAssert: 0 }
+  );
+  // Tight multi-line hunk without enclosing test( header also detects skip: false -> skip: true
+  assert.deepEqual(
+    detectTestAssertionWeakening("edit_file", {
+      Path: "test/retry.test.mjs",
+      Target: "  {\n    skip: false,\n    timeout: 5000\n  }",
+      Replacement: "  {\n    skip: true,\n    timeout: 5000\n  }"
+    }),
+    { files: ["test/retry.test.mjs"], addedSkip: 1, droppedAssert: 0 }
+  );
+  assert.deepEqual(
+    detectTestAssertionWeakening("edit_file", {
+      Path: "tests/concurrent.spec.ts",
+      Target: 'test.concurrent("runs", async () => {\n  expect(1).toBe(1);\n});',
+      Replacement: 'test.concurrent.skip("runs", async () => {\n  expect(1).toBe(1);\n});'
+    }),
+    { files: ["tests/concurrent.spec.ts"], addedSkip: 1, droppedAssert: 0 }
+  );
+  assert.deepEqual(
+    detectTestAssertionWeakening("edit_file", {
+      Path: "tests/vitest.spec.ts",
+      Target: 'it("works", () => {\n  expect(ok).toBe(true);\n});',
+      Replacement: 'it.skipIf(true)("works", () => {\n  expect(ok).toBe(true);\n});'
+    }),
+    { files: ["tests/vitest.spec.ts"], addedSkip: 1, droppedAssert: 0 }
+  );
+  assert.equal(
+    detectTestAssertionWeakening("edit_file", {
+      Path: "tests/vitest.spec.ts",
+      Target: 'it("works", () => {\n  expect(ok).toBe(true);\n});',
+      Replacement: 'it.skipIf(false)("works", () => {\n  expect(ok).toBe(true);\n});'
+    }),
+    null
+  );
+  // Changing plain string literal to "test.skip(" must remain silent
+  assert.equal(
+    detectTestAssertionWeakening("edit_file", {
+      Path: "tests/parser.test.ts",
+      Target: 'const sample = "hello";',
+      Replacement: 'const sample = "test.skip(";'
+    }),
+    null
+  );
+  assert.equal(
+    detectTestAssertionWeakening("edit_file", {
+      Path: "tests/parser.test.ts",
+      Target: "const sample = `hello`;",
+      Replacement: "const sample = `test.skip(`;"
+    }),
+    null
+  );
+
+  // Preserved coverage: Python assert(ok), Go t.Errorf, and multi_replace_file_content
+  assert.deepEqual(
+    detectTestAssertionWeakening("edit_file", {
+      Path: "tests/test_py_assert.py",
+      Target: "def test_ok():\n    assert(ok)\n    return True",
+      Replacement: "def test_ok():\n    return True"
+    }),
+    { files: ["tests/test_py_assert.py"], addedSkip: 0, droppedAssert: 1 }
+  );
+  assert.deepEqual(
+    detectTestAssertionWeakening("edit_file", {
+      Path: "pkg/handler_test.go",
+      Target: 'func TestHandler(t *testing.T) {\n\tif err != nil {\n\t\tt.Errorf("unexpected: %v", err)\n\t}\n}',
+      Replacement: "func TestHandler(t *testing.T) {\n\t_ = err\n}"
+    }),
+    { files: ["pkg/handler_test.go"], addedSkip: 0, droppedAssert: 1 }
+  );
+  assert.deepEqual(
+    detectTestAssertionWeakening("multi_replace_file_content", {
+      TargetFile: "tests/multi.test.ts",
+      ReplacementChunks: [
+        { TargetContent: "expect(a).toBe(1);\nwork();", ReplacementContent: "work();" },
+        { TargetContent: 'test("b", () => {});', ReplacementContent: 'test.skip("b", () => {});' }
+      ]
+    }),
+    { files: ["tests/multi.test.ts"], addedSkip: 1, droppedAssert: 1 }
+  );
+});
+
+test("v2.7.4 review verification: paired Stop invariance, /compact, rewind, high-priority follow-up, and no 1s cross-turn repeat alert", async (t) => {
+  const failEv = classifyToolEvents(
+    {
+      stepIdx: 1,
+      toolCall: { name: "run_command", args: { CommandLine: "npm test" } },
+      toolResponse: "Command exited with code 1."
+    },
+    6000
+  )[0];
+  const weakenEditEv = classifyToolEvents(
+    {
+      stepIdx: 2,
+      toolCall: {
+        name: "edit_file",
+        args: {
+          Path: "tests/order.test.ts",
+          Target: "expect(a).toBe(1);\nexpect(b).toBe(2);",
+          Replacement: "expect(a).toBe(1);"
+        }
+      },
+      toolResponse: "Made 1 replacement in tests/order.test.ts at line 1."
+    },
+    6010
+  )[0];
+  const neutralEditEv = { ...weakenEditEv };
+  delete neutralEditEv.testWeakening;
+  const passEv = classifyToolEvents(
+    {
+      stepIdx: 3,
+      toolCall: { name: "run_command", args: { CommandLine: "npm test" } },
+      toolResponse: "Command exited with code 0."
+    },
+    6020
+  )[0];
+  const failAgainEv = { ...failEv, stepIdx: 3, ts: 6020 };
+  const stopOpts = { settings: { autoRetryMode: "count", autoRetryMax: 3, autoRetryScope: "smart" } };
+  const stopPayload = { terminationReason: "model_stop", fullyIdle: true, lastUserInput: "修好订单测试" };
+
+  // Paired Stop check 1: verification green -> BOTH with and without audit marker return allow
+  const greenWithAudit = evaluateStop(stopPayload, [failEv, weakenEditEv, passEv], null, stopOpts);
+  const greenWithoutAudit = evaluateStop(stopPayload, [failEv, neutralEditEv, passEv], null, stopOpts);
+  assert.equal(greenWithAudit.decision, "allow");
+  assert.equal(greenWithoutAudit.decision, "allow");
+
+  // Paired Stop check 2: existing continue reason (red verify) -> BOTH preserve continue + auto_continue
+  const redWithAudit = evaluateStop(stopPayload, [failEv, weakenEditEv, failAgainEv], null, stopOpts);
+  const redWithoutAudit = evaluateStop(stopPayload, [failEv, neutralEditEv, failAgainEv], null, stopOpts);
+  assert.equal(redWithAudit.decision, "continue");
+  assert.equal(redWithoutAudit.decision, "continue");
+  assert.equal(redWithAudit.reasonCode, redWithoutAudit.reasonCode);
+  assert.match(redWithAudit.reason, /tests\/order\.test\.ts.*净删减 1 处断言/);
+  assert.doesNotMatch(redWithoutAudit.reason, /疑似弱化校验/);
+
+  // Non-blocking suggestion A: Turn 2 starting within 1s of Turn 1 does NOT re-alert Turn 1's already-noticed edit
+  const turn1Entry = evaluatePreInvocation(
+    { initialNumSteps: 0, invocationNum: 0, lastUserInput: "修好订单测试" },
+    [],
+    null,
+    { nowMs: 6000 }
+  );
+  const turn1Alert = evaluatePreInvocation(
+    { initialNumSteps: 3, invocationNum: 1, lastUserInput: "修好订单测试" },
+    [failEv, weakenEditEv, passEv],
+    turn1Entry.nextState,
+    { nowMs: 6030 }
+  );
+  assert.equal(turn1Alert.reasonCode, "test_assertion_weakening_audit");
+  const turn2Within1s = evaluatePreInvocation(
+    { initialNumSteps: 4, invocationNum: 0, lastUserInput: "再解释一下架构" },
+    [failEv, weakenEditEv, passEv],
+    turn1Alert.nextState,
+    { nowMs: 6300, settings: { deliveryTestGateEnabled: true } }
+  );
+  assert.equal(turn2Within1s.reasonCode, "steady_state");
+
+  // /compact resets audit state & events cleanly
+  const compactRes = evaluatePreInvocation(
+    { initialNumSteps: 5, invocationNum: 0, lastUserInput: "/compact" },
+    [failEv, weakenEditEv],
+    turn1Alert.nextState,
+    { nowMs: 6400 }
+  );
+  assert.equal(compactRes.reasonCode, "compact_reset");
+  assert.equal(compactRes.shouldResetEvents, true);
+  assert.equal(compactRes.nextState.testAuditNoticedSig, "");
+  assert.equal(compactRes.nextState.turnAllowTestWeakening, false);
+  assert.equal(compactRes.nextState.turnAuditFloorTs, 0);
+  assert.equal(compactRes.nextState.turnAuditFloorStep, -1);
+
+  // Trajectory rewind resets audit state cleanly so a post-rewind weakening edit alerts again
+  const rewindRes = evaluatePreInvocation(
+    { initialNumSteps: 1, invocationNum: 1, lastUserInput: "重新修订单测试" },
+    [failEv, weakenEditEv],
+    turn1Alert.nextState,
+    { nowMs: 6500 }
+  );
+  assert.equal(rewindRes.shouldResetEvents, true);
+  assert.equal(rewindRes.nextState.testAuditNoticedSig, "");
+  const postRewindAlert = evaluatePreInvocation(
+    { initialNumSteps: 3, invocationNum: 1, lastUserInput: "重新修订单测试" },
+    [failEv, weakenEditEv],
+    rewindRes.nextState,
+    { nowMs: 6520 }
+  );
+  assert.equal(postRewindAlert.reasonCode, "test_assertion_weakening_audit");
+
+  // High-priority PreInvocation alert does not swallow test_assertion_weakening_audit on the next call
+  {
+    const dir = makeTmpDir();
+    t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+    const workspace = path.join(dir, "untested-app");
+    fs.mkdirSync(workspace);
+    // No package.json test script -> triggers Priority 5 delivery_gate_no_test_disclosure first
+    const env = makeEnv(path.join(dir, "data"));
+    updateSettings(env.AGY_CMD_STATE_DIR, { deliveryTestGateEnabled: true });
+    const base = { conversationId: "reg-prio", cwd: workspace, workspacePaths: [workspace] };
+    assert.deepEqual(
+      await runPreInvocation({ ...base, initialNumSteps: 1, invocationNum: 0, lastUserInput: "改一下测试" }, env, 7000),
+      {}
+    );
+    await runPostToolUse(
+      {
+        ...base,
+        stepIdx: 1,
+        toolCall: {
+          name: "edit_file",
+          args: {
+            Path: JSON.stringify(path.join(workspace, "app.test.ts")),
+            Target: JSON.stringify("expect(a).toBe(1);\nexpect(b).toBe(2);"),
+            Replacement: JSON.stringify("expect(a).toBe(1);")
+          }
+        },
+        toolResponse: "Made 1 replacement in app.test.ts at line 1."
+      },
+      env,
+      7010
+    );
+    const highPrio = await runPreInvocation(
+      { ...base, initialNumSteps: 2, invocationNum: 1, lastUserInput: "改一下测试" },
+      env,
+      7020
+    );
+    assert.match(highPrio.injectSteps?.[0]?.systemMessage?.systemMessage || "", /交付测试门禁 · 保守放行提示/);
+    // Next PreInvocation still surfaces the pending test weakening soft audit once
+    const nextCall = await runPreInvocation(
+      { ...base, initialNumSteps: 2, invocationNum: 2, lastUserInput: "改一下测试" },
+      env,
+      7030
+    );
+    assert.match(
+      nextCall.injectSteps?.[0]?.systemMessage?.systemMessage || "",
+      /测试断言审计.*app\.test\.ts.*净删减 1 处断言/
+    );
+    assert.deepEqual(
+      await runPreInvocation({ ...base, initialNumSteps: 2, invocationNum: 3, lastUserInput: "改一下测试" }, env, 7040),
+      {}
+    );
+  }
+});

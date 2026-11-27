@@ -112,15 +112,15 @@
 
 标准四段骨架：`Fan-out`（便宜模型并发）→ `Reduce`（纯 Python 代码去重与计数，0 Token）→ `Verify`（独立洁净上下文强模型挑刺）→ `Synthesize`（单节点汇总）。三条防爆硬护栏：
 - **首轮 `CAP` 硬上限**：首轮强制限 `<= 20` 项且设总 Agent 硬上限，看清实际耗时与配额再放量。
-- **Fan-in Guard（完整性守卫）**：Reduce 脚本核对 `returned_count` 与 `expected_count`，报告顶部显式列出 `missing / failed` 清单，严禁拿残缺集当完整报告交付。
+- **Fan-in Guard（完整性守卫）**：Reduce 脚本核对 `total / dispatched / returned / missing / failed / remaining` 六项计数（例如 41 项目标首轮仅派发 20 项全回传时，仍须显式标明 `dispatched: 20/41`、`remaining: 21`），报告顶部显式列出 `missing / failed / remaining` 清单，严禁拿残缺集或首批截断集当全量报告交付。
 - **分层汇聚（Layered Fan-in）**：扇出超过 `30～40` 项时，先按 `15～20` 项分批做中间摘要，再进最终单节点汇总，防止上下文坍塌。
 
 ```text
 /run-workflow 对照 @docs/package-rules.md 批量检查 @packages/，按四段菱形骨架执行：
-1. Fan-out（CAP 硬上限）：先取前 20 个目标（设总 Agent 上限 25），用便宜模型并发跑每项任务书（含路径、规则、判据与严格 JSON Schema：item/status/issues/evidence），逐项 try/except 捕获超时与异常。
-2. Reduce（纯 Python，0 Token）：按 item 去重合并，核对 returned_count 与 expected_count，分离 passed / failed / missing 清单，禁止跳过失败项。若有效结果超过 35 项，先每 15～20 项分组做中间摘要（Layered Fan-in）。
+1. Fan-out（CAP 硬上限）：先统计全量目标总数 total（例如 41 项），首轮仅派发前 20 项（dispatched=20，remaining=total-dispatched，设总 Agent 上限 25），用便宜模型并发跑每项任务书（含路径、规则、判据与严格 JSON Schema：item/status/issues/evidence），逐项 try/except 捕获超时与异常。
+2. Reduce（纯 Python，0 Token）：按 item 去重合并，核对 total / dispatched / returned / missing / failed / remaining，分离 passed / failed / missing / remaining 清单，禁止跳过失败项或把首批 20/20 误报为全量完成。若有效结果超过 35 项，先每 15～20 项分组做中间摘要（Layered Fan-in）。
 3. Verify（洁净上下文强模型）：把高危/失败项的相对路径、Diff 或代码证据交给独立强模型核查假阳性（不传前序推理过程）。
-4. Synthesize（单节点汇总）：顶部显式给出 expected / returned / missing / failed 计数与残缺项清单，再输出分级整改表。
+4. Synthesize（单节点汇总）：顶部显式给出 total / dispatched / returned / missing / failed / remaining 计数与未完成/待派发清单，再输出分级整改表。
 ```
 
 **Workflow 2 · 未知规模猎错 / 重构收敛模板（App）**

@@ -18,8 +18,9 @@ import {
   allowsTestWeakening,
   deliveryEventOrder,
   deliveryGateToolEvidence,
-  detectTestAssertionWeakening,
+  detectTestAssertionWeakeningDetails,
   evaluateDeliveryGateStatus,
+  filterTestWeakeningByAppliedFiles,
   matchesCustomCheckCommand,
   pathKey,
   pendingPlanChecks,
@@ -418,13 +419,52 @@ function classifyCommandOutcome(bareTool, isBenignCmd, errorText, rawResponseTex
   };
 }
 
+function parseApplyEditsPartialReceipt(body) {
+  if (typeof body !== "string" || !/Partial edit applied\b/i.test(body)) {
+    return { isPartial: false, writtenCount: null, appliedFiles: null };
+  }
+  const countMatch = body.match(/Partial edit applied\s*\(\s*(\d+)\s*\/\s*(\d+)\s+file\(s\)\s+written/i);
+  const writtenCount = countMatch ? Number(countMatch[1]) : null;
+  if (writtenCount === 0) {
+    return { isPartial: true, writtenCount: 0, appliedFiles: [] };
+  }
+  const appliedHeader = /^Applied:\s*$/im.exec(body);
+  if (!appliedHeader) {
+    return { isPartial: true, writtenCount, appliedFiles: null };
+  }
+  const rest = body.slice(appliedHeader.index + appliedHeader[0].length).replace(/^\r?\n/, "");
+  const appliedFiles = [];
+  for (const line of rest.split(/\r?\n/)) {
+    if (!line.trim()) break;
+    const bullet = line.match(/^\s*-\s+(.+)$/);
+    if (!bullet) break;
+    const item = bullet[1]
+      .trim()
+      .replace(/:\s+(?:updated|created|modified|edited|replaced)\b.*$/i, "")
+      .replace(/:\s+lines\s+[+-]?\d+.*$/i, "")
+      .trim();
+    if (item) appliedFiles.push(item);
+  }
+  return {
+    isPartial: true,
+    writtenCount,
+    appliedFiles: appliedFiles.length > 0 ? appliedFiles : null
+  };
+}
+
 function classifyEditOutcome(bareTool, hasArtifactMeta, looksLikePlanPath, errorText, rawResponseText, explicitError) {
   const body = stripTranscriptStepHeaders(rawResponseText);
   const combinedErr = `${errorText}\n${body}`.trim();
 
+  const partialReceipt =
+    bareTool === "apply_edits"
+      ? parseApplyEditsPartialReceipt(body)
+      : { isPartial: false, writtenCount: null, appliedFiles: null };
+
   const explicitlyApplied =
     bareTool === "apply_edits" &&
-    (/^\s*Applied edits to \d+ file\(s\):/im.test(body) || /Partial edit applied\b/i.test(body));
+    (/^\s*Applied edits to [1-9]\d* file\(s\):/im.test(body) ||
+      (partialReceipt.isPartial && partialReceipt.writtenCount !== 0));
 
   const abortedNoWrite =
     !explicitlyApplied &&
@@ -460,7 +500,7 @@ function classifyEditOutcome(bareTool, hasArtifactMeta, looksLikePlanPath, error
     else if (WRITE_ONLY_TOOLS.has(bareTool)) applied = /^(?:Created file\b|File (?:successfully )?created\b|Successfully created\b)/i.test(body);
     else applied = /^(?:Made [1-9]\d* replacements? in\b|Successfully (?:edited|modified|replaced|applied|updated)\b|(?:File|The file)\b[^\r\n]{0,500}\b(?:edited|modified|updated)|Applied (?:the )?(?:edit|change))/i.test(body);
   }
-  return { editFailed, abortedNoWrite, planModeWriteBlocked, verifyResult, applied };
+  return { editFailed, abortedNoWrite, planModeWriteBlocked, verifyResult, applied, partialReceipt };
 }
 
 /**
@@ -548,15 +588,39 @@ export function classifyToolEvents(payload, nowMs = Date.now(), options = {}) {
       explicitError
     );
 
-    const testWeakening =
-      !hasArtifactMeta && !looksLikePlanPath && !editOutcome.editFailed
-        ? detectTestAssertionWeakening(bareTool, effectiveArgs)
-        : null;
-
     const emitInlineVerify = Boolean(hasVerify && editOutcome.verifyResult);
     const pendingEdit = Boolean(
       needsPreInvocationResolve && (bareTool === "apply_edits" || !explicitError)
     );
+    const editCwd = nonEmptyString(effectiveArgs.cwd ?? effectiveArgs.Cwd) || nonEmptyString(payload.cwd);
+
+    const rawWeakening =
+      !hasArtifactMeta && !looksLikePlanPath && (!editOutcome.editFailed || pendingEdit)
+        ? detectTestAssertionWeakeningDetails(bareTool, effectiveArgs, { cwd: editCwd })
+        : null;
+    const baseWeakening = rawWeakening
+      ? {
+          files: rawWeakening.files,
+          addedSkip: rawWeakening.addedSkip,
+          droppedAssert: rawWeakening.droppedAssert
+        }
+      : null;
+    const testWeakening = baseWeakening
+      ? pendingEdit
+        ? baseWeakening
+        : filterTestWeakeningByAppliedFiles(
+            baseWeakening,
+            rawWeakening.entries,
+            editOutcome.partialReceipt,
+            editCwd
+          )
+      : null;
+    const testWeakeningDetails =
+      bareTool === "apply_edits" &&
+      rawWeakening?.entries?.length &&
+      (pendingEdit || editOutcome.partialReceipt?.isPartial)
+        ? rawWeakening.entries.slice(0, 16)
+        : null;
 
     const events = [
       {
@@ -566,6 +630,8 @@ export function classifyToolEvents(payload, nowMs = Date.now(), options = {}) {
         ...planFields,
         ...(hasVerificationEvidence && editOutcome.applied ? { applied: true } : {}),
         ...(testWeakening ? { testWeakening } : {}),
+        ...(testWeakeningDetails ? { testWeakeningDetails } : {}),
+        ...(testWeakeningDetails && editCwd ? { editCwd } : {}),
         tool: bareTool,
         failed: editOutcome.editFailed,
         abortedNoWrite: editOutcome.editFailed,
@@ -806,7 +872,7 @@ export function reconcileEventsWithTranscript(events, transcriptTail = null, pre
 
     if (ev.kind === "edit") {
       if (txStep) {
-        if (txStep.status === "RUNNING" && hasEv) continue;
+        if (txStep.status === "RUNNING") continue;
         const txErr = nonEmptyString(txStep.error);
         const txExplicitErr = txStep.status === "ERROR" || Boolean(txErr);
         const editOut = classifyEditOutcome(
@@ -817,10 +883,21 @@ export function reconcileEventsWithTranscript(events, transcriptTail = null, pre
           txStep.content || "",
           txExplicitErr
         );
+        const resolvedWeakening = editOut.editFailed
+          ? null
+          : editOut.partialReceipt?.isPartial
+            ? filterTestWeakeningByAppliedFiles(
+                ev.testWeakening,
+                ev.testWeakeningDetails,
+                editOut.partialReceipt,
+                ev.editCwd || ""
+              )
+            : ev.testWeakening || null;
         nextCache[key] = {
           kind: "edit",
           ...(hasEv ? { applied: editOut.applied || Boolean(ev.applied) } : {}),
           failed: editOut.editFailed,
+          ...(editOut.partialReceipt?.isPartial ? { partialReceipt: editOut.partialReceipt } : {}),
           planModeWriteBlocked: editOut.planModeWriteBlocked,
           verifyResult: editOut.verifyResult
         };
@@ -828,6 +905,7 @@ export function reconcileEventsWithTranscript(events, transcriptTail = null, pre
           ...ev,
           failed: editOut.editFailed,
           ...(hasEv ? { applied: editOut.applied || Boolean(ev.applied) } : {}),
+          testWeakening: resolvedWeakening,
           abortedNoWrite: editOut.editFailed,
           planModeWriteBlocked: ev.planModeWriteBlocked || editOut.planModeWriteBlocked,
           pending: false
@@ -852,11 +930,22 @@ export function reconcileEventsWithTranscript(events, transcriptTail = null, pre
 
       if (cached && cached.kind === "edit") {
         nextCache[key] = cached;
+        const resolvedWeakening = cached.failed
+          ? null
+          : cached.partialReceipt?.isPartial
+            ? filterTestWeakeningByAppliedFiles(
+                ev.testWeakening,
+                ev.testWeakeningDetails,
+                cached.partialReceipt,
+                ev.editCwd || ""
+              )
+            : ev.testWeakening || null;
         resolvedEvents.push({
           ...ev,
           failed: Boolean(cached.failed),
           abortedNoWrite: Boolean(cached.failed),
           ...(hasEv ? { applied: Boolean(cached.applied) } : {}),
+          testWeakening: resolvedWeakening,
           planModeWriteBlocked: Boolean(ev.planModeWriteBlocked || cached.planModeWriteBlocked),
           pending: false
         });
@@ -1092,7 +1181,7 @@ export function resolveEffectiveRetryPolicy(
   };
 }
 
-function collectActiveTestWeakening(events, turnFloorTs = 0, deliveryGateEnabled = false) {
+function collectActiveTestWeakening(events, turnFloorTs = 0, deliveryGateEnabled = false, turnFloorStep = -1) {
   let sawActiveFailure = false;
   const files = new Set();
   let addedSkip = 0;
@@ -1104,19 +1193,24 @@ function collectActiveTestWeakening(events, turnFloorTs = 0, deliveryGateEnabled
     const ev = events[i];
     if (!ev || typeof ev !== "object" || ev.pending || ev.backgroundRunning) continue;
     const evTs = Number(ev.ts) || i + 1;
+    const evStep = parseNonNegInt(ev.stepIdx);
+    const inCurrentTurn =
+      turnFloorStep >= 0 && evStep !== null
+        ? evStep > turnFloorStep && evTs >= turnFloorTs
+        : evTs >= turnFloorTs;
 
     if (ev.kind === "cmd") {
       if (ev.isReadOnlyCmd || ev.isBenignSearchCmd) continue;
-      if (ev.failed) {
+      if (ev.failed && ev.isVerify) {
         sawActiveFailure = true;
-      } else if (evTs < turnFloorTs && ev.isVerify) {
+      } else if (!ev.failed && !inCurrentTurn && ev.isVerify) {
         // A clean passing verification before the current turn started clears stale prior failure context.
         sawActiveFailure = false;
       }
       continue;
     }
 
-    if (ev.kind === "edit" && !ev.failed && ev.testWeakening && evTs >= turnFloorTs) {
+    if (ev.kind === "edit" && !ev.failed && ev.testWeakening && inCurrentTurn) {
       if (!deliveryGateEnabled && !sawActiveFailure) continue;
       const w = ev.testWeakening;
       const sk = Number(w.addedSkip) || 0;
@@ -1284,7 +1378,19 @@ export function evaluatePreInvocation(payload, events = [], prevStateInput = nul
         nextState.userTurnCount === 0)) ||
       (invocationNum === null && rawLastUserInput !== "" && rawLastUserInput !== nextState.lastUserInput));
 
+  const approvedNotice = isPlanApprovalNotice(inputEnvelope) && (!rawLastUserInput || confirmsPlan(rawLastUserInput));
+  const isPlanFollowup =
+    approvedNotice || (Boolean(transcriptTail?.latestInputFollowsPlan) && confirmsPlan(rawLastUserInput));
+  const inheritedPlanSource = isPlanFollowup
+    ? unwrapUserRequestText(nonEmptyString(transcriptTail?.planRequest) || prevState.lastUserInput)
+    : "";
+
   if (isNewUserTurn) {
+    let maxEventStep = -1;
+    for (const ev of effectiveEvents) {
+      const st = parseNonNegInt(ev?.stepIdx);
+      if (st !== null && st > maxEventStep) maxEventStep = st;
+    }
     nextState.userTurnCount = (nextState.userTurnCount || 0) + 1;
     nextState.lastUserInput = rawLastUserInput;
     nextState.lastTurnUserInputKey = latestTxUserKey;
@@ -1293,6 +1399,12 @@ export function evaluatePreInvocation(payload, events = [], prevStateInput = nul
     }
     nextState.lastTurnInitialSteps = initialNumSteps;
     nextState.lastTurnStartTs = nowMs;
+    nextState.turnAuditFloorTs = nowMs;
+    nextState.turnAuditFloorStep = maxEventStep;
+    nextState.turnAllowTestWeakening = Boolean(
+      allowsTestWeakening(rawLastUserInput) ||
+        (inheritedPlanSource && allowsTestWeakening(inheritedPlanSource))
+    );
     nextState.turnAutoRetries = 0;
     nextState.turnBaseExecutionNum = null;
     nextState.lastContinueEventSig = "";
@@ -1319,6 +1431,9 @@ export function evaluatePreInvocation(payload, events = [], prevStateInput = nul
       nextState.turnBaseExecutionNum = null;
       nextState.lastContinueEventSig = "";
       nextState.testAuditNoticedSig = "";
+      nextState.turnAllowTestWeakening = false;
+      nextState.turnAuditFloorTs = 0;
+      nextState.turnAuditFloorStep = -1;
       nextState.lastPlanBoostKey = "";
       nextState.lastPlanBoostNoticeHash = "";
       nextState.lastPlanBoostPromptKey = "";
@@ -1362,7 +1477,6 @@ export function evaluatePreInvocation(payload, events = [], prevStateInput = nul
 
   // A fresh user task ends the preceding plan. A replay of the same approval
   // or a background wakeup retains its one-shot budgets.
-  const approvedNotice = isPlanApprovalNotice(inputEnvelope) && (!rawLastUserInput || confirmsPlan(rawLastUserInput));
   if (nextState.freePlan && (effSettings.planTier !== "free" || (isNewUserTurn &&
       !approvedNotice && (!sameTxTurnKey || !confirmsPlan(rawLastUserInput))))) {
     nextState.freePlan = null;
@@ -1378,19 +1492,19 @@ export function evaluatePreInvocation(payload, events = [], prevStateInput = nul
 
   // Delivery Test Gate per-turn ledger (all tiers, opt-in via deliveryTestGateEnabled)
   if (effSettings.deliveryTestGateEnabled) {
-    const isPlanFollowup =
-      approvedNotice || (Boolean(transcriptTail?.latestInputFollowsPlan) && confirmsPlan(rawLastUserInput));
     if (isNewUserTurn || !nextState.deliveryGate) {
       const gateKey = `turn:${nextState.userTurnCount || 0}`;
-      const inheritedSource = isPlanFollowup
-        ? unwrapUserRequestText(nonEmptyString(transcriptTail?.planRequest) || prevState.lastUserInput)
-        : "";
+      const inheritedSource = inheritedPlanSource;
       const strippedUserProse = rawLastUserInput.replace(/```[\s\S]*?```/g, " ");
       const strippedInheritedProse = inheritedSource.replace(/```[\s\S]*?```/g, " ");
       const gatePrefs = planPreferences(strippedUserProse);
       const inheritedPrefs = strippedInheritedProse
         ? planPreferences(strippedInheritedProse)
         : { skipCheck: false };
+      const gateAllowTestWeakening = Boolean(
+        allowsTestWeakening(rawLastUserInput) ||
+          (inheritedSource && allowsTestWeakening(inheritedSource))
+      );
       const wsRoots = payload.workspacePaths ?? payload.workspace_paths;
       const gateRequested =
         requestedProjectCheck(rawLastUserInput, wsRoots) ||
@@ -1400,6 +1514,7 @@ export function evaluatePreInvocation(payload, events = [], prevStateInput = nul
       nextState.deliveryGate = {
         key: gateKey,
         skipCheck: Boolean(gatePrefs.skipCheck || inheritedPrefs.skipCheck),
+        ...(gateAllowTestWeakening ? { allowTestWeakening: true } : {}),
         requested: gateRequested,
         wroteSource: false,
         noCmdNoticed: false,
@@ -1515,8 +1630,20 @@ export function evaluatePreInvocation(payload, events = [], prevStateInput = nul
       if (effSettings.planTier === "free") {
         const source = unwrapUserRequestText(nonEmptyString(transcriptTail?.planRequest) || prevState.lastUserInput);
         const prefs = planPreferences(source);
+        const planAllowTestWeakening = Boolean(
+          allowsTestWeakening(source) || allowsTestWeakening(rawLastUserInput)
+        );
         const requested = requestedProjectCheck(source + "\n" + (transcriptTail?.planCheckText || ""), payload.workspacePaths ?? payload.workspace_paths);
-        nextState.freePlan = { key: planBoostKey, ...prefs, requested, wroteSource: false, reminded: false, reviewRequested: false, scopes: {} };
+        nextState.freePlan = {
+          key: planBoostKey,
+          ...prefs,
+          ...(planAllowTestWeakening ? { allowTestWeakening: true } : {}),
+          requested,
+          wroteSource: false,
+          reminded: false,
+          reviewRequested: false,
+          scopes: {}
+        };
         return { nextState, injectStep: null, shouldResetEvents, reasonCode: "approved_free_plan", stateChanged, metrics };
       }
       nextState.lastPaidBoostTurn = nextState.userTurnCount;
@@ -1537,9 +1664,21 @@ export function evaluatePreInvocation(payload, events = [], prevStateInput = nul
     }
   }
 
-  const auditTurnFloorTs = nextState.lastTurnStartTs > 0 ? nextState.lastTurnStartTs - 1000 : 0;
-  const activeTestWeakening = !allowsTestWeakening(intentProse)
-    ? collectActiveTestWeakening(effectiveEvents, auditTurnFloorTs, effSettings.deliveryTestGateEnabled)
+  const allowWeakeningThisTurn = Boolean(
+    allowsTestWeakening(intentProse) ||
+      nextState.freePlan?.allowTestWeakening ||
+      nextState.deliveryGate?.allowTestWeakening ||
+      nextState.turnAllowTestWeakening
+  );
+  const auditTurnFloorTs = nextState.turnAuditFloorTs || nextState.lastTurnStartTs || 0;
+  const auditTurnFloorStep = Number.isInteger(nextState.turnAuditFloorStep) ? nextState.turnAuditFloorStep : -1;
+  const activeTestWeakening = !allowWeakeningThisTurn
+    ? collectActiveTestWeakening(
+        effectiveEvents,
+        auditTurnFloorTs,
+        effSettings.deliveryTestGateEnabled,
+        auditTurnFloorStep
+      )
     : null;
 
   const plan = nextState.freePlan;
@@ -1796,13 +1935,20 @@ export function evaluatePreInvocation(payload, events = [], prevStateInput = nul
     stateChanged = true;
     const filesLabel = activeTestWeakening.files.join("、");
     const detail = formatTestWeakeningDetailZh(activeTestWeakening);
+    const hasPendingFreePlanReview = Boolean(
+      plan?.reviewRequested && effSettings.freePlanReviewEnabled && !plan.skipReview
+    );
+    const verifierSupplement = hasPendingFreePlanReview
+      ? ` For this approved plan's single TypeName='cmd-verifier' (Workspace='inherit') dispatch, also include these newly flagged test edits for strict assertion-integrity review (do NOT start a second reviewer): ${activeTestWeakening.files.join(", ")} (${detail}). Keep context isolation mandatory — pass ONLY: (1) the acceptance criteria, (2) this task's repo-relative paths and diff excerpts, (3) applicable root/nested AGENTS.md or GEMINI.md paths, and (4) actual check commands with raw terminal results (do NOT pass main-session reasoning, self-justifications, summaries, or chat history).`
+      : "";
     return {
       nextState,
       injectStep: buildInjectStep({
         uiOnly,
         systemMessage:
           `[agy-cmd 测试断言审计] 检测到在近期测试失败或交付门禁开启期间，对测试文件（${filesLabel}）存在疑似弱化校验的改动（${detail}）。` +
-          `请自查是否为强行跑绿而删改/跳过断言；若属于合法测试重构，请在最终交付回复中向用户明确列出删改/跳过的用例与原因（本次仅做软审计提醒，不阻断正常交付）。`
+          `请自查是否为强行跑绿而删改/跳过断言；若属于合法测试重构，请在最终交付回复中向用户明确列出删改/跳过的用例与原因（本次仅做软审计提醒，不阻断正常交付）。` +
+          verifierSupplement
       }),
       shouldResetEvents,
       reasonCode: "test_assertion_weakening_audit",
@@ -2239,8 +2385,21 @@ export function evaluateStop(payload, events = [], prevStateInput = null, option
   nextState.lastContinueEventSig = currentEventSig;
   stateChanged = true;
 
-  const stopTestWeakening = !allowsTestWeakening(intentProse)
-    ? collectActiveTestWeakening(effectiveEvents, turnFloorTs, effSettings.deliveryTestGateEnabled)
+  const stopAllowWeakening = Boolean(
+    allowsTestWeakening(intentProse) ||
+      plan?.allowTestWeakening ||
+      deliveryGate?.allowTestWeakening ||
+      nextState.turnAllowTestWeakening
+  );
+  const stopAuditFloorTs = nextState.turnAuditFloorTs || nextState.lastTurnStartTs || 0;
+  const stopAuditFloorStep = Number.isInteger(nextState.turnAuditFloorStep) ? nextState.turnAuditFloorStep : -1;
+  const stopTestWeakening = !stopAllowWeakening
+    ? collectActiveTestWeakening(
+        effectiveEvents,
+        stopAuditFloorTs,
+        effSettings.deliveryTestGateEnabled,
+        stopAuditFloorStep
+      )
     : null;
   const auditSuffix = stopTestWeakening
     ? `另检测到测试文件（${stopTestWeakening.files.join("、")}）存在疑似弱化校验改动（${formatTestWeakeningDetailZh(stopTestWeakening)}），请核对并恢复必要断言，或在交付时向用户明示删改/跳过原因。`
