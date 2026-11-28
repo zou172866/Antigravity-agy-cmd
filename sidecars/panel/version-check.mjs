@@ -101,17 +101,15 @@ function getRetryAt(headers, currentNow) {
 }
 
 /**
- * Select a published release archive asset (.zip or .tgz) when GitHub provides a valid SHA-256 digest.
- * Prefers `agy-cmd-v<version>.zip` to match the existing release workflow, while also supporting
- * `agy-cmd-<version>.zip` and `.tgz` packages.
+ * Select a published ZIP release archive asset when GitHub provides a valid SHA-256 digest.
+ * Prefers `agy-cmd-v<version>.zip` to match the release workflow, while also supporting
+ * `agy-cmd-<version>.zip`.
  */
 export function selectReleasePackageAsset(assets, version) {
   if (!Array.isArray(assets) || !version) return null;
   const candidates = [
     { name: `agy-cmd-v${version}.zip`, format: "zip" },
-    { name: `agy-cmd-${version}.zip`, format: "zip" },
-    { name: `agy-cmd-${version}.tgz`, format: "tgz" },
-    { name: `agy-cmd-v${version}.tgz`, format: "tgz" }
+    { name: `agy-cmd-${version}.zip`, format: "zip" }
   ];
   for (const candidate of candidates) {
     for (const asset of assets) {

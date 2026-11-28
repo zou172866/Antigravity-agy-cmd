@@ -24,7 +24,6 @@ import {
   computeCrc32,
   downloadArchive,
   readReleaseArchive,
-  readTarGzArchive,
   readZipArchive,
   UpdateError,
   verifyArchiveSha256
@@ -63,73 +62,6 @@ function makeTmpDir(prefix = "agy-cmd-upd-") {
 
 function sha256Hex(buf) {
   return createHash("sha256").update(buf).digest("hex");
-}
-
-function makeTarHeader(name, size, typeChar = "0") {
-  const header = Buffer.alloc(512, 0);
-  const nameBytes = Buffer.from(name, "utf8");
-  if (nameBytes.length <= 100) {
-    nameBytes.copy(header, 0);
-  } else {
-    const slash = name.lastIndexOf("/");
-    const prefix = name.slice(0, slash);
-    const base = name.slice(slash + 1);
-    Buffer.from(base, "utf8").copy(header, 0, 0, 100);
-    Buffer.from(prefix, "utf8").copy(header, 345, 0, 155);
-  }
-  Buffer.from("0000644\0", "latin1").copy(header, 100);
-  Buffer.from("0000000\0", "latin1").copy(header, 108);
-  Buffer.from("0000000\0", "latin1").copy(header, 116);
-  Buffer.from(`${size.toString(8).padStart(11, "0")}\0`, "latin1").copy(header, 124);
-  Buffer.from("00000000000\0", "latin1").copy(header, 136);
-  header.fill(0x20, 148, 156);
-  header[156] = typeChar.charCodeAt(0);
-  Buffer.from("ustar\0", "latin1").copy(header, 257);
-  Buffer.from("00", "latin1").copy(header, 263);
-  let checksum = 0;
-  for (let i = 0; i < 512; i++) checksum += header[i];
-  Buffer.from(`${checksum.toString(8).padStart(6, "0")}\0 `, "latin1").copy(header, 148);
-  return header;
-}
-
-function padTarBlock(buf) {
-  const rem = buf.length % 512;
-  return rem === 0 ? buf : Buffer.concat([buf, Buffer.alloc(512 - rem, 0)]);
-}
-
-function makePaxRecord(key, val) {
-  const suffix = ` ${key}=${val}\n`;
-  let len = Buffer.byteLength(suffix, "utf8") + 1;
-  while (true) {
-    const line = `${len}${suffix}`;
-    const byteLen = Buffer.byteLength(line, "utf8");
-    if (byteLen === len) return Buffer.from(line, "utf8");
-    len = byteLen;
-  }
-}
-
-function buildTarGz(entries, { globalCommentHex = "" } = {}) {
-  const chunks = [];
-  if (globalCommentHex) {
-    const paxBody = makePaxRecord("comment", globalCommentHex);
-    chunks.push(makeTarHeader("pax_global_header", paxBody.length, "g"), padTarBlock(paxBody));
-  }
-  for (const entry of entries) {
-    const data = Buffer.isBuffer(entry.content) ? entry.content : Buffer.from(entry.content || "", "utf8");
-    if (entry.paxRecords) {
-      const paxBody = Buffer.isBuffer(entry.paxRecords)
-        ? entry.paxRecords
-        : Buffer.concat(entry.paxRecords.map(([k, v]) => makePaxRecord(k, v)));
-      chunks.push(makeTarHeader("PaxHeaders/entry", paxBody.length, "x"), padTarBlock(paxBody));
-    }
-    const typeChar = entry.type || (entry.path.endsWith("/") ? "5" : "0");
-    chunks.push(makeTarHeader(entry.headerPath || entry.path, typeChar === "5" ? 0 : data.length, typeChar));
-    if (typeChar !== "5" && data.length > 0) {
-      chunks.push(padTarBlock(data));
-    }
-  }
-  chunks.push(Buffer.alloc(1024, 0));
-  return gzipSync(Buffer.concat(chunks));
 }
 
 function buildZip(entries) {
@@ -255,14 +187,6 @@ function packBundleAsZip(filesMap, topDir = "agy-cmd-v2.5.0") {
   return buildZip(entries);
 }
 
-function packBundleAsTarGz(filesMap, topDir = "zou172866-Antigravity-agy-cmd-abcdef0") {
-  const entries = [{ path: `${topDir}/`, content: "", type: "5" }];
-  for (const [rel, bytes] of filesMap) {
-    entries.push({ path: `${topDir}/${rel}`, content: bytes });
-  }
-  return buildTarGz(entries, { globalCommentHex: "a".repeat(40) });
-}
-
 function httpRawRequest(port, urlPath, { method = "POST", headers = {}, body = null } = {}) {
   return new Promise((resolve, reject) => {
     const reqHeaders = { Host: `127.0.0.1:${port}`, ...headers };
@@ -291,7 +215,7 @@ function httpRawRequest(port, urlPath, { method = "POST", headers = {}, body = n
   });
 }
 
-test("version-check: SemVer parsing, comparison, ZIP/TGZ asset selection, rate-limit backoff & no-error-cache", async () => {
+test("version-check: SemVer parsing, comparison, ZIP-only asset selection, rate-limit backoff & no-error-cache", async () => {
   assert.equal(parseVersion("v2.4.1")?.version, "2.4.1");
   assert.equal(parseVersion("2.5.0-beta.1")?.version, "2.5.0-beta.1");
   assert.equal(parseVersion("2.5.0-01"), null);
@@ -329,7 +253,7 @@ test("version-check: SemVer parsing, comparison, ZIP/TGZ asset selection, rate-l
     assetFormat: "zip"
   });
 
-  // Rejects bad host prefix or malformed digest
+  // Rejects bad host prefix, malformed digest, or retired .tgz assets
   assert.equal(
     selectReleasePackageAsset(
       [
@@ -339,8 +263,13 @@ test("version-check: SemVer parsing, comparison, ZIP/TGZ asset selection, rate-l
           digest: `sha256:${validHash}`
         },
         {
-          name: "agy-cmd-2.5.0.tgz",
-          browser_download_url: `https://github.com/${REPO}/releases/download/v2.5.0/agy-cmd-2.5.0.tgz`,
+          name: "agy-cmd-v2.5.0.tgz",
+          browser_download_url: `https://github.com/${REPO}/releases/download/v2.5.0/agy-cmd-v2.5.0.tgz`,
+          digest: `sha256:${validHash}`
+        },
+        {
+          name: "agy-cmd-2.5.0.zip",
+          browser_download_url: `https://github.com/${REPO}/releases/download/v2.5.0/agy-cmd-2.5.0.zip`,
           digest: "sha256:short"
         }
       ],
@@ -425,7 +354,7 @@ test("version-check: SemVer parsing, comparison, ZIP/TGZ asset selection, rate-l
   assert.equal(rlCalls, 1, "Rate-limit deadline prevents hammering GitHub API");
 });
 
-test("update-archive: download allowlist + SHA-256 + pure-JS ZIP & TAR.GZ/PAX parsing & attack rejections", async () => {
+test("update-archive: download allowlist + SHA-256 + pure-JS ZIP-only parsing & attack rejections", async () => {
   const payload = Buffer.from("hello-agy-cmd");
   const digest = sha256Hex(payload);
   verifyArchiveSha256(payload, digest);
@@ -521,37 +450,19 @@ test("update-archive: download allowlist + SHA-256 + pure-JS ZIP & TAR.GZ/PAX pa
     (e) => e instanceof UpdateError && e.reason === "size"
   );
 
-  // TAR.GZ with GitHub 64-hex global pax comment + per-entry PAX long path & size
-  const longRel = `skills/agy-cmd/${"nested/".repeat(20)}guide.md`;
-  const tarGz = buildTarGz(
-    [
-      {
-        path: "root/short-placeholder",
-        headerPath: "root/short-placeholder",
-        content: "# ok\n",
-        paxRecords: [
-          ["path", `root/${longRel}`],
-          ["size", "5"]
-        ]
-      }
-    ],
-    { globalCommentHex: "f".repeat(64) }
+  // Retired gzip / .tar.gz magic bytes and arbitrary non-ZIP payloads are rejected cleanly
+  const gzipPayload = gzipSync(Buffer.from("not-a-zip-tar-stream"));
+  await assert.rejects(
+    readReleaseArchive(gzipPayload),
+    (e) => e instanceof UpdateError && e.reason === "archive"
   );
-  const tarMap = await readReleaseArchive(tarGz);
-  assert.equal(tarMap.get(longRel).toString("utf8"), "# ok\n");
-
-  // TAR.GZ rejects invalid UTF-8 inside PAX header cleanly as UpdateError("archive")
-  const badPaxTar = buildTarGz([
-    {
-      path: "root/a.txt",
-      content: "x",
-      paxRecords: Buffer.concat([Buffer.from("12 path="), Buffer.from([0xff, 0xfe, 0xfd, 0x0a])])
-    }
-  ]);
-  await assert.rejects(readTarGzArchive(badPaxTar), (e) => e instanceof UpdateError && e.reason === "archive");
+  await assert.rejects(
+    readReleaseArchive(Buffer.from("plain-text-not-zip")),
+    (e) => e instanceof UpdateError && e.reason === "archive"
+  );
 });
 
-test("version-update: atomic ZIP & TAR.GZ self-update, case-insensitive FS, rollback/recovery, stale locks, EPERM & verifier guard", async () => {
+test("version-update: atomic ZIP-only self-update, case-insensitive FS, rollback/recovery, stale locks, EPERM & verifier guard", async () => {
   const tmpBase = makeTmpDir("agy-cmd-install-");
   try {
     // 1. Static relative import extraction supports single-line and multi-line named imports
@@ -650,10 +561,10 @@ test("version-update: atomic ZIP & TAR.GZ self-update, case-insensitive FS, roll
       "new-case-v250"
     );
 
-    // 4. A .tgz release asset uses the same mandatory digest check as ZIP.
-    const v260Tar = packBundleAsTarGz(collectRepoBundleFiles("2.6.0"));
+    // 4. Retired .tgz asset is rejected as noVerifiedAsset; subsequent signed .zip updates cleanly to 2.6.0.
+    const fakeTgz = gzipSync(Buffer.from("legacy-tgz-payload"));
     const tarUrl = `https://github.com/${REPO}/releases/download/v2.6.0/agy-cmd-v2.6.0.tgz`;
-    const tarUpdater = createPluginUpdater({
+    const tgzRejectedUpdater = createPluginUpdater({
       sidecarDirectory: path.join(installedRoot, "sidecars", "panel"),
       pluginsDirectory: pluginsDir,
       checkVersion: async () => ({
@@ -665,19 +576,46 @@ test("version-update: atomic ZIP & TAR.GZ self-update, case-insensitive FS, roll
         releaseUrl: `https://github.com/${REPO}/releases/tag/v2.6.0`,
         assetName: "agy-cmd-v2.6.0.tgz",
         assetUrl: tarUrl,
-        assetSha256: sha256Hex(v260Tar)
+        assetSha256: sha256Hex(fakeTgz)
       }),
       downloadOptions: {
-        fetchImpl: async (url) => {
-          assert.equal(url, tarUrl);
-          return { ok: true, status: 200, headers: new Map(), arrayBuffer: async () => v260Tar };
+        fetchImpl: async () => {
+          throw new Error("should not download retired .tgz asset");
         }
       }
     });
-    const tarRes = await tarUpdater("2.6.0");
-    assert.equal(tarRes.ok, true);
-    assert.equal(tarRes.status, "updated");
-    assert.equal(tarRes.verifiedSha256, sha256Hex(v260Tar));
+    const tgzRes = await tgzRejectedUpdater("2.6.0");
+    assert.equal(tgzRes.ok, false);
+    assert.equal(tgzRes.reason, "noVerifiedAsset");
+    assert.equal(readLocalVersion(installedRoot), "2.5.0");
+
+    const v260Zip = packBundleAsZip(collectRepoBundleFiles("2.6.0"), "agy-cmd-v2.6.0");
+    const zip260Url = `https://github.com/${REPO}/releases/download/v2.6.0/agy-cmd-v2.6.0.zip`;
+    const zip260Updater = createPluginUpdater({
+      sidecarDirectory: path.join(installedRoot, "sidecars", "panel"),
+      pluginsDirectory: pluginsDir,
+      checkVersion: async () => ({
+        ok: true,
+        status: "update",
+        currentVersion: "2.5.0",
+        latestVersion: "2.6.0",
+        releaseTag: "v2.6.0",
+        releaseUrl: `https://github.com/${REPO}/releases/tag/v2.6.0`,
+        assetName: "agy-cmd-v2.6.0.zip",
+        assetUrl: zip260Url,
+        assetSha256: sha256Hex(v260Zip)
+      }),
+      downloadOptions: {
+        fetchImpl: async (url) => {
+          assert.equal(url, zip260Url);
+          return { ok: true, status: 200, headers: new Map(), arrayBuffer: async () => v260Zip };
+        }
+      }
+    });
+    const zip260Res = await zip260Updater("2.6.0");
+    assert.equal(zip260Res.ok, true);
+    assert.equal(zip260Res.status, "updated");
+    assert.equal(zip260Res.verifiedSha256, sha256Hex(v260Zip));
     assert.equal(readLocalVersion(installedRoot), "2.6.0");
 
     // 5. Tampered agents/cmd-verifier.md & broken relative import rejected before touching disk
@@ -781,7 +719,7 @@ test("version-update: atomic ZIP & TAR.GZ self-update, case-insensitive FS, roll
     const markerPath = path.join(installedRoot, UPDATE_MARKER_NAME);
     fs.writeFileSync(markerPath, JSON.stringify({ pid: 99999999, startedAt: 1, phase: "recovery" }) + "\n");
     assert.equal(hasActiveUpdateMarker(markerPath, { isPidAlive: () => false }), true);
-    assert.equal((await tarUpdater("2.7.0")).reason, "recovery");
+    assert.equal((await zip260Updater("2.7.0")).reason, "recovery");
     fs.unlinkSync(markerPath);
   } finally {
     fs.rmSync(tmpBase, { recursive: true, force: true });
@@ -2013,4 +1951,54 @@ test("P2 · M1: single-source version check passes and JS verifier/custom-comman
   assert.equal(detector.classifyToolEvents, facts.classifyToolEvents);
   assert.equal(detector.unwrapCliFilterCommand, facts.unwrapCliFilterCommand);
   assert.equal(detector.reconcileEventsWithTranscript, ledger.reconcileEventsWithTranscript);
+});
+
+test("Phase 3 · pack-release.mjs builds verified deterministic ZIP + SHA256SUMS.txt with LF/CRLF & 0755 invariants", async (t) => {
+  const packScript = path.join(REPO_ROOT, "scripts/pack-release.mjs");
+  if (!fs.existsSync(packScript)) {
+    return; // Release ZIP bundles intentionally exclude maintainer scripts/
+  }
+  const { execFileSync } = await import("node:child_process");
+  const outDir = makeTmpDir("agy-cmd-pack-");
+  t.after(() => fs.rmSync(outDir, { recursive: true, force: true }));
+
+  const stdout = execFileSync(process.execPath, [packScript, "--out-dir", outDir], {
+    encoding: "utf8"
+  });
+  const summary = JSON.parse(stdout);
+  assert.equal(summary.ok, true);
+  assert.equal(fs.existsSync(summary.zipPath), true);
+  assert.equal(fs.existsSync(summary.sumsPath), true);
+
+  const zipBuf = fs.readFileSync(summary.zipPath);
+  const sumsTxt = fs.readFileSync(summary.sumsPath, "utf8");
+  assert.equal(sumsTxt, `${summary.sha256}  ${summary.assetName}\n`);
+  verifyArchiveSha256(zipBuf, summary.sha256);
+
+  const extracted = await readReleaseArchive(zipBuf);
+  assert.equal(extracted.has("hooks/lib/fs-atomic.mjs"), true);
+  assert.equal(extracted.has("hooks/lib/test-audit.mjs"), true);
+  assert.equal(extracted.has("scripts/pack-release.mjs"), false);
+  assert.equal(extracted.has("docs/RELEASE.md"), false);
+  assert.equal(extracted.get("install.sh").includes(0x0d), false, "install.sh in ZIP must stay pure LF");
+  assert.equal(extracted.get("install.ps1").includes(Buffer.from("\r\n")), true, "install.ps1 in ZIP must stay CRLF");
+
+  // Verify POSIX 0o100755 executable bits recorded in Central Directory for install.sh & hooks/stop.mjs
+  const eocdPos = zipBuf.lastIndexOf(Buffer.from([0x50, 0x4b, 0x05, 0x06]));
+  const cdOffset = zipBuf.readUInt32LE(eocdPos + 16);
+  const totalEntries = zipBuf.readUInt16LE(eocdPos + 10);
+  const modes = new Map();
+  let pos = cdOffset;
+  for (let i = 0; i < totalEntries; i++) {
+    const nameLen = zipBuf.readUInt16LE(pos + 28);
+    const extraLen = zipBuf.readUInt16LE(pos + 30);
+    const commentLen = zipBuf.readUInt16LE(pos + 32);
+    const extAttr = zipBuf.readUInt32LE(pos + 38);
+    const fullName = zipBuf.subarray(pos + 46, pos + 46 + nameLen).toString("utf8");
+    modes.set(fullName.replace(/^[^/]+\//, ""), (extAttr >>> 16) & 0o177777);
+    pos += 46 + nameLen + extraLen + commentLen;
+  }
+  assert.equal(modes.get("install.sh"), 0o100755);
+  assert.equal(modes.get("hooks/stop.mjs"), 0o100755);
+  assert.equal(modes.get("plugin.json"), 0o100644);
 });

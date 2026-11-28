@@ -2,8 +2,8 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { sanitizeConversationId } from "../../hooks/lib/common.mjs";
-import { readHostDiagnostics } from "../../hooks/lib/diagnostics.mjs";
+import { formatRouterCliCommand, sanitizeConversationId } from "../../hooks/lib/common.mjs";
+import { readHostDiagnostics, resetHostDiagnostics } from "../../hooks/lib/diagnostics.mjs";
 import {
   evaluateStarPrompt,
   formatDeliveryGateSummaryZh,
@@ -17,7 +17,13 @@ import {
 } from "../../hooks/lib/settings.mjs";
 import { readState, withSessionLock, writeState } from "../../hooks/lib/state.mjs";
 import { createVersionChecker, parseVersion, readLocalVersion } from "./version-check.mjs";
-import { createPluginUpdater, evaluateAutoInstallEligibility, verifiedAssetIdentity } from "./version-update.mjs";
+import {
+  createPluginUpdater,
+  evaluateAutoInstallEligibility,
+  getUpdateMarkerStatus,
+  UPDATE_MARKER_NAME,
+  verifiedAssetIdentity
+} from "./version-update.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -31,6 +37,7 @@ const LOCAL_HTTP_ORIGIN_RE = /^http:\/\/(?:127\.0\.0\.1|localhost|\[::1\])(?::\d
 const VSCODE_WEBVIEW_RE = /^vscode-webview:\/\/[a-z0-9._-]+(?:\/.*)?$/i;
 export const AUTO_UPDATE_ACK_ROUTE = "/api/auto-update-ack";
 export const RESUME_NORMAL_SESSION_ROUTE = "/api/resume-normal-session";
+export const RESET_DIAGNOSTICS_ROUTE = "/api/reset-diagnostics";
 
 const STAR_PROMPT_ALLOWED_KEYS = new Set(["state"]);
 const STAR_PROMPT_ALLOWED_STATES = new Set(STAR_PROMPT_TERMINAL_STATES);
@@ -65,28 +72,29 @@ function parseOptionalEnvBool(raw) {
   return undefined;
 }
 
-export function isAutoUpdateCheckEnabled(stateDir, env = process.env) {
+export function isAutoUpdateCheckEnabled(stateDir, env = process.env, { settings = null } = {}) {
   if (parseOptionalEnvBool(env?.AGY_CMD_DISABLE_AUTO_UPDATE_CHECK) === true) {
     return false;
   }
   const envVal = parseOptionalEnvBool(env?.AGY_CMD_AUTO_UPDATE_CHECK);
   if (envVal !== undefined) return envVal;
   try {
-    return readSettings(stateDir).autoUpdateCheck !== false;
+    const resolved = settings && typeof settings === "object" ? settings : readSettings(stateDir);
+    return resolved.autoUpdateCheck !== false;
   } catch {
     return true;
   }
 }
 
-export function isAutoUpdateInstallEnabled(stateDir, env = process.env) {
-  if (!isAutoUpdateCheckEnabled(stateDir, env)) return false;
+export function isAutoUpdateInstallEnabled(stateDir, env = process.env, { settings = null } = {}) {
+  if (!isAutoUpdateCheckEnabled(stateDir, env, { settings })) return false;
   if (parseOptionalEnvBool(env?.AGY_CMD_DISABLE_AUTO_UPDATE_INSTALL) === true) {
     return false;
   }
   const envVal = parseOptionalEnvBool(env?.AGY_CMD_AUTO_UPDATE_INSTALL);
   if (envVal !== undefined) return envVal;
   try {
-    const s = readSettings(stateDir);
+    const s = settings && typeof settings === "object" ? settings : readSettings(stateDir);
     return s.autoUpdateCheck !== false && s.autoUpdateInstall === true;
   } catch {
     return false;
@@ -223,9 +231,13 @@ function formatStopOutcomeForPanel(outcome) {
   };
 }
 
-export function buildPanelStatePayload(stateDir, rawConvId = "", { markStarTriggered = true } = {}) {
-  const starPrompt = evaluateStarPrompt(stateDir, { markTriggered: markStarTriggered });
+export function buildPanelStatePayload(
+  stateDir,
+  rawConvId = "",
+  { markStarTriggered = true, pluginRoot = path.resolve(__dirname, "../..") } = {}
+) {
   const settings = readSettings(stateDir);
+  const starPrompt = evaluateStarPrompt(stateDir, { markTriggered: markStarTriggered, settings });
   const trackedSessions = countTrackedSessions(stateDir);
   let activeSession = null;
 
@@ -259,11 +271,16 @@ export function buildPanelStatePayload(stateDir, rawConvId = "", { markStarTrigg
         }
       : null;
 
+  const markerStatus = pluginRoot ? getUpdateMarkerStatus(path.join(pluginRoot, UPDATE_MARKER_NAME)) : "clean";
+  const updateRecoveryNeeded = markerStatus === "recovery" || markerStatus === "interrupted";
+
   return {
     ok: true,
     version: localVersion,
-    autoUpdateInstallEffective: isAutoUpdateInstallEnabled(stateDir),
+    autoUpdateInstallEffective: isAutoUpdateInstallEnabled(stateDir, process.env, { settings }),
     autoUpdateNotice,
+    updateRecoveryNeeded,
+    recoveryCliCommand: updateRecoveryNeeded ? formatRouterCliCommand("--install") : "",
     settings,
     starPrompt,
     summaryZh: formatRetrySummaryZh(settings),
@@ -580,7 +597,11 @@ export async function runAutoUpdateCycle({
   return task;
 }
 
-export function dispatchPanelApi(pathname, rawData, { stateDir, defaultConvId = "" } = {}) {
+export function dispatchPanelApi(pathname, rawData, { stateDir, defaultConvId = "", pluginRoot } = {}) {
+  const payloadOpts = (extra = {}) => ({
+    ...(pluginRoot !== undefined ? { pluginRoot } : {}),
+    ...extra
+  });
   if (pathname === "/api/star-prompt") {
     return handleStarPromptMutation(stateDir, rawData);
   }
@@ -607,7 +628,7 @@ export function dispatchPanelApi(pathname, rawData, { stateDir, defaultConvId = 
   if (pathname === "/api/state") {
     return {
       status: 200,
-      body: buildPanelStatePayload(stateDir, convId)
+      body: buildPanelStatePayload(stateDir, convId, payloadOpts())
     };
   }
 
@@ -616,7 +637,7 @@ export function dispatchPanelApi(pathname, rawData, { stateDir, defaultConvId = 
       updateSettings(stateDir, data, { markConfigured: true });
       return {
         status: 200,
-        body: buildPanelStatePayload(stateDir, convId, { markStarTriggered: false })
+        body: buildPanelStatePayload(stateDir, convId, payloadOpts({ markStarTriggered: false }))
       };
     } catch (err) {
       return {
@@ -640,7 +661,7 @@ export function dispatchPanelApi(pathname, rawData, { stateDir, defaultConvId = 
       );
       return {
         status: 200,
-        body: buildPanelStatePayload(stateDir, convId, { markStarTriggered: false })
+        body: buildPanelStatePayload(stateDir, convId, payloadOpts({ markStarTriggered: false }))
       };
     } catch (err) {
       return {
@@ -653,6 +674,22 @@ export function dispatchPanelApi(pathname, rawData, { stateDir, defaultConvId = 
         }
       };
     }
+  }
+
+  if (pathname === RESET_DIAGNOSTICS_ROUTE) {
+    for (const key of Object.keys(data)) {
+      if (key !== "conversationId") {
+        return {
+          status: 400,
+          body: { ok: false, error: `Unexpected field '${key}' in request body` }
+        };
+      }
+    }
+    resetHostDiagnostics(stateDir);
+    return {
+      status: 200,
+      body: buildPanelStatePayload(stateDir, convId, payloadOpts({ markStarTriggered: false }))
+    };
   }
 
   if (pathname === RESUME_NORMAL_SESSION_ROUTE) {
@@ -701,7 +738,7 @@ export function dispatchPanelApi(pathname, rawData, { stateDir, defaultConvId = 
     }
     return {
       status: 200,
-      body: buildPanelStatePayload(stateDir, convId, { markStarTriggered: false })
+      body: buildPanelStatePayload(stateDir, convId, payloadOpts({ markStarTriggered: false }))
     };
   }
 

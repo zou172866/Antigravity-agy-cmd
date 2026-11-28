@@ -41,19 +41,19 @@
 **Windows（PowerShell 一行直装）：**
 
 ```powershell
-irm https://raw.githubusercontent.com/zou172866/Antigravity-agy-cmd/v2.8.0/install.ps1 | iex
+irm https://raw.githubusercontent.com/zou172866/Antigravity-agy-cmd/v2.8.1/install.ps1 | iex
 ```
 
 **macOS / Linux（一行直装）：**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zou172866/Antigravity-agy-cmd/v2.8.0/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/zou172866/Antigravity-agy-cmd/v2.8.1/install.sh | sh
 ```
 
 ### 其他安装方式
 
 - **离线稳定包（带 SHA-256 验签）**：从 [GitHub Releases](https://github.com/zou172866/Antigravity-agy-cmd/releases/latest) 下载正式 ZIP 与 `SHA256SUMS.txt`：
-  - 先验签再装：Windows 运行 `.\install.ps1 --archive .\agy-cmd-v2.8.0.zip --checksums .\SHA256SUMS.txt`，macOS / Linux 运行 `sh ./install.sh --archive ./agy-cmd-v2.8.0.zip --checksums ./SHA256SUMS.txt`。
+  - 先验签再装：Windows 运行 `.\install.ps1 --archive .\agy-cmd-v2.8.1.zip --checksums .\SHA256SUMS.txt`，macOS / Linux 运行 `sh ./install.sh --archive ./agy-cmd-v2.8.1.zip --checksums ./SHA256SUMS.txt`。
   - 或解压后在目录内运行 `.\install.ps1`（Windows）/ `sh ./install.sh`（macOS / Linux）。
 - **手动克隆仓库**（含 `.git` 目录时，面板在线自更新会自动关闭以防覆盖源码；后续用 `git pull` 更新，或改用上方一行直装）：
 
@@ -130,6 +130,9 @@ Hook 与安装流程已通过本地测试，真实免费账号在 App 和 IDE �
 除了点面板和在聊天框口头交代，也能在终端用脚本直接管：
 
 ```bash
+# 极速只读查询当前套餐档位、Boost 开关与配置修订号（免目录扫盘）
+python skills/agy-cmd/scripts/setup_auto_router.py --tier --json
+
 # 查看插件状态与当前设置
 python skills/agy-cmd/scripts/setup_auto_router.py --status
 

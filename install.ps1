@@ -3,15 +3,15 @@
   Pinned-release, SHA-256-verified Windows installer for agy-cmd.
   Supports:
     - Pinned remote release install:
-        irm https://raw.githubusercontent.com/zou172866/Antigravity-agy-cmd/v2.8.0/install.ps1 | iex
+        irm https://raw.githubusercontent.com/zou172866/Antigravity-agy-cmd/v2.8.1/install.ps1 | iex
     - Local checkout / extracted archive install:
         .\install.ps1
     - Offline SHA-256-verified ZIP install:
-        .\install.ps1 --archive .\agy-cmd-v2.8.0.zip --checksums .\SHA256SUMS.txt
+        .\install.ps1 --archive .\agy-cmd-v2.8.1.zip --checksums .\SHA256SUMS.txt
 #>
 $ErrorActionPreference = "Stop"
 $ScriptPath = $MyInvocation.MyCommand.Path
-$DefaultVersion = "v2.8.0"
+$DefaultVersion = "v2.8.1"
 $ReleaseDownloadBase = "https://github.com/zou172866/Antigravity-agy-cmd/releases/download"
 
 function Fail-Install([string]$Message, [int]$Code = 1) {
@@ -60,8 +60,24 @@ function Resolve-ExpectedSha256([string]$ChecksumsPath, [string]$AssetName) {
 if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
   Fail-Install "Node.js >= 20 is required. Install Node.js first: https://nodejs.org/"
 }
+$NodeMajorRaw = (& node -e "process.stdout.write(String(parseInt(process.versions.node,10)||0))" 2>$null)
+$NodeMajor = 0
+[void][int]::TryParse([string]$NodeMajorRaw, [ref]$NodeMajor)
+if ($LASTEXITCODE -ne 0 -or $NodeMajor -lt 20) {
+  $NodeVerStr = (& node -v 2>$null | Out-String).Trim()
+  Fail-Install "Node.js >= 20 is required (found: $NodeVerStr). Please upgrade Node.js: https://nodejs.org/"
+}
 
-$PythonBin = if (Get-Command python -ErrorAction SilentlyContinue) { "python" } elseif (Get-Command python3 -ErrorAction SilentlyContinue) { "python3" } else { "" }
+$PythonBin = ""
+foreach ($Cand in @("python", "python3")) {
+  if (Get-Command $Cand -ErrorAction SilentlyContinue) {
+    & $Cand -c "import sys; sys.exit(0 if sys.version_info >= (3, 8) else 1)" 2>$null
+    if ($LASTEXITCODE -eq 0) {
+      $PythonBin = $Cand
+      break
+    }
+  }
+}
 if (-not $PythonBin) {
   Fail-Install "Python 3.8+ is required to configure agy-cmd."
 }
@@ -127,8 +143,8 @@ try {
       } catch {}
 
       Write-Host "[agy-cmd] Downloading release $Tag ($AssetName) and SHA256SUMS.txt..."
-      Invoke-WebRequest -Uri $SumsUrl -OutFile $SumsFile -UseBasicParsing
-      Invoke-WebRequest -Uri $ZipUrl -OutFile $ZipFile -UseBasicParsing
+      Invoke-WebRequest -Uri $SumsUrl -OutFile $SumsFile -TimeoutSec 30 -UseBasicParsing
+      Invoke-WebRequest -Uri $ZipUrl -OutFile $ZipFile -TimeoutSec 60 -UseBasicParsing
       $ExpectedSha256 = Resolve-ExpectedSha256 $SumsFile $AssetName
     }
 

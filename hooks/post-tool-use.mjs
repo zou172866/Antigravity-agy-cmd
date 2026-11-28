@@ -15,7 +15,7 @@ import {
   resolveConversationId,
   resolveStateDir
 } from "./lib/common.mjs";
-import { classifyToolEvents } from "./lib/detector.mjs";
+import { classifyToolEvents, isTrackableToolPayload } from "./lib/detector-facts.mjs";
 import { readSettings } from "./lib/settings.mjs";
 import { appendEvents, readState } from "./lib/state.mjs";
 import {
@@ -26,15 +26,25 @@ import {
 
 export async function runPostToolUse(rawInput, env = process.env, nowMs = Date.now()) {
   const payload = parseHookPayload(rawInput);
-  if (!payload || isSubagentPayload(payload, env)) {
+  if (!payload || isSubagentPayload(payload, env) || !isTrackableToolPayload(payload)) {
     return {};
   }
 
   const stateDir = resolveStateDir(env);
   const convId = resolveConversationId(payload, env);
   const transcriptPath = resolveTranscriptPath(payload);
-  if (transcriptPath && resolveWorkerTranscriptIdentity(transcriptPath, { stateDir, convId, nowMs }).isSubagent) {
-    return {};
+  let preloadedTailRaw = null;
+  if (transcriptPath) {
+    const workerId = resolveWorkerTranscriptIdentity(transcriptPath, {
+      stateDir,
+      convId,
+      nowMs,
+      includeTailRaw: true
+    });
+    if (workerId.isSubagent) {
+      return {};
+    }
+    preloadedTailRaw = workerId._tailRaw || null;
   }
 
   const stepIdx = Number.isFinite(Number(payload.stepIdx ?? payload.step_idx))
@@ -45,7 +55,7 @@ export async function runPostToolUse(rawInput, env = process.env, nowMs = Date.n
   );
   const transcriptStep =
     transcriptPath && stepIdx !== null && !hasInlineResponse
-      ? findTranscriptStep(transcriptPath, stepIdx)
+      ? findTranscriptStep(transcriptPath, stepIdx, { preloadedTailRaw })
       : null;
 
   if (!convId) {

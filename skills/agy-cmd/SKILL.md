@@ -3,7 +3,7 @@ name: agy-cmd
 description: Antigravity 桌面端/IDE 高阶能力自动路由与内置斜杠指令参谋。用于开关路由、调自动重试/交付门禁/会员 Boost，或查询对比 /grill-me、/plan、/goal、/boost、/swarm、/run-workflow 等内置指令（禁混 CLI 专属命令）。
 ---
 
-# agy-cmd：高阶能力自动路由与指令参谋（v2.8.0）
+# agy-cmd：高阶能力自动路由与指令参谋（v2.8.1）
 
 四项能力：**常驻精简规则**（`rules/AGENTS.md`）、**零稳态开销钩子**（`hooks.json`：`SessionStart` / `PreToolUse` / `PostToolUse` / `PreInvocation` / `Stop`）、**右侧 Sidecar 面板**（`sidecar://agy-cmd/panel/`）与**按需指令参谋**。
 
@@ -21,24 +21,25 @@ description: Antigravity 桌面端/IDE 高阶能力自动路由与内置斜杠�
 App（含 SSH 转发）点击 **[agy-cmd 自动路由](sidecar://agy-cmd/panel/)** 调节；IDE/CLI 或聊天口令调参运行 [scripts/setup_auto_router.py](scripts/setup_auto_router.py)（Linux/macOS/SSH 用 `python3`，Windows 可用 `python`）：
 
 ```bash
-# 自动重试次数（off / 1..50 / infinite）与触发范围（smart 默认 / all_failures / goal_only）
-python3 scripts/setup_auto_router.py --auto-retry off|5|infinite
+# 自动重试次数（可选：off / 1..50 / infinite）与触发范围（可选：smart 默认 / all_failures / goal_only）
+python3 scripts/setup_auto_router.py --auto-retry 5
 python3 scripts/setup_auto_router.py --retry-scope smart
 
-# 账号套餐、Boost、降级保护与统计清零（free 默认防报错 / paid 开启）
+# 账号套餐、Boost、降级保护与统计清零（开关参数可选：on / off；默认 free 防报错）
 python3 scripts/setup_auto_router.py --plan-tier free
-python3 scripts/setup_auto_router.py --plan-tier paid --boost on|off --boost-after-plan-approval on|off
-python3 scripts/setup_auto_router.py --free-fallback on|off --plan-fallback on|off
+python3 scripts/setup_auto_router.py --plan-tier paid --boost on --boost-after-plan-approval off
+python3 scripts/setup_auto_router.py --free-fallback on --plan-fallback on
 python3 scripts/setup_auto_router.py --reset-stats
 
-# 交付前强制测试门禁（默认关，全套餐可用；实质改码后必过全量/自定义验证，无测项目保守放行并声明缺测；单轮「这次跳过测试」豁免）
-python3 scripts/setup_auto_router.py --delivery-test-gate on|off
-python3 scripts/setup_auto_router.py --delivery-test-cmd "npm run typecheck && npm test"   # 传 "" 清空
+# 交付前强制测试门禁（开关可选：on / off，默认关；传 "" 清空自定义命令并回退自动探测；单轮「这次跳过测试」豁免）
+python3 scripts/setup_auto_router.py --delivery-test-gate on
+python3 scripts/setup_auto_router.py --delivery-test-cmd "npm run typecheck && npm test"
 
-# 免费计划获批后的可选只读复核（默认关，最多派 1 次 cmd-verifier）
-python3 scripts/setup_auto_router.py --free-plan-review on|off
+# 免费计划获批后的可选只读复核（开关可选：on / off，默认关，最多派 1 次 cmd-verifier）
+python3 scripts/setup_auto_router.py --free-plan-review on
 
-# 状态 / 同步安装 / 零漂移校验 / 停用
+# 极速查套餐 / 完整状态 / 同步安装 / 零漂移校验 / 停用
+python3 scripts/setup_auto_router.py --tier --json
 python3 scripts/setup_auto_router.py --status
 python3 scripts/setup_auto_router.py --install
 python3 scripts/setup_auto_router.py --sync-check
@@ -52,7 +53,7 @@ python3 scripts/setup_auto_router.py --remove
 **重型路由（Swarm / Workflow）准入三步**：
 1. 仅候选任务判断；用户点名运行某项按单次执行（查用法不算点名运行），已有原生命令直接跟随。
 2. 确认当前为 Antigravity App 且公开工具/命令含目标能力（如 `run_workflow`）；IDE、未知宿主或未开放时留主会话（勿以磁盘存在内置技能作证）。
-3. 主动路由取 `settings.planTier`；未知时仅调一次 `python3 scripts/setup_auto_router.py --status --json`（只读）。仅 `paid` 进主动重型路由，`free`/未知走顺序分批且不亮重型徽标。
+3. 主动路由取 `settings.planTier`；未知时仅调一次 `python3 scripts/setup_auto_router.py --tier --json`（只读极速，按返回的 `configRev` 会话内缓存）。仅 `paid` 进主动重型路由，`free`/未知走顺序分批且不亮重型徽标。
 
 | 任务特征 | 调度徽标 / 轨道 | 执行动作 |
 | --- | --- | --- |

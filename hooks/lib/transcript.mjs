@@ -7,6 +7,7 @@ import {
 } from "./common.mjs";
 import {
   computeTranscriptGeneration,
+  hasPersistedWorkerIdentities,
   lookupConfirmedWorkerIdentity,
   recordConfirmedWorkerIdentity
 } from "./diagnostics.mjs";
@@ -277,7 +278,7 @@ function hasSwarmWorkerSystemStep(steps) {
   );
 }
 
-export function inspectSubagentTranscript(transcriptPath) {
+export function inspectSubagentTranscript(transcriptPath, { includeTailRaw = false } = {}) {
   if (!transcriptPath) {
     return { status: "not_applicable", isSubagent: false, source: "none", rolledPastWindow: false };
   }
@@ -338,17 +339,26 @@ export function inspectSubagentTranscript(transcriptPath) {
     // A Swarm worker spawned via `fork: "coordinator"` inherits the coordinator's
     // opening USER_INPUT, then receives a `<swarm_worker>` SYSTEM_MESSAGE later in the log.
     const rolledPastWindow = fileSize > HEAD_READ_BYTES + TAIL_READ_BYTES;
+    let tailRaw = null;
     if (truncated) {
-      const tailSteps = readTranscriptTail(transcriptPath, TAIL_READ_BYTES);
+      tailRaw = readTranscriptTailRaw(transcriptPath, TAIL_READ_BYTES);
+      const tailSteps = tailRaw.entries.map((entry) => entry.step);
       if (hasSwarmWorkerSystemStep(tailSteps)) {
-        return { status: "confirmed", isSubagent: true, source: "swarm_worker_tail", rolledPastWindow };
+        return {
+          status: "confirmed",
+          isSubagent: true,
+          source: "swarm_worker_tail",
+          rolledPastWindow,
+          ...(includeTailRaw ? { _tailRaw: tailRaw } : {})
+        };
       }
     }
     return {
       status: rolledPastWindow ? "unknown" : "not_applicable",
       isSubagent: false,
       source: rolledPastWindow ? "fork_window_gap" : "main_user_input",
-      rolledPastWindow
+      rolledPastWindow,
+      ...(includeTailRaw && tailRaw ? { _tailRaw: tailRaw } : {})
     };
   }
   if (hasSubagentMessage) {
@@ -374,9 +384,9 @@ export function isSubagentTranscript(transcriptPath) {
  */
 export function resolveWorkerTranscriptIdentity(
   transcriptPath,
-  { stateDir = "", convId = "", nowMs = Date.now() } = {}
+  { stateDir = "", convId = "", nowMs = Date.now(), includeTailRaw = false } = {}
 ) {
-  const inspected = inspectSubagentTranscript(transcriptPath);
+  const inspected = inspectSubagentTranscript(transcriptPath, { includeTailRaw });
   if (!transcriptPath) return inspected;
 
   if (inspected.isSubagent) {
@@ -389,7 +399,7 @@ export function resolveWorkerTranscriptIdentity(
     return inspected;
   }
 
-  if (stateDir && convId) {
+  if (stateDir && convId && hasPersistedWorkerIdentities(stateDir)) {
     const gen = computeTranscriptGeneration(transcriptPath);
     if (gen) {
       const persisted = lookupConfirmedWorkerIdentity(stateDir, convId, gen, nowMs);
@@ -398,7 +408,8 @@ export function resolveWorkerTranscriptIdentity(
           status: "confirmed",
           isSubagent: true,
           source: `persisted:${persisted.source}`,
-          rolledPastWindow: inspected.rolledPastWindow
+          rolledPastWindow: inspected.rolledPastWindow,
+          ...(includeTailRaw && inspected._tailRaw ? { _tailRaw: inspected._tailRaw } : {})
         };
       }
     }
@@ -466,7 +477,7 @@ function requestsPlanFeedback(call) {
  * - latestPlanModeDenial: active PreToolUse-denied Plan Mode artifact write (cleared on `Plan mode is off.` or new USER_INPUT)
  * - latestUserInput: most recent USER_INPUT step content (fallback if payload.lastUserInput is omitted)
  */
-export function inspectTranscriptTail(transcriptPath) {
+export function inspectTranscriptTail(transcriptPath, { preloadedTailRaw = null } = {}) {
   const buildAdapter = (readStatus, malformedLines = 0, unknownStepTypes = 0, states = {}) => ({
     schemaVersion: 1,
     readStatus,
@@ -504,10 +515,10 @@ export function inspectTranscriptTail(transcriptPath) {
   };
   if (!transcriptPath) return empty;
 
-  const { entries, truncated, fileSize, malformedLines, readStatus } = readTranscriptTailRaw(
-    transcriptPath,
-    TAIL_READ_BYTES
-  );
+  const { entries, truncated, fileSize, malformedLines, readStatus } =
+    preloadedTailRaw && Array.isArray(preloadedTailRaw.entries)
+      ? preloadedTailRaw
+      : readTranscriptTailRaw(transcriptPath, TAIL_READ_BYTES);
   if (entries.length === 0) {
     const isUnknownRead = readStatus === "unreadable" || readStatus === "malformed" || readStatus === "truncated_empty";
     return {
@@ -813,11 +824,15 @@ export function inspectTranscriptTail(transcriptPath) {
 
 /**
  * Lightweight single-step lookup used by PostToolUse when payload omits `toolResponse`.
+ * Reuses a preloaded transcript tail when available to avoid a second disk read.
  */
-export function findTranscriptStep(transcriptPath, stepIdx) {
+export function findTranscriptStep(transcriptPath, stepIdx, { preloadedTailRaw = null } = {}) {
   const target = parseNonNegStepIdx(stepIdx);
   if (!transcriptPath || target === null) return null;
-  const steps = readTranscriptTail(transcriptPath, 32 * 1024);
+  const steps =
+    preloadedTailRaw && Array.isArray(preloadedTailRaw.entries)
+      ? preloadedTailRaw.entries.map((entry) => entry.step)
+      : readTranscriptTail(transcriptPath, 32 * 1024);
   for (let i = steps.length - 1; i >= 0; i--) {
     const s = steps[i];
     if (s.type === "GENERIC" && parseNonNegStepIdx(s.step_index) === target) {

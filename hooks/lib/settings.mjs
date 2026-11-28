@@ -1,6 +1,6 @@
-import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { resolveLockWaitMs, sleepSyncMs, withFileLock, writeFileAtomic as writeFileAtomicShared } from "./fs-atomic.mjs";
 import { inspectCustomCheckCommand } from "./plan-verification.mjs";
 
 export const MIN_RETRY_MAX = 1;
@@ -175,7 +175,6 @@ const SETTINGS_LOCK_STALE_MS = 2000;
 const SETTINGS_LOCK_DEAD_PID_GRACE_MS = 100;
 const SETTINGS_LOCK_DEFAULT_WAIT_MS = 1000;
 const SETTINGS_LOCK_STEP_MS = 8;
-const WAIT_BUF = new Int32Array(new SharedArrayBuffer(4));
 
 export class SettingsLockTimeoutError extends Error {
   constructor(message = "Settings file is busy (lock timeout); please retry.") {
@@ -187,171 +186,35 @@ export class SettingsLockTimeoutError extends Error {
   }
 }
 
-function sleepSyncMs(ms) {
-  if (ms <= 0) return;
-  try {
-    Atomics.wait(WAIT_BUF, 0, 0, ms);
-  } catch {}
-}
-
-function isPidAlive(pid) {
-  if (!Number.isInteger(pid) || pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (err) {
-    return err?.code === "EPERM";
-  }
-}
-
-function readLockInfo(lockPath) {
-  try {
-    const raw = fs.readFileSync(lockPath, "utf8");
-    const parsed = JSON.parse(raw.replace(/^\uFEFF/, ""));
-    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-      return parsed;
-    }
-  } catch {}
-  return null;
-}
-
-function resolveSettingsLockWaitMs(options = {}) {
-  const opt = Number(options.maxWaitMs);
-  if (Number.isFinite(opt) && opt >= 0) return Math.floor(opt);
-  const envVal = Number(process.env.AGY_CMD_SETTINGS_LOCK_WAIT_MS);
-  if (Number.isFinite(envVal) && envVal >= 0) return Math.floor(envVal);
-  return SETTINGS_LOCK_DEFAULT_WAIT_MS;
-}
-
-function isLockStale(lockPath, staleMs, pidAliveFn) {
-  let st;
-  try {
-    st = fs.statSync(lockPath);
-  } catch {
-    return { stale: false, token: null };
-  }
-  const ageMs = Date.now() - st.mtimeMs;
-  const info = readLockInfo(lockPath);
-  if (info && Number.isInteger(info.pid)) {
-    const tsAge = Number.isFinite(info.ts) ? Date.now() - info.ts : ageMs;
-    if (info.pid !== process.pid && !pidAliveFn(info.pid) && ageMs >= SETTINGS_LOCK_DEAD_PID_GRACE_MS) {
-      return { stale: true, token: typeof info.token === "string" ? info.token : null };
-    }
-    if (tsAge > staleMs && ageMs > staleMs) {
-      return { stale: true, token: typeof info.token === "string" ? info.token : null };
-    }
-    return { stale: false, token: typeof info.token === "string" ? info.token : null };
-  }
-  if (ageMs > staleMs) {
-    return { stale: true, token: null };
-  }
-  return { stale: false, token: null };
-}
-
-function tryReclaimStaleLock(lockPath, expectedToken, staleMs, pidAliveFn) {
-  const check = isLockStale(lockPath, staleMs, pidAliveFn);
-  if (!check.stale) return false;
-  if (expectedToken !== null && check.token !== expectedToken) return false;
-  try {
-    fs.unlinkSync(lockPath);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 export function withSettingsLock(stateDir, fn, options = {}) {
   const lockPath = path.join(stateDir, ".settings.lock");
-  const maxWaitMs = resolveSettingsLockWaitMs(options);
+  const maxWaitMs = resolveLockWaitMs({
+    optionWaitMs: options.maxWaitMs,
+    envVarName: "AGY_CMD_SETTINGS_LOCK_WAIT_MS",
+    defaultWaitMs: SETTINGS_LOCK_DEFAULT_WAIT_MS
+  });
   const staleMs =
     Number.isFinite(Number(options.staleMs)) && Number(options.staleMs) > 0
       ? Number(options.staleMs)
       : SETTINGS_LOCK_STALE_MS;
-  const pidAliveFn = typeof options.isPidAlive === "function" ? options.isPidAlive : isPidAlive;
-  const token = crypto.randomBytes(8).toString("hex");
-  let acquired = false;
-
-  fs.mkdirSync(stateDir, { recursive: true });
-  const deadline = Date.now() + maxWaitMs;
-  while (true) {
-    let lockFd = null;
-    try {
-      lockFd = fs.openSync(lockPath, "wx");
-      try {
-        const record = JSON.stringify({ pid: process.pid, token, ts: Date.now() }) + "\n";
-        fs.writeFileSync(lockFd, record, "utf8");
-      } finally {
-        try {
-          fs.closeSync(lockFd);
-        } catch {}
-      }
-      acquired = true;
-      break;
-    } catch (err) {
-      if (err?.code !== "EEXIST") {
-        throw err;
-      }
-      const { stale, token: staleToken } = isLockStale(lockPath, staleMs, pidAliveFn);
-      if (stale && tryReclaimStaleLock(lockPath, staleToken, staleMs, pidAliveFn)) {
-        continue;
-      }
-      if (Date.now() >= deadline) {
-        throw new SettingsLockTimeoutError();
-      }
-      sleepSyncMs(SETTINGS_LOCK_STEP_MS);
-    }
-  }
-
-  try {
-    return fn();
-  } finally {
-    if (acquired) {
-      try {
-        const current = readLockInfo(lockPath);
-        if (current && current.token === token) {
-          fs.unlinkSync(lockPath);
-        }
-      } catch {}
-    }
-  }
+  return withFileLock(lockPath, fn, {
+    maxWaitMs,
+    staleMs,
+    deadPidGraceMs: SETTINGS_LOCK_DEAD_PID_GRACE_MS,
+    stepMs: SETTINGS_LOCK_STEP_MS,
+    isPidAliveFn: options.isPidAlive,
+    reentrant: false,
+    createTimeoutError: () => new SettingsLockTimeoutError()
+  });
 }
 
 function writeFileAtomic(filePath, content) {
-  fs.mkdirSync(path.dirname(filePath), { recursive: true });
-  const tmpName = `${filePath}.${process.pid}.${crypto.randomBytes(4).toString("hex")}.tmp`;
-  try {
-    fs.writeFileSync(tmpName, content, "utf8");
-    let lastErr = null;
-    for (let attempt = 0; attempt < 8; attempt++) {
-      try {
-        fs.renameSync(tmpName, filePath);
-        lastErr = null;
-        break;
-      } catch (err) {
-        lastErr = err;
-        const retryable =
-          process.platform === "win32" &&
-          (err?.code === "EPERM" || err?.code === "EBUSY" || err?.code === "EACCES");
-        if (!retryable) {
-          throw err;
-        }
-        sleepSyncMs(10 * (attempt + 1));
-      }
-    }
-    if (lastErr) {
-      const wrapped = new Error(`Failed to atomically replace settings file: ${lastErr.message}`);
-      wrapped.code = lastErr.code || "SETTINGS_WRITE_BUSY";
-      wrapped.statusCode = 503;
-      wrapped.retryable = true;
-      wrapped.cause = lastErr;
-      throw wrapped;
-    }
-  } catch (err) {
-    try {
-      fs.unlinkSync(tmpName);
-    } catch {}
-    throw err;
-  }
+  return writeFileAtomicShared(filePath, content, {
+    maxAttempts: 8,
+    retryBaseMs: 10,
+    busyCode: "SETTINGS_WRITE_BUSY",
+    label: "settings file"
+  });
 }
 
 export function clampRetryMax(val, fallback = DEFAULT_RETRY_MAX) {
@@ -767,8 +630,8 @@ function buildStarPromptEvalFromSettings(settings) {
   };
 }
 
-export function evaluateStarPrompt(stateDir, { markTriggered = false, nowIso = null } = {}) {
-  const initialSettings = readSettings(stateDir);
+export function evaluateStarPrompt(stateDir, { markTriggered = false, nowIso = null, settings = null } = {}) {
+  const initialSettings = settings && typeof settings === "object" ? settings : readSettings(stateDir);
   const initialEval = buildStarPromptEvalFromSettings(initialSettings);
 
   if (initialEval.shouldShow && markTriggered && !initialEval.triggeredAt) {

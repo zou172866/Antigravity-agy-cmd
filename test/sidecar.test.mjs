@@ -7,6 +7,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import vm from "node:vm";
 
+import { readHostDiagnostics, recordHostDiagnostic } from "../hooks/lib/diagnostics.mjs";
 import {
   createDefaultSettings,
   parseTurnRetryOverride,
@@ -20,8 +21,9 @@ import { runPostToolUse } from "../hooks/post-tool-use.mjs";
 import { runPreInvocation } from "../hooks/pre-invocation.mjs";
 import { runSessionStart } from "../hooks/session-start.mjs";
 import { runStop } from "../hooks/stop.mjs";
-import { dispatchPanelApi } from "../sidecars/panel/api-handler.mjs";
+import { dispatchPanelApi, RESET_DIAGNOSTICS_ROUTE } from "../sidecars/panel/api-handler.mjs";
 import { createStandaloneServer, renderPanelHtml } from "../sidecars/panel/server.mjs";
+import { UPDATE_MARKER_NAME } from "../sidecars/panel/version-update.mjs";
 
 function makeTmpDir(prefix = "agy-cmd-v21-") {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -1087,4 +1089,140 @@ test("P2 · S2 P2 Standalone HTTP CSP: emits per-request script nonce CSP header
   });
   assert.equal(saveRes.status, 200);
   assert.equal((await saveRes.json()).settings.autoRetryMax, 6);
+});
+
+test("Phase 2 optimization · Sidecar recovery banner, host diagnostics UI + /api/reset-diagnostics & paid-tier toast accuracy", async (t) => {
+  const dir = makeTmpDir("agy-cmd-opt2-panel-");
+  const fakePluginRoot = path.join(dir, "plugin-root");
+  fs.mkdirSync(fakePluginRoot, { recursive: true });
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+  // 1. Clean plugin root -> updateRecoveryNeeded: false, empty diagnostics
+  const cleanState = dispatchPanelApi("/api/state", {}, { stateDir: dir, pluginRoot: fakePluginRoot });
+  assert.equal(cleanState.status, 200);
+  assert.equal(cleanState.body.updateRecoveryNeeded, false);
+  assert.equal(cleanState.body.recoveryCliCommand, "");
+  assert.deepEqual(cleanState.body.hostDiagnostics.totals, {});
+
+  // 2. Reject unexpected fields on /api/reset-diagnostics
+  const badReset = dispatchPanelApi(RESET_DIAGNOSTICS_ROUTE, { extra: true }, { stateDir: dir, pluginRoot: fakePluginRoot });
+  assert.equal(badReset.status, 400);
+
+  // 3. Recovery marker + non-zero diagnostics surfaced through API and rendered in index.html DOM
+  const htmlSource = renderPanelHtml("vm-csrf-opt2");
+  const scriptBlocks = [...htmlSource.matchAll(/<script>([\s\S]*?)<\/script>/gi)];
+  const mainScript = scriptBlocks[scriptBlocks.length - 1][1];
+
+  const elements = new Map();
+  const makeEl = (id, dataset = {}) => {
+    const listeners = new Map();
+    return {
+      id,
+      hidden: id === "recovery-banner" || id === "row-host-diagnostics" || id === "toast",
+      value: id === "inp-max" ? "3" : "",
+      checked: false,
+      disabled: false,
+      textContent: "",
+      style: { getPropertyValue: () => "" },
+      dataset: { ...dataset },
+      classList: {
+        _s: new Set(),
+        add(c) { this._s.add(c); },
+        remove(c) { this._s.delete(c); },
+        toggle(c, force) {
+          const on = force === undefined ? !this._s.has(c) : Boolean(force);
+          if (on) this._s.add(c);
+          else this._s.delete(c);
+          return on;
+        },
+        contains(c) { return this._s.has(c); }
+      },
+      setAttribute() {},
+      addEventListener(type, fn) {
+        if (!listeners.has(type)) listeners.set(type, []);
+        listeners.get(type).push(fn);
+      },
+      async trigger(type, ev = { preventDefault() {} }) {
+        for (const fn of listeners.get(type) || []) {
+          await fn(ev);
+        }
+      }
+    };
+  };
+  const getEl = (id) => {
+    if (!elements.has(id)) elements.set(id, makeEl(id));
+    return elements.get(id);
+  };
+  const tierFreeBtn = makeEl("btn-tier-free", { tier: "free" });
+  const tierPaidBtn = makeEl("btn-tier-paid", { tier: "paid" });
+
+  let pollCb = null;
+  const ctx = {
+    document: {
+      hidden: false,
+      activeElement: null,
+      documentElement: { style: { getPropertyValue: () => "" }, setAttribute() {} },
+      getElementById: getEl,
+      querySelectorAll: (sel) => (sel === "[data-tier]" ? [tierFreeBtn, tierPaidBtn] : [])
+    },
+    window: {
+      addEventListener() {},
+      fetch: async (urlPath, opts = {}) => {
+        const out = dispatchPanelApi(urlPath, JSON.parse(opts.body || "{}"), {
+          stateDir: dir,
+          pluginRoot: fakePluginRoot
+        });
+        return { ok: out.status >= 200 && out.status < 300, status: out.status, json: async () => structuredClone(out.body) };
+      }
+    },
+    navigator: {},
+    requestAnimationFrame: (fn) => fn(),
+    setTimeout: () => 1,
+    clearTimeout() {},
+    setInterval: (fn) => {
+      pollCb = fn;
+      return 1;
+    }
+  };
+  ctx.window.window = ctx.window;
+  vm.runInNewContext(mainScript, ctx);
+  await new Promise((r) => setTimeout(r, 15));
+
+  // Normal state: both recovery banner and diagnostics row stay hidden (zero visual noise)
+  assert.equal(getEl("recovery-banner").hidden, true);
+  assert.equal(getEl("row-host-diagnostics").hidden, true);
+
+  // Simulate interrupted recovery marker & host diagnostic counters -> next poll reveals both
+  fs.writeFileSync(
+    path.join(fakePluginRoot, UPDATE_MARKER_NAME),
+    JSON.stringify({ schemaVersion: 2, pid: 99999999, startedAt: 1, phase: "recovery" }) + "\n",
+    "utf8"
+  );
+  recordHostDiagnostic(dir, { surface: "app", hostVersion: "2.35.1", reason: "transcript_parse_unknown", count: 2 });
+  pollCb();
+  await new Promise((r) => setTimeout(r, 15));
+
+  assert.equal(getEl("recovery-banner").hidden, false);
+  assert.match(getEl("recovery-cmd-text").textContent, /--install/);
+  assert.equal(getEl("row-host-diagnostics").hidden, false);
+  assert.match(getEl("lbl-host-diagnostics").textContent, /轨迹解析异常 2/);
+
+  // Clicking "清零诊断" resets diagnostics.json and hides the row cleanly
+  await getEl("btn-reset-diagnostics").trigger("click");
+  assert.equal(getEl("row-host-diagnostics").hidden, true);
+  assert.equal(getEl("toast").textContent, "本地诊断计数已清零");
+  assert.deepEqual(readHostDiagnostics(dir).totals, {});
+
+  // 4. Paid-tier button toast matches actual boostEnabled state
+  // Free -> Paid automatically enables Boost and announces it
+  await tierPaidBtn.trigger("click");
+  assert.equal(readSettings(dir).planTier, "paid");
+  assert.equal(readSettings(dir).boostEnabled, true);
+  assert.equal(getEl("toast").textContent, "已切换至会员模式并开启 Boost 接入");
+
+  // Manually disable Boost while staying Paid -> clicking Paid again must NOT claim Boost was enabled
+  updateSettings(dir, { planTier: "paid", boostEnabled: false });
+  await tierPaidBtn.trigger("click");
+  assert.equal(readSettings(dir).boostEnabled, false);
+  assert.equal(getEl("toast").textContent, "已保持会员模式（Boost 自动接入保持关闭）");
 });

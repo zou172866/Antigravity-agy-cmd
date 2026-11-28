@@ -2,26 +2,36 @@
 # Pinned-release, SHA-256-verified POSIX installer for agy-cmd.
 # Supports:
 #   - Pinned remote release install:
-#       curl -fsSL https://raw.githubusercontent.com/zou172866/Antigravity-agy-cmd/v2.8.0/install.sh | sh
+#       curl -fsSL https://raw.githubusercontent.com/zou172866/Antigravity-agy-cmd/v2.8.1/install.sh | sh
 #   - Local checkout / extracted archive install:
 #       sh ./install.sh
 #   - Offline SHA-256-verified ZIP install:
-#       sh ./install.sh --archive ./agy-cmd-v2.8.0.zip --checksums ./SHA256SUMS.txt
+#       sh ./install.sh --archive ./agy-cmd-v2.8.1.zip --checksums ./SHA256SUMS.txt
 set -eu
 
-DEFAULT_VERSION="v2.8.0"
+DEFAULT_VERSION="v2.8.1"
 RELEASE_DOWNLOAD_BASE="https://github.com/zou172866/Antigravity-agy-cmd/releases/download"
 
 if ! command -v node >/dev/null 2>&1; then
   echo "Error: Node.js >= 20 is required. Install Node.js first: https://nodejs.org/" >&2
   exit 1
 fi
+if ! node -e 'process.exit((parseInt(process.versions.node,10)||0)>=20?0:1)' >/dev/null 2>&1; then
+  NODE_VER="$(node -v 2>/dev/null || echo unknown)"
+  echo "Error: Node.js >= 20 is required (found: $NODE_VER). Please upgrade Node.js: https://nodejs.org/" >&2
+  exit 1
+fi
 
-if command -v python3 >/dev/null 2>&1; then
-  PY_BIN="python3"
-elif command -v python >/dev/null 2>&1; then
-  PY_BIN="python"
-else
+PY_BIN=""
+for CAND in python3 python; do
+  if command -v "$CAND" >/dev/null 2>&1; then
+    if "$CAND" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 8) else 1)' >/dev/null 2>&1; then
+      PY_BIN="$CAND"
+      break
+    fi
+  fi
+done
+if [ -z "$PY_BIN" ]; then
   echo "Error: Python 3.8+ is required to configure agy-cmd." >&2
   exit 1
 fi
@@ -98,11 +108,11 @@ download_file() {
   URL="$1"
   OUT="$2"
   if command -v curl >/dev/null 2>&1; then
-    curl -fsSL --proto '=https' --tlsv1.2 "$URL" -o "$OUT"
+    curl -fsSL --proto '=https' --tlsv1.2 --connect-timeout 10 --max-time 60 "$URL" -o "$OUT"
   elif command -v wget >/dev/null 2>&1; then
-    wget -qO "$OUT" --https-only "$URL"
+    wget -qO "$OUT" --https-only --timeout=30 --tries=2 "$URL"
   else
-    node -e 'const fs=require("node:fs");fetch(process.argv[1]).then(r=>{if(!r.ok)process.exit(1);return r.arrayBuffer()}).then(b=>fs.writeFileSync(process.argv[2],Buffer.from(b))).catch(()=>process.exit(1))' "$URL" "$OUT"
+    node -e 'const fs=require("node:fs");const u=new URL(process.argv[1]);if(u.protocol!=="https:")process.exit(1);fetch(u,{signal:AbortSignal.timeout(60000)}).then(async r=>{if(!r.ok)process.exit(1);const b=Buffer.from(await r.arrayBuffer());if(b.byteLength>16*1024*1024)process.exit(1);fs.writeFileSync(process.argv[2],b);}).catch(()=>process.exit(1))' "$URL" "$OUT"
   fi
 }
 

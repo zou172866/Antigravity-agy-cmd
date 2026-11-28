@@ -6,6 +6,7 @@
 import {
   detectHostSurface,
   extractActiveSlashCommands,
+  formatRouterCliCommand,
   isBareResumeNormalSessionRequest,
   isResumeNormalSessionRequest,
   isSubagentPayload,
@@ -838,7 +839,7 @@ export function evaluatePreInvocation(payload, events = [], prevStateInput = nul
       const surface = detectHostSurface(payload);
       const adjustHintZh =
         surface === "ide" || surface === "cli"
-          ? "可通过 `python3 scripts/setup_auto_router.py --auto-retry ...` 随时调节"
+          ? `可通过 \`${formatRouterCliCommand("--auto-retry 5")}\` 随时调节`
           : "可在右侧 `agy-cmd` 面板随时调节";
       const policyZh =
         retryPolicy.mode === "infinite"

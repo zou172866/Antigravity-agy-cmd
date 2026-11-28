@@ -469,3 +469,19 @@ export function isDirectRun(metaUrl, argv1 = process.argv[1]) {
   if (!argv1) return false;
   return isSameFilePath(argv1, fileURLToPath(metaUrl));
 }
+
+export function resolveRouterCliScriptPath() {
+  const pluginRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
+  return path.join(pluginRoot, "skills", "agy-cmd", "scripts", "setup_auto_router.py");
+}
+
+export function formatRouterCliCommand(
+  subArgs = "--status",
+  { platform = process.platform, scriptPath } = {}
+) {
+  const resolvedScript = nonEmptyString(scriptPath) || resolveRouterCliScriptPath();
+  const pyBin = platform === "win32" ? "python" : "python3";
+  const quotedScript = `"${resolvedScript.replace(/"/g, '\\"')}"`;
+  const suffix = nonEmptyString(subArgs);
+  return suffix ? `${pyBin} ${quotedScript} ${suffix}` : `${pyBin} ${quotedScript}`;
+}

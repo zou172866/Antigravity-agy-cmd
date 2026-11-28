@@ -1071,6 +1071,103 @@ class TestStarFollowupCliAndState(unittest.TestCase):
                 f"Python custom command parity mismatch on {sample['cmd']!r}: {err}",
             )
 
+    def test_lightweight_tier_query_fast_path_and_config_rev(self) -> None:
+        import os
+
+        stripped_env = dict(os.environ)
+        stripped_env.pop("PATH", None)
+        stripped_env.pop("Path", None)
+        py_dir = str(Path(sys.executable).resolve().parent)
+        stripped_env["PATH"] = py_dir
+        if os.name == "nt":
+            stripped_env["Path"] = py_dir
+
+        def run_stripped(*cli_args: str) -> subprocess.CompletedProcess[str]:
+            return subprocess.run(
+                [sys.executable, str(SCRIPT_PATH), *cli_args],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                env=stripped_env,
+                check=False,
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_dir = Path(tmp) / "cfg"
+            st_dir = Path(tmp) / "state"
+
+            # 1. Uninstalled / empty state still returns deterministic defaults with configRev
+            empty_res = run_stripped("--tier", "--json", "--config-dir", str(cfg_dir), "--state-dir", str(st_dir))
+            self.assertEqual(empty_res.returncode, 0, empty_res.stderr)
+            empty_data = json.loads(empty_res.stdout)
+            self.assertEqual(empty_data["ok"], True)
+            self.assertIsNone(empty_data["mode"])
+            self.assertEqual(empty_data["planTier"], "free")
+            self.assertEqual(empty_data["boostEnabled"], False)
+            self.assertRegex(empty_data["configRev"], r"^[0-9a-f]{16}$")
+            self.assertNotIn(router.GITHUB_REPO_URL, empty_res.stdout)
+
+            # 2. Standalone mode exposes planTier/boostEnabled/configRev (unlike --status --json standalone)
+            inst_standalone = run_cli("--install", "--standalone", "--config-dir", str(cfg_dir), "--state-dir", str(st_dir), "--json")
+            self.assertEqual(inst_standalone.returncode, 0, inst_standalone.stderr)
+            standalone_tier = run_stripped("--tier", "--json", "--config-dir", str(cfg_dir), "--state-dir", str(st_dir))
+            self.assertEqual(standalone_tier.returncode, 0, standalone_tier.stderr)
+            standalone_data = json.loads(standalone_tier.stdout)
+            self.assertEqual(standalone_data["mode"], "standalone")
+            self.assertEqual(standalone_data["planTier"], "free")
+            self.assertEqual(standalone_data["configRev"], empty_data["configRev"])
+
+            # 3. Plugin mode skips full installation integrity checks (even broken/drifted plugin dir returns ok: true)
+            broken_plugin = cfg_dir / "plugins" / "agy-cmd"
+            broken_plugin.mkdir(parents=True, exist_ok=True)
+            (broken_plugin / "plugin.json").write_text('{"name":"agy-cmd","version":"2.8.0"}\n', encoding="utf-8")
+            plugin_tier = run_stripped("--tier", "--json", "--config-dir", str(cfg_dir), "--state-dir", str(st_dir))
+            self.assertEqual(plugin_tier.returncode, 0, plugin_tier.stderr)
+            plugin_data = json.loads(plugin_tier.stdout)
+            self.assertEqual(plugin_data["ok"], True)
+            self.assertEqual(plugin_data["mode"], "plugin")
+            self.assertEqual(plugin_data["planTier"], "free")
+
+            # 4. Settings mutation updates planTier/boostEnabled and deterministically advances configRev
+            mut = run_cli("--plan-tier", "paid", "--boost", "on", "--state-dir", str(st_dir), "--json")
+            self.assertEqual(mut.returncode, 0, mut.stderr)
+            paid_tier_1 = json.loads(
+                run_stripped("--tier", "--json", "--config-dir", str(cfg_dir), "--state-dir", str(st_dir)).stdout
+            )
+            paid_tier_2 = json.loads(
+                run_stripped("--tier", "--json", "--config-dir", str(cfg_dir), "--state-dir", str(st_dir)).stdout
+            )
+            self.assertEqual(paid_tier_1["planTier"], "paid")
+            self.assertEqual(paid_tier_1["boostEnabled"], True)
+            self.assertNotEqual(paid_tier_1["configRev"], plugin_data["configRev"])
+            self.assertEqual(paid_tier_1["configRev"], paid_tier_2["configRev"])
+
+            # 5. Plain text output omits Star hint and prints concise tier summary
+            plain_tier = run_stripped("--tier", "--config-dir", str(cfg_dir), "--state-dir", str(st_dir))
+            self.assertEqual(plain_tier.returncode, 0, plain_tier.stderr)
+            self.assertIn("paid", plain_tier.stdout)
+            self.assertIn(paid_tier_1["configRev"], plain_tier.stdout)
+            self.assertNotIn(router.GITHUB_REPO_URL, plain_tier.stdout)
+
+    def test_phase3_installers_version_guards_timeouts_and_line_endings(self) -> None:
+        sh_bytes = (PLUGIN_ROOT / "install.sh").read_bytes()
+        ps_bytes = (PLUGIN_ROOT / "install.ps1").read_bytes()
+        self.assertNotIn(b"\r", sh_bytes, "install.sh must remain pure LF")
+        self.assertIn(b"\r\n", ps_bytes, "install.ps1 must retain CRLF line endings")
+
+        sh_text = sh_bytes.decode("utf-8")
+        ps_text = ps_bytes.decode("utf-8")
+        self.assertIn("process.versions.node", sh_text)
+        self.assertIn("sys.version_info >= (3, 8)", sh_text)
+        self.assertIn("--connect-timeout", sh_text)
+        self.assertIn("--max-time", sh_text)
+        self.assertIn("AbortSignal.timeout", sh_text)
+
+        self.assertIn("process.versions.node", ps_text)
+        self.assertIn("sys.version_info >= (3, 8)", ps_text)
+        self.assertIn("-TimeoutSec", ps_text)
+
 
 if __name__ == "__main__":
     unittest.main()

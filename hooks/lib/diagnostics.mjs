@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { nonEmptyString, sanitizeConversationId } from "./common.mjs";
+import { writeFileAtomic } from "./fs-atomic.mjs";
 
 const DIAGNOSTICS_FILENAME = "diagnostics.json";
 const WORKER_IDENTITIES_FILENAME = "worker-identities.json";
@@ -20,18 +21,15 @@ const ALLOWED_DIAGNOSTIC_REASONS = new Set([
 ]);
 
 function writeJsonAtomicBestEffort(filePath, obj) {
-  let tmpPath = "";
   try {
-    fs.mkdirSync(path.dirname(filePath), { recursive: true });
-    tmpPath = `${filePath}.${process.pid}.${crypto.randomBytes(4).toString("hex")}.tmp`;
-    fs.writeFileSync(tmpPath, JSON.stringify(obj, null, 2) + "\n", "utf8");
-    fs.renameSync(tmpPath, filePath);
+    writeFileAtomic(filePath, JSON.stringify(obj, null, 2) + "\n", {
+      maxAttempts: 4,
+      retryBaseMs: 8,
+      busyCode: "DIAGNOSTICS_WRITE_BUSY",
+      label: "diagnostics file"
+    });
   } catch {
-    if (tmpPath) {
-      try {
-        fs.unlinkSync(tmpPath);
-      } catch {}
-    }
+    // Non-critical local telemetry; never disrupt hooks
   }
 }
 
@@ -135,6 +133,29 @@ export function readHostDiagnostics(stateDir) {
     totals,
     buckets
   };
+}
+
+export function resetHostDiagnostics(stateDir) {
+  if (!stateDir) return false;
+  const filePath = path.join(stateDir, DIAGNOSTICS_FILENAME);
+  try {
+    if (fs.existsSync(filePath)) {
+      fs.unlinkSync(filePath);
+    }
+    return true;
+  } catch {
+    writeJsonAtomicBestEffort(filePath, { version: 1, updatedAt: new Date().toISOString(), buckets: {} });
+    return true;
+  }
+}
+
+export function hasPersistedWorkerIdentities(stateDir) {
+  if (!stateDir) return false;
+  try {
+    return fs.existsSync(path.join(stateDir, WORKER_IDENTITIES_FILENAME));
+  } catch {
+    return false;
+  }
 }
 
 /**

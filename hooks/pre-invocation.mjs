@@ -47,11 +47,18 @@ export async function runPreInvocation(rawInput, env = process.env, nowMs = Date
   const stateDir = resolveStateDir(env);
   const convId = resolveConversationId(payload, env);
   const transcriptPath = resolveTranscriptPath(payload);
+  let preloadedTailRaw = null;
   if (transcriptPath) {
-    const workerId = resolveWorkerTranscriptIdentity(transcriptPath, { stateDir, convId, nowMs });
+    const workerId = resolveWorkerTranscriptIdentity(transcriptPath, {
+      stateDir,
+      convId,
+      nowMs,
+      includeTailRaw: true
+    });
     if (workerId.isSubagent) {
       return {};
     }
+    preloadedTailRaw = workerId._tailRaw || null;
     if (workerId.status === "unknown" && workerId.source !== "fork_window_gap") {
       recordHostDiagnostic(stateDir, {
         surface: detectHostSurface(payload),
@@ -64,7 +71,7 @@ export async function runPreInvocation(rawInput, env = process.env, nowMs = Date
 
   try {
     const settings = readSettings(stateDir);
-    const transcriptTail = transcriptPath ? inspectTranscriptTail(transcriptPath) : null;
+    const transcriptTail = transcriptPath ? inspectTranscriptTail(transcriptPath, { preloadedTailRaw }) : null;
     if (transcriptTail?.adapter) {
       const st = transcriptTail.adapter.readStatus;
       if (st === "malformed" || st === "unreadable" || st === "truncated_empty") {

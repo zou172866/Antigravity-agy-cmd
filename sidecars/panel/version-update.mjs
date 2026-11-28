@@ -32,11 +32,13 @@ const REQUIRED_FILES = [
   "hooks/pre-invocation.mjs",
   "hooks/stop.mjs",
   "hooks/lib/common.mjs",
+  "hooks/lib/fs-atomic.mjs",
   "hooks/lib/detector.mjs",
   "hooks/lib/detector-facts.mjs",
   "hooks/lib/detector-ledger.mjs",
   "hooks/lib/diagnostics.mjs",
   "hooks/lib/plan-verification.mjs",
+  "hooks/lib/test-audit.mjs",
   "hooks/lib/settings.mjs",
   "hooks/lib/state.mjs",
   "hooks/lib/transcript.mjs",
@@ -166,10 +168,10 @@ function evaluateMarkerState(
 }
 
 /**
- * Synchronous check used by the sidecar auto-reload poller so an active, interrupted, or recovery
- * update marker suppresses reloads while dead-process staging locks do not permanently disable reload.
+ * Inspect `.update-in-progress` synchronously and return its classified marker state:
+ * `"clean"`, `"active"`, `"stale"`, `"committed_stale"`, `"interrupted"`, or `"recovery"`.
  */
-export function hasActiveUpdateMarker(
+export function getUpdateMarkerStatus(
   markerPath,
   { now = Date.now, staleMs = STALE_MARKER_MS, isPidAlive = defaultIsPidAlive } = {}
 ) {
@@ -177,16 +179,24 @@ export function hasActiveUpdateMarker(
   try {
     st = lstatSync(markerPath);
   } catch {
-    return false;
+    return "clean";
   }
-  if (!st.isFile() || st.isSymbolicLink()) return true;
+  if (!st.isFile() || st.isSymbolicLink()) return "recovery";
   try {
     const raw = readFileSync(markerPath, "utf8");
-    const state = evaluateMarkerState(raw, st.mtimeMs, { now, staleMs, isPidAlive });
-    return state === "active" || state === "recovery" || state === "interrupted";
+    return evaluateMarkerState(raw, st.mtimeMs, { now, staleMs, isPidAlive });
   } catch {
-    return true;
+    return "recovery";
   }
+}
+
+/**
+ * Synchronous check used by the sidecar auto-reload poller so an active, interrupted, or recovery
+ * update marker suppresses reloads while dead-process staging locks do not permanently disable reload.
+ */
+export function hasActiveUpdateMarker(markerPath, options = {}) {
+  const state = getUpdateMarkerStatus(markerPath, options);
+  return state === "active" || state === "recovery" || state === "interrupted";
 }
 
 async function resolveSiblingWorkDir(root, workDirName) {
@@ -874,7 +884,7 @@ async function replaceInstalledFiles(
 }
 
 const RELEASE_ASSET_PREFIX = `https://github.com/${REPO}/releases/download/`;
-const ASSET_FILENAME = /^[a-z0-9][a-z0-9._+-]*\.(?:zip|tgz)$/i;
+const ASSET_FILENAME = /^[a-z0-9][a-z0-9._+-]*\.zip$/i;
 
 export function verifiedAssetIdentity({ assetName, assetUrl, assetSha256 }, { strictNameMatch = false } = {}) {
   if (typeof assetUrl !== "string" || !assetUrl.startsWith(RELEASE_ASSET_PREFIX)) return null;

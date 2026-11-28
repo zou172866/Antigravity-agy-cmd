@@ -36,15 +36,24 @@ export async function runPreToolUse(rawInput, env = process.env) {
   const stateDir = resolveStateDir(env);
   const convId = resolveConversationId(payload, env);
   const transcriptPath = resolveTranscriptPath(payload);
-  if (transcriptPath && resolveWorkerTranscriptIdentity(transcriptPath, { stateDir, convId }).isSubagent) {
-    return { decision: "allow" };
+  let preloadedTailRaw = null;
+  if (transcriptPath) {
+    const workerId = resolveWorkerTranscriptIdentity(transcriptPath, {
+      stateDir,
+      convId,
+      includeTailRaw: true
+    });
+    if (workerId.isSubagent) {
+      return { decision: "allow" };
+    }
+    preloadedTailRaw = workerId._tailRaw || null;
   }
 
   try {
     const settings = readSettings(stateDir);
     const prevState = convId ? readState(stateDir, convId) : createDefaultState();
     const events = convId ? readEvents(stateDir, convId, { compact: false }) : [];
-    const transcriptTail = transcriptPath ? inspectTranscriptTail(transcriptPath) : null;
+    const transcriptTail = transcriptPath ? inspectTranscriptTail(transcriptPath, { preloadedTailRaw }) : null;
 
     const verdict = evaluatePreToolUse(payload, events, prevState, {
       env,

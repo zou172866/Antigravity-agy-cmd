@@ -2,19 +2,20 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { sanitizeConversationId } from "./common.mjs";
+import { resolveLockWaitMs, sleepSyncMs, withFileLock, writeFileAtomic as writeFileAtomicShared } from "./fs-atomic.mjs";
 
 const MAX_EVENT_LINES = 120;
 const COMPACT_TRIGGER_LINES = 180;
 const COMPACT_TRIGGER_BYTES = 64 * 1024;
 const GC_INTERVAL_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const BOOTSTRAP_LOG_MAX_BYTES = 64 * 1024;
+const BOOTSTRAP_LOG_KEEP_BYTES = 32 * 1024;
 
 const SESSION_LOCK_STALE_MS = 5000;
 const SESSION_LOCK_DEAD_PID_GRACE_MS = 100;
 const SESSION_LOCK_DEFAULT_WAIT_MS = 1000;
 const SESSION_LOCK_STEP_MS = 8;
-const WAIT_BUF = new Int32Array(new SharedArrayBuffer(4));
-const activeSessionLocks = new Set();
 
 export class SessionLockTimeoutError extends Error {
   constructor(message = "Session state is busy (lock timeout); please retry.") {
@@ -23,79 +24,6 @@ export class SessionLockTimeoutError extends Error {
     this.code = "SESSION_LOCK_TIMEOUT";
     this.statusCode = 503;
     this.retryable = true;
-  }
-}
-
-function sleepSyncMs(ms) {
-  if (ms <= 0) return;
-  try {
-    Atomics.wait(WAIT_BUF, 0, 0, ms);
-  } catch {}
-}
-
-function isPidAlive(pid) {
-  if (!Number.isInteger(pid) || pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (err) {
-    return err?.code === "EPERM";
-  }
-}
-
-function readLockInfo(lockPath) {
-  try {
-    const raw = fs.readFileSync(lockPath, "utf8");
-    const parsed = JSON.parse(raw.replace(/^\uFEFF/, ""));
-    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-      return parsed;
-    }
-  } catch {}
-  return null;
-}
-
-function resolveSessionLockWaitMs(options = {}) {
-  const opt = Number(options.maxWaitMs);
-  if (Number.isFinite(opt) && opt >= 0) return Math.floor(opt);
-  const envVal = Number(process.env.AGY_CMD_SESSION_LOCK_WAIT_MS);
-  if (Number.isFinite(envVal) && envVal >= 0) return Math.floor(envVal);
-  return SESSION_LOCK_DEFAULT_WAIT_MS;
-}
-
-function isSessionLockStale(lockPath, staleMs, pidAliveFn) {
-  let st;
-  try {
-    st = fs.statSync(lockPath);
-  } catch {
-    return { stale: false, token: null };
-  }
-  const ageMs = Date.now() - st.mtimeMs;
-  const info = readLockInfo(lockPath);
-  if (info && Number.isInteger(info.pid)) {
-    const tsAge = Number.isFinite(info.ts) ? Date.now() - info.ts : ageMs;
-    if (info.pid !== process.pid && !pidAliveFn(info.pid) && ageMs >= SESSION_LOCK_DEAD_PID_GRACE_MS) {
-      return { stale: true, token: typeof info.token === "string" ? info.token : null };
-    }
-    if (tsAge > staleMs && ageMs > staleMs) {
-      return { stale: true, token: typeof info.token === "string" ? info.token : null };
-    }
-    return { stale: false, token: typeof info.token === "string" ? info.token : null };
-  }
-  if (ageMs > staleMs) {
-    return { stale: true, token: null };
-  }
-  return { stale: false, token: null };
-}
-
-function tryReclaimStaleSessionLock(lockPath, expectedToken, staleMs, pidAliveFn) {
-  const check = isSessionLockStale(lockPath, staleMs, pidAliveFn);
-  if (!check.stale) return false;
-  if (expectedToken !== null && check.token !== expectedToken) return false;
-  try {
-    fs.unlinkSync(lockPath);
-    return true;
-  } catch {
-    return false;
   }
 }
 
@@ -182,103 +110,33 @@ export function withSessionLock(stateDir, convId, fn, options = {}) {
   if (!lockPath) {
     return fn();
   }
-  const lockKey = process.platform === "win32" ? path.resolve(lockPath).toLowerCase() : path.resolve(lockPath);
-  if (activeSessionLocks.has(lockKey)) {
-    return fn();
-  }
-
-  const maxWaitMs = resolveSessionLockWaitMs(options);
+  const maxWaitMs = resolveLockWaitMs({
+    optionWaitMs: options.maxWaitMs,
+    envVarName: "AGY_CMD_SESSION_LOCK_WAIT_MS",
+    defaultWaitMs: SESSION_LOCK_DEFAULT_WAIT_MS
+  });
   const staleMs =
     Number.isFinite(Number(options.staleMs)) && Number(options.staleMs) > 0
       ? Number(options.staleMs)
       : SESSION_LOCK_STALE_MS;
-  const pidAliveFn = typeof options.isPidAlive === "function" ? options.isPidAlive : isPidAlive;
-  const token = crypto.randomBytes(8).toString("hex");
-  let acquired = false;
-
-  ensureDir(path.dirname(lockPath));
-  const deadline = Date.now() + maxWaitMs;
-  while (true) {
-    let lockFd = null;
-    try {
-      lockFd = fs.openSync(lockPath, "wx");
-      try {
-        const record = JSON.stringify({ pid: process.pid, token, ts: Date.now() }) + "\n";
-        fs.writeFileSync(lockFd, record, "utf8");
-      } finally {
-        try {
-          fs.closeSync(lockFd);
-        } catch {}
-      }
-      acquired = true;
-      break;
-    } catch (err) {
-      if (err?.code !== "EEXIST") {
-        throw err;
-      }
-      const { stale, token: staleToken } = isSessionLockStale(lockPath, staleMs, pidAliveFn);
-      if (stale && tryReclaimStaleSessionLock(lockPath, staleToken, staleMs, pidAliveFn)) {
-        continue;
-      }
-      if (Date.now() >= deadline) {
-        throw new SessionLockTimeoutError();
-      }
-      sleepSyncMs(SESSION_LOCK_STEP_MS);
-    }
-  }
-
-  activeSessionLocks.add(lockKey);
-  try {
-    return fn();
-  } finally {
-    activeSessionLocks.delete(lockKey);
-    if (acquired) {
-      try {
-        const current = readLockInfo(lockPath);
-        if (current && current.token === token) {
-          fs.unlinkSync(lockPath);
-        }
-      } catch {}
-    }
-  }
+  return withFileLock(lockPath, fn, {
+    maxWaitMs,
+    staleMs,
+    deadPidGraceMs: SESSION_LOCK_DEAD_PID_GRACE_MS,
+    stepMs: SESSION_LOCK_STEP_MS,
+    isPidAliveFn: options.isPidAlive,
+    reentrant: true,
+    createTimeoutError: () => new SessionLockTimeoutError()
+  });
 }
 
 function writeFileAtomic(filePath, content) {
-  ensureDir(path.dirname(filePath));
-  const tmpName = `${filePath}.${process.pid}.${crypto.randomBytes(4).toString("hex")}.tmp`;
-  try {
-    fs.writeFileSync(tmpName, content, "utf8");
-    let lastErr = null;
-    for (let attempt = 0; attempt < 8; attempt++) {
-      try {
-        fs.renameSync(tmpName, filePath);
-        lastErr = null;
-        break;
-      } catch (err) {
-        lastErr = err;
-        const retryable =
-          process.platform === "win32" &&
-          (err?.code === "EPERM" || err?.code === "EBUSY" || err?.code === "EACCES");
-        if (!retryable) {
-          throw err;
-        }
-        sleepSyncMs(10 * (attempt + 1));
-      }
-    }
-    if (lastErr) {
-      const wrapped = new Error(`Failed to atomically replace session file: ${lastErr.message}`);
-      wrapped.code = lastErr.code || "SESSION_WRITE_BUSY";
-      wrapped.statusCode = 503;
-      wrapped.retryable = true;
-      wrapped.cause = lastErr;
-      throw wrapped;
-    }
-  } catch (err) {
-    try {
-      fs.unlinkSync(tmpName);
-    } catch {}
-    throw err;
-  }
+  return writeFileAtomicShared(filePath, content, {
+    maxAttempts: 8,
+    retryBaseMs: 10,
+    busyCode: "SESSION_WRITE_BUSY",
+    label: "session file"
+  });
 }
 
 function readEventLogSnapshot(logPath) {
@@ -415,11 +273,41 @@ export function writeState(stateDir, convId, state) {
   });
 }
 
+function trimBootstrapLogIfNeeded(stateDir) {
+  const logPath = path.join(stateDir, "hook-bootstrap.log");
+  try {
+    const st = fs.statSync(logPath);
+    if (!st.isFile() || st.size <= BOOTSTRAP_LOG_MAX_BYTES) return false;
+    const fd = fs.openSync(logPath, "r");
+    let tailBuf;
+    try {
+      const offset = Math.max(0, st.size - BOOTSTRAP_LOG_KEEP_BYTES);
+      const len = st.size - offset;
+      tailBuf = Buffer.allocUnsafe(len);
+      const bytesRead = fs.readSync(fd, tailBuf, 0, len, offset);
+      tailBuf = tailBuf.subarray(0, bytesRead);
+    } finally {
+      try {
+        fs.closeSync(fd);
+      } catch {}
+    }
+    const firstNl = tailBuf.indexOf(0x0a);
+    const trimmed = firstNl >= 0 && firstNl + 1 < tailBuf.length ? tailBuf.subarray(firstNl + 1) : tailBuf;
+    writeFileAtomic(logPath, trimmed.toString("utf8"));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export function maybeGcStaleSessions(stateDir, nowMs = Date.now(), maxAgeMs = DEFAULT_TTL_MS) {
   const sessionsDir = getSessionsDir(stateDir);
   const stampPath = path.join(sessionsDir, ".last-gc");
   try {
-    if (!fs.existsSync(sessionsDir)) return 0;
+    if (!fs.existsSync(sessionsDir)) {
+      trimBootstrapLogIfNeeded(stateDir);
+      return 0;
+    }
     try {
       const st = fs.statSync(stampPath);
       if (nowMs - st.mtimeMs < GC_INTERVAL_MS) return 0;
@@ -445,6 +333,8 @@ export function maybeGcStaleSessions(stateDir, nowMs = Date.now(), maxAgeMs = DE
         }
       } catch {}
     }
+
+    trimBootstrapLogIfNeeded(stateDir);
 
     try {
       fs.writeFileSync(stampPath, String(nowMs), "utf8");

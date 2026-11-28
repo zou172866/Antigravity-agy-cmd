@@ -1,6 +1,6 @@
 {
   "name": "agy-cmd",
-  "version": "2.8.0",
+  "version": "2.8.1",
   "private": true,
   "type": "module",
   "description": "Google Antigravity Desktop/IDE plugin: task-based command and multi-agent routing, opt-in delivery test gate with custom verification commands, auto Boost for hard debugging, read-only stuck recovery, anti-bypass plan guard, Stop-hook auto-retry, and right-hand panel with one-click self-update.",
@@ -15,7 +15,8 @@
   "scripts": {
     "test": "node --test test/hooks.test.mjs test/sidecar.test.mjs test/star-prompt.test.mjs test/self-update.test.mjs",
     "version:check": "node scripts/sync-version.mjs --check",
-    "version:sync": "node scripts/sync-version.mjs"
+    "version:sync": "node scripts/sync-version.mjs",
+    "pack:release": "node scripts/pack-release.mjs"
   },
   "engines": {
     "node": ">=20.0.0"

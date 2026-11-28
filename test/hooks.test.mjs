@@ -9,9 +9,11 @@ import { fileURLToPath } from "node:url";
 import {
   detectHostSurface,
   extractActiveSlashCommands,
+  formatRouterCliCommand,
   isSubagentPayload,
   resolveConversationId,
   resolveHostSlashCapability,
+  resolveRouterCliScriptPath,
   resolveStateDir,
   sanitizeConversationId,
   sanitizeSnippet,
@@ -25,6 +27,8 @@ import {
   reconcileEventsWithTranscript,
   unwrapCliFilterCommand
 } from "../hooks/lib/detector.mjs";
+import { isTrackableToolPayload } from "../hooks/lib/detector-facts.mjs";
+import { withFileLock, writeFileAtomic } from "../hooks/lib/fs-atomic.mjs";
 import {
   appendEvents,
   maybeGcStaleSessions,
@@ -35,12 +39,22 @@ import {
   writeState
 } from "../hooks/lib/state.mjs";
 import {
+  findTranscriptStep,
   inspectSubagentTranscript,
   inspectTranscriptTail,
   isSubagentTranscript,
   resolveWorkerTranscriptIdentity
 } from "../hooks/lib/transcript.mjs";
-import { readHostDiagnostics } from "../hooks/lib/diagnostics.mjs";
+import {
+  hasPersistedWorkerIdentities,
+  readHostDiagnostics,
+  recordHostDiagnostic,
+  resetHostDiagnostics
+} from "../hooks/lib/diagnostics.mjs";
+import {
+  detectTestAssertionWeakening as detectWeakDirect,
+  isTestFilePath as isTestFileDirect
+} from "../hooks/lib/test-audit.mjs";
 import { runSessionStart } from "../hooks/session-start.mjs";
 import { runPreToolUse } from "../hooks/pre-tool-use.mjs";
 import { runPostToolUse } from "../hooks/post-tool-use.mjs";
@@ -5392,4 +5406,292 @@ test("P1 Batch C · Stop stratification: separates verificationStatus (passed/no
   assert.equal(waiting.decision, "allow");
   assert.equal(waiting.verificationStatus, "not_run");
   assert.equal(waiting.exitReason, "awaiting_user_input");
+});
+
+test("P2 v2.8.1+ · absolute CLI hints (with space quoting) & B4 nested Rust / JS regex masking", async (t) => {
+  // 1. formatRouterCliCommand quotes absolute path and selects platform python binary
+  const winCmd = formatRouterCliCommand("--status", {
+    platform: "win32",
+    scriptPath: "C:\\Users\\My User\\.gemini\\config\\plugins\\agy-cmd\\skills\\agy-cmd\\scripts\\setup_auto_router.py"
+  });
+  assert.equal(
+    winCmd,
+    'python "C:\\Users\\My User\\.gemini\\config\\plugins\\agy-cmd\\skills\\agy-cmd\\scripts\\setup_auto_router.py" --status'
+  );
+  const posixCmd = formatRouterCliCommand("--tier --json", {
+    platform: "linux",
+    scriptPath: "/home/my user/.gemini/config/plugins/agy-cmd/skills/agy-cmd/scripts/setup_auto_router.py"
+  });
+  assert.equal(
+    posixCmd,
+    'python3 "/home/my user/.gemini/config/plugins/agy-cmd/skills/agy-cmd/scripts/setup_auto_router.py" --tier --json'
+  );
+  const resolvedCli = resolveRouterCliScriptPath();
+  assert.equal(path.isAbsolute(resolvedCli), true);
+  assert.equal(fs.existsSync(resolvedCli), true);
+
+  // IDE SessionStart & CLI PreInvocation emit quoted absolute script path (never bare relative scripts/setup_auto_router.py)
+  const dir = makeTmpDir("agy-cmd-p2-cli-");
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const ideOut = await runSessionStart(
+    {
+      conversationId: "p2-ide-c1",
+      workspacePaths: [dir],
+      artifactDirectoryPath: "/home/u/.gemini/antigravity-ide/brain/p2-ide-c1"
+    },
+    makeEnv(path.join(dir, "state"))
+  );
+  const ideMsg = ideOut.injectSteps?.[0]?.systemMessage?.systemMessage || "";
+  assert.equal(ideMsg.includes(`"${resolvedCli}"`), true);
+  assert.doesNotMatch(ideMsg, /`python3? scripts\/setup_auto_router\.py/);
+
+  const cliPre = evaluatePreInvocation(
+    {
+      invocationNum: 0,
+      initialNumSteps: 1,
+      lastUserInput: "帮我一直修到全部测试通过",
+      artifactDirectoryPath: "/home/u/.gemini/antigravity-cli/brain/p2-cli-c1"
+    },
+    [],
+    null,
+    { settings: { autoRetryMode: "count", autoRetryMax: 3 } }
+  );
+  const preMsg = cliPre.injectStep?.systemMessage?.systemMessage || "";
+  assert.equal(preMsg.includes(`"${resolvedCli}"`), true);
+  assert.doesNotMatch(preMsg, /`python3? scripts\/setup_auto_router\.py/);
+
+  // 2. B4 nested Rust integration test paths
+  assert.equal(isTestFilePath("tests/basic.rs"), true);
+  assert.equal(isTestFilePath("tests/integration/auth.rs"), true);
+  assert.equal(isTestFilePath("crates/core/tests/e2e/sub/flow.rs"), true);
+  assert.equal(isTestFilePath("examples/tests/integration/demo.rs"), false);
+  assert.equal(isTestFilePath("src/tests_helper.rs"), false);
+
+  const rustWeak = detectTestAssertionWeakening("edit_file", {
+    Path: "crates/core/tests/integration/auth.rs",
+    Target: "#[test]\nfn login_ok() {\n  assert_eq!(1, 1);\n}",
+    Replacement: "#[test]\n#[ignore]\nfn login_ok() {\n  assert_eq!(1, 1);\n}"
+  });
+  assert.deepEqual(rustWeak, {
+    files: ["crates/core/tests/integration/auth.rs"],
+    addedSkip: 1,
+    droppedAssert: 0
+  });
+
+  // 3. B4 JS/TS single-line regex literal masking:
+  // (a) Skip-like text or stray quote inside regex literal does not cause false-positive skip
+  assert.equal(
+    detectTestAssertionWeakening("edit_file", {
+      Path: "src/parser.test.js",
+      Target: "assert.match(out, /ok/);",
+      Replacement: "assert.match(out, /test\\.skip\\('/);"
+    }),
+    null
+  );
+
+  // (b) Quote inside regex literal /a'b/ must not swallow assertions on the same or following lines
+  const quoteInRegex = detectTestAssertionWeakening("edit_file", {
+    Path: "src/parser.test.js",
+    Target: "const re = /a'b/g;\nassert.equal(a, 1);\nassert.equal(b, 2);",
+    Replacement: "const re = /a'b/g;\nassert.equal(a, 1);"
+  });
+  assert.deepEqual(quoteInRegex, {
+    files: ["src/parser.test.js"],
+    addedSkip: 0,
+    droppedAssert: 1
+  });
+
+  // (c) Escaped slashes // inside regex literal /foo\/\// must not comment out following assertions
+  const slashInRegex = detectTestAssertionWeakening("edit_file", {
+    Path: "src/url.test.ts",
+    Target: "const re = /foo\\/\\//; expect(a).toBe(1); expect(b).toBe(2);",
+    Replacement: "const re = /foo\\/\\//; expect(a).toBe(1);"
+  });
+  assert.deepEqual(slashInRegex, {
+    files: ["src/url.test.ts"],
+    addedSkip: 0,
+    droppedAssert: 1
+  });
+
+  // (d) Character class [/'"] inside regex literal does not terminate regex early or open string
+  const classInRegex = detectTestAssertionWeakening("edit_file", {
+    Path: "src/lexer.test.js",
+    Target: "return /[/'\"]/i.test(s) && assert.equal(x, 1);",
+    Replacement: "return /[/'\"]/i.test(s);"
+  });
+  assert.deepEqual(classInRegex, {
+    files: ["src/lexer.test.js"],
+    addedSkip: 0,
+    droppedAssert: 1
+  });
+
+  // (e) Division operators `a / b / c` must not be mistaken for a regex literal swallowing assertions
+  const divisionCase = detectTestAssertionWeakening("edit_file", {
+    Path: "src/math.test.js",
+    Target: "const r = a / b / c; assert.equal(r, 1); assert.equal(r > 0, true);",
+    Replacement: "const r = a / b / c; assert.equal(r, 1);"
+  });
+  assert.deepEqual(divisionCase, {
+    files: ["src/math.test.js"],
+    addedSkip: 0,
+    droppedAssert: 1
+  });
+});
+
+test("Phase 2 optimization · preloaded tail reuse, worker-store short-circuit, bootstrap log GC cap & test-audit.mjs split", (t) => {
+  // 1. test-audit.mjs split preserves exact re-export identity from plan-verification.mjs
+  assert.equal(isTestFileDirect, isTestFilePath);
+  assert.equal(detectWeakDirect, detectTestAssertionWeakening);
+
+  const dir = makeTmpDir("agy-cmd-opt2-");
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+  // 2. Main session >64KB transcript: includeTailRaw populates reusable _tailRaw matching direct inspectTranscriptTail
+  const txPath = path.join(dir, "main-long.jsonl");
+  const filler = "x".repeat(4000);
+  const lines = [
+    JSON.stringify({ step_index: 0, type: "USER_INPUT", content: "<USER_REQUEST>\n帮我修复单元测试\n</USER_REQUEST>" }),
+    ...Array.from({ length: 20 }, (_, i) =>
+      JSON.stringify({ step_index: i + 1, type: "GENERIC", content: filler, status: "DONE" })
+    ),
+    JSON.stringify({
+      step_index: 21,
+      type: "PLANNER_RESPONSE",
+      content: "正在检查测试失败原因",
+      tool_calls: [{ name: "run_command", args: { CommandLine: "npm test" } }]
+    }),
+    JSON.stringify({ step_index: 22, type: "GENERIC", content: "Exit code: 0", status: "DONE" })
+  ];
+  fs.writeFileSync(txPath, lines.join("\n") + "\n", "utf8");
+
+  assert.equal(hasPersistedWorkerIdentities(dir), false);
+  const defaultId = resolveWorkerTranscriptIdentity(txPath, { stateDir: dir, convId: "main-c1" });
+  assert.equal(defaultId.isSubagent, false);
+  assert.equal(Object.prototype.hasOwnProperty.call(defaultId, "_tailRaw"), false);
+  assert.equal(hasPersistedWorkerIdentities(dir), false, "Main session must not create worker-identities.json");
+
+  const withTailId = resolveWorkerTranscriptIdentity(txPath, {
+    stateDir: dir,
+    convId: "main-c1",
+    includeTailRaw: true
+  });
+  assert.equal(withTailId.isSubagent, false);
+  assert.ok(Array.isArray(withTailId._tailRaw?.entries) && withTailId._tailRaw.entries.length > 0);
+  const reusedTail = inspectTranscriptTail(txPath, { preloadedTailRaw: withTailId._tailRaw });
+  const directTail = inspectTranscriptTail(txPath);
+  assert.deepEqual(reusedTail, directTail);
+
+  // Confirming a real worker creates worker-identities.json and flips hasPersistedWorkerIdentities to true
+  const workerTx = path.join(dir, "worker.jsonl");
+  fs.writeFileSync(
+    workerTx,
+    JSON.stringify({ step_index: 0, type: "SYSTEM_MESSAGE", content: "<swarm_worker>hello</swarm_worker>" }) + "\n",
+    "utf8"
+  );
+  const confirmedWorker = resolveWorkerTranscriptIdentity(workerTx, { stateDir: dir, convId: "worker-c1" });
+  assert.equal(confirmedWorker.isSubagent, true);
+  assert.equal(hasPersistedWorkerIdentities(dir), true);
+
+  // 3. Diagnostics reset helper clears diagnostics.json cleanly
+  assert.equal(recordHostDiagnostic(dir, { surface: "app", hostVersion: "2.35.1", reason: "transcript_parse_unknown" }), true);
+  assert.equal(readHostDiagnostics(dir).totals.transcript_parse_unknown, 1);
+  assert.equal(resetHostDiagnostics(dir), true);
+  assert.deepEqual(readHostDiagnostics(dir).totals, {});
+
+  // 4. maybeGcStaleSessions caps oversized hook-bootstrap.log cleanly on a valid JSONL newline boundary
+  const bootLog = path.join(dir, "hook-bootstrap.log");
+  const logLines = Array.from({ length: 1200 }, (_, i) =>
+    JSON.stringify({ ts: `2026-11-27T00:00:${String(i % 60).padStart(2, "0")}Z`, hook: "Stop", reason: "no_trusted_root", seq: i })
+  );
+  fs.writeFileSync(bootLog, logLines.join("\n") + "\n", "utf8");
+  assert.ok(fs.statSync(bootLog).size > 64 * 1024);
+  maybeGcStaleSessions(dir, Date.now());
+  const trimmedSize = fs.statSync(bootLog).size;
+  assert.ok(trimmedSize > 0 && trimmedSize <= 32 * 1024, `Expected trimmed log <= 32KB, got ${trimmedSize}`);
+  const remainingLines = fs.readFileSync(bootLog, "utf8").trim().split("\n");
+  assert.equal(JSON.parse(remainingLines[remainingLines.length - 1]).seq, 1199);
+  assert.doesNotThrow(() => JSON.parse(remainingLines[0]), "First remaining line must start on a clean newline boundary");
+});
+
+test("Phase 3 optimization · PostToolUse zero-I/O prefilter, preloaded findTranscriptStep & fs-atomic.mjs primitives", async (t) => {
+  // 1. Zero-I/O prefilter skips irrelevant MCP & dryRun payloads, allows real edits/cmds
+  assert.equal(isTrackableToolPayload({ toolCall: { name: "call_mcp_tool", args: { ToolName: "ctx_search", Arguments: {} } } }), false);
+  assert.equal(isTrackableToolPayload({ toolCall: { name: "call_mcp_tool", args: { ToolName: "ctx_execute", Arguments: {} } } }), false);
+  assert.equal(isTrackableToolPayload({ toolCall: { name: "read_file", args: { Path: "a.js" } } }), false);
+  assert.equal(isTrackableToolPayload({ toolCall: { name: "mcp_agy-dart_fast_apply_edits", args: { dryRun: true, edits: [] } } }), false);
+  assert.equal(isTrackableToolPayload({ toolCall: { name: "edit_file", args: { Path: "a.js" } } }), true);
+  assert.equal(isTrackableToolPayload({ toolCall: { name: "run_command", args: { CommandLine: "npm test" } } }), true);
+  assert.equal(isTrackableToolPayload({ toolCall: { name: "call_mcp_tool", args: { ToolName: "apply_edits", Arguments: { edits: [] } } } }), true);
+  assert.equal(isTrackableToolPayload({ toolCall: { name: "mcp_agy-dart_fast_run_checks", args: { commands: [] } } }), true);
+
+  const dir = makeTmpDir("agy-cmd-opt3-");
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const env = makeEnv(dir);
+
+  // Irrelevant MCP tool returns {} immediately without creating sessions/ or touching disk
+  const mcpOut = await runPostToolUse(
+    {
+      conversationId: "mcp-skip-c1",
+      toolCall: { name: "call_mcp_tool", args: { ToolName: "ctx_search", Arguments: { query: "foo" } } }
+    },
+    env,
+    1000
+  );
+  assert.deepEqual(mcpOut, {});
+  assert.equal(fs.existsSync(path.join(dir, "sessions")), false);
+
+  // 2. findTranscriptStep reuses preloadedTailRaw identically to direct disk scan
+  const txPath = path.join(dir, "long-step.jsonl");
+  const pad = "z".repeat(4000);
+  const lines = [
+    JSON.stringify({ step_index: 0, type: "USER_INPUT", content: "<USER_REQUEST>\n修测试\n</USER_REQUEST>" }),
+    ...Array.from({ length: 20 }, (_, i) => JSON.stringify({ step_index: i + 1, type: "GENERIC", content: pad, status: "DONE" })),
+    JSON.stringify({ step_index: 21, type: "GENERIC", content: "Exit code: 0\nAll passed", status: "DONE" })
+  ];
+  fs.writeFileSync(txPath, lines.join("\n") + "\n", "utf8");
+  const wid = resolveWorkerTranscriptIdentity(txPath, { stateDir: dir, convId: "step-c1", includeTailRaw: true });
+  const reusedStep = findTranscriptStep(txPath, 21, { preloadedTailRaw: wid._tailRaw });
+  const directStep = findTranscriptStep(txPath, 21);
+  assert.deepEqual(reusedStep, directStep);
+  assert.equal(reusedStep?.step_index, 21);
+
+  // 3. fs-atomic.mjs primitives: reentrant lock, timeout on live lock, dead-PID reclaim, and clean atomic write
+  const lockPath = path.join(dir, "test.lock");
+  const nested = withFileLock(
+    lockPath,
+    () => withFileLock(lockPath, () => "ok-reentrant", { reentrant: true }),
+    { reentrant: true }
+  );
+  assert.equal(nested, "ok-reentrant");
+  assert.equal(fs.existsSync(lockPath), false);
+
+  fs.writeFileSync(lockPath, JSON.stringify({ pid: process.pid, token: "live-tok", ts: Date.now() }) + "\n", "utf8");
+  assert.throws(
+    () =>
+      withFileLock(lockPath, () => "nope", {
+        maxWaitMs: 25,
+        staleMs: 60_000,
+        reentrant: false,
+        createTimeoutError: () => Object.assign(new Error("busy"), { code: "CUSTOM_LOCK_TIMEOUT" })
+      }),
+    (err) => err?.code === "CUSTOM_LOCK_TIMEOUT"
+  );
+  assert.equal(fs.existsSync(lockPath), true, "Timeout must not unlink another holder's lock");
+
+  // Dead PID past grace period is reclaimed cleanly
+  fs.writeFileSync(lockPath, JSON.stringify({ pid: 99999999, token: "dead-tok", ts: Date.now() - 500 }) + "\n", "utf8");
+  const oldTime = new Date(Date.now() - 500);
+  fs.utimesSync(lockPath, oldTime, oldTime);
+  const reclaimed = withFileLock(lockPath, () => "reclaimed", {
+    maxWaitMs: 200,
+    deadPidGraceMs: 10,
+    isPidAliveFn: () => false
+  });
+  assert.equal(reclaimed, "reclaimed");
+  assert.equal(fs.existsSync(lockPath), false);
+
+  const targetFile = path.join(dir, "atomic.json");
+  writeFileAtomic(targetFile, '{"v":1}\n');
+  assert.equal(fs.readFileSync(targetFile, "utf8"), '{"v":1}\n');
+  assert.equal(fs.readdirSync(dir).some((f) => f.endsWith(".tmp")), false);
 });

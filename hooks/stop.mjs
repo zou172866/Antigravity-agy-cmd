@@ -39,8 +39,18 @@ export async function runStop(rawInput, env = process.env, nowMs = Date.now()) {
   const stateDir = resolveStateDir(env);
   const convId = resolveConversationId(payload, env);
   const transcriptPath = resolveTranscriptPath(payload);
-  if (transcriptPath && resolveWorkerTranscriptIdentity(transcriptPath, { stateDir, convId, nowMs }).isSubagent) {
-    return { decision: "allow" };
+  let preloadedTailRaw = null;
+  if (transcriptPath) {
+    const workerId = resolveWorkerTranscriptIdentity(transcriptPath, {
+      stateDir,
+      convId,
+      nowMs,
+      includeTailRaw: true
+    });
+    if (workerId.isSubagent) {
+      return { decision: "allow" };
+    }
+    preloadedTailRaw = workerId._tailRaw || null;
   }
   if (!convId) {
     return { decision: "allow" };
@@ -48,7 +58,7 @@ export async function runStop(rawInput, env = process.env, nowMs = Date.now()) {
 
   try {
     const settings = readSettings(stateDir);
-    const transcriptTail = transcriptPath ? inspectTranscriptTail(transcriptPath) : null;
+    const transcriptTail = transcriptPath ? inspectTranscriptTail(transcriptPath, { preloadedTailRaw }) : null;
     if (transcriptTail?.adapter) {
       const st = transcriptTail.adapter.readStatus;
       if (st === "malformed" || st === "unreadable" || st === "truncated_empty") {

@@ -605,6 +605,22 @@ function classifyEditOutcome(bareTool, hasArtifactMeta, looksLikePlanPath, error
 }
 
 /**
+ * Fast zero-I/O prefilter used by PostToolUse to short-circuit irrelevant tools
+ * (e.g. read-only MCP calls routed through `call_mcp_tool` or `apply_edits` dryRun)
+ * before reading transcript.jsonl, settings.json, or session state from disk.
+ */
+export function isTrackableToolPayload(payload) {
+  if (!payload || typeof payload !== "object") return false;
+  const toolCall = payload.toolCall && typeof payload.toolCall === "object" ? payload.toolCall : {};
+  const { bareTool, effectiveArgs } = normalizeBareTool(toolCall.name, toolCall.args || {});
+  if (!bareTool) return false;
+  if (EDIT_TOOL_NAMES.has(bareTool)) {
+    return !(bareTool === "apply_edits" && effectiveArgs.dryRun === true);
+  }
+  return CMD_TOOL_NAMES.has(bareTool);
+}
+
+/**
  * Classify a PostToolUse hook payload into 0..2 lightweight tracking events.
  * Read-only tools return [] (zero disk I/O).
  * When Antigravity omits `toolResponse` in PostToolUse, marks `pending: true`

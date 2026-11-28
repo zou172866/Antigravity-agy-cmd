@@ -24,6 +24,8 @@ import {
   isAllowedLocalRequest,
   isPluginUpdateBusy,
   NO_STORE_HEADERS,
+  RESET_DIAGNOSTICS_ROUTE,
+  RESUME_NORMAL_SESSION_ROUTE,
   runAutoUpdateCycle,
   timingSafeEqualStr
 } from "./api-handler.mjs";
@@ -45,6 +47,10 @@ const WATCHED_BACKEND_FILES = [
   path.join(__dirname, "version-check.mjs"),
   path.join(__dirname, "update-archive.mjs"),
   path.join(__dirname, "version-update.mjs"),
+  path.resolve(__dirname, "../../hooks/lib/diagnostics.mjs"),
+  path.resolve(__dirname, "../../hooks/lib/plan-verification.mjs"),
+  path.resolve(__dirname, "../../hooks/lib/test-audit.mjs"),
+  path.resolve(__dirname, "../../hooks/lib/fs-atomic.mjs"),
   path.resolve(__dirname, "../../hooks/lib/settings.mjs"),
   path.resolve(__dirname, "../../hooks/lib/state.mjs"),
   path.resolve(__dirname, "../../hooks/lib/common.mjs")
@@ -60,9 +66,41 @@ function snapshotBackendMtimes() {
   }).join("|");
 }
 
+let _cachedHtmlMtime = -1;
+let _cachedHtmlTemplate = "";
+let _cachedManifestMtime = -1;
+let _cachedLocalVersion = "";
+
+function readPanelTemplateCached() {
+  try {
+    const mtime = fs.statSync(HTML_PATH).mtimeMs;
+    if (mtime !== _cachedHtmlMtime || !_cachedHtmlTemplate) {
+      _cachedHtmlTemplate = fs.readFileSync(HTML_PATH, "utf8");
+      _cachedHtmlMtime = mtime;
+    }
+    return _cachedHtmlTemplate;
+  } catch {
+    return fs.readFileSync(HTML_PATH, "utf8");
+  }
+}
+
+function readLocalVersionCached() {
+  const manifestPath = path.resolve(__dirname, "../../plugin.json");
+  try {
+    const mtime = fs.statSync(manifestPath).mtimeMs;
+    if (mtime !== _cachedManifestMtime || !_cachedLocalVersion) {
+      _cachedLocalVersion = readLocalVersion();
+      _cachedManifestMtime = mtime;
+    }
+    return _cachedLocalVersion;
+  } catch {
+    return readLocalVersion();
+  }
+}
+
 export function renderPanelHtml(csrfToken = "", { scriptNonce = "" } = {}) {
-  const tpl = fs.readFileSync(HTML_PATH, "utf8");
-  const localVer = readLocalVersion();
+  const tpl = readPanelTemplateCached();
+  const localVer = readLocalVersionCached();
   const withVersion = localVer
     ? tpl.replace(/<span class="ver-pill">v[^<]*<\/span>/, `<span class="ver-pill">v${localVer}</span>`)
     : tpl;
@@ -167,7 +205,8 @@ export function createStandaloneServer({
   pluginUpdater = null,
   autoUpdateCheckEnabled = null,
   onUpdated = null,
-  onAutoInstallEnabled = null
+  onAutoInstallEnabled = null,
+  pluginRoot
 } = {}) {
   const sendJson = (res, status, payload, extraHeaders = {}) => {
     res.writeHead(status, {
@@ -269,7 +308,7 @@ export function createStandaloneServer({
           sendJson(res, out.status, out.body);
           return;
         }
-        const out = dispatchPanelApi(url.pathname, parsed.data, { stateDir });
+        const out = dispatchPanelApi(url.pathname, parsed.data, { stateDir, pluginRoot });
         if (
           url.pathname === "/api/settings" &&
           out.status === 200 &&
@@ -304,7 +343,8 @@ export function registerSidecarRoutes(
     pluginUpdater = null,
     autoUpdateCheckEnabled = null,
     onUpdated = null,
-    onAutoInstallEnabled = null
+    onAutoInstallEnabled = null,
+    pluginRoot
   } = {}
 ) {
   const wrapJson = (out) => {
@@ -341,14 +381,16 @@ export function registerSidecarRoutes(
     "/api/settings",
     "/api/dismiss-onboarding",
     "/api/star-prompt",
-    "/api/resume-normal-session"
+    RESUME_NORMAL_SESSION_ROUTE,
+    RESET_DIAGNOSTICS_ROUTE
   ]) {
     app.api(
       route,
       (rawData) => {
         const out = dispatchPanelApi(route, rawData, {
           stateDir,
-          defaultConvId: app.config?.conversationId || ""
+          defaultConvId: app.config?.conversationId || "",
+          pluginRoot
         });
         if (
           route === "/api/settings" &&

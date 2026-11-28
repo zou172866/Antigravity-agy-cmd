@@ -763,7 +763,7 @@
           aria-pressed="false"
           title="默认关闭。开启后仅对同主版本且通过 SHA-256 校验的 Release 自动静默升级，单版本失败自动熔断，跨大版本仍需手动确认。"
         >自动更新：关</button>
-        <span class="ver-pill">v2.8.0</span>
+        <span class="ver-pill">v2.8.1</span>
       </div>
     </div>
 
@@ -792,6 +792,14 @@
         <button id="version-dismiss-btn" class="update-btn-ghost" type="button">关闭</button>
       </div>
     </section>
+
+    <div id="recovery-banner" class="onboard-card hidden" role="alert" hidden>
+      <div class="onboard-title">⚠️ 检测到上次插件更新未完成（待恢复）</div>
+      <p class="onboard-desc">
+        为防止加载混版脚本，部分钩子已自动切入中性保护模式。请重启 Antigravity 自动恢复，或在终端运行：
+        <code id="recovery-cmd-text">python skills/agy-cmd/scripts/setup_auto_router.py --install</code>
+      </p>
+    </div>
 
     <div id="onboard-card" class="onboard-card" hidden>
       <div class="onboard-title">⚠️ 安装后首次确认提醒</div>
@@ -1008,6 +1016,10 @@
         <div class="status-line" id="row-stop-outcome" hidden>
           <span class="status-muted" id="lbl-stop-outcome">—</span>
         </div>
+        <div class="status-line" id="row-host-diagnostics" hidden>
+          <span class="status-muted" id="lbl-host-diagnostics">—</span>
+          <button id="btn-reset-diagnostics" class="link-btn" type="button">清零诊断</button>
+        </div>
         <div class="status-line" style="margin-top:2px">
           <span class="status-muted">累计自动拦截续跑：<strong id="lbl-total-retries">0</strong> 次</span>
           <button id="btn-reset-stats" class="link-btn" type="button">清零统计</button>
@@ -1119,6 +1131,8 @@
       syncHostTheme();
 
       const $ = (id) => document.getElementById(id);
+      const recoveryBannerEl = $("recovery-banner");
+      const recoveryCmdTextEl = $("recovery-cmd-text");
       const onboardCard = $("onboard-card");
       const btnAckOnboard = $("btn-ack-onboard");
       const countBox = $("count-box");
@@ -1151,6 +1165,9 @@
       const btnResumeNormal = $("btn-resume-normal");
       const rowStopOutcome = $("row-stop-outcome");
       const lblStopOutcome = $("lbl-stop-outcome");
+      const rowHostDiagnostics = $("row-host-diagnostics");
+      const lblHostDiagnostics = $("lbl-host-diagnostics");
+      const btnResetDiagnostics = $("btn-reset-diagnostics");
       const lblTotalRetries = $("lbl-total-retries");
       const btnResetStats = $("btn-reset-stats");
       const toastEl = $("toast");
@@ -1739,11 +1756,41 @@
         }, 2500);
       }
 
+      const DIAGNOSTIC_REASON_ZH = {
+        unknown_transcript_receipt: "未知工具回执",
+        pending_receipt_out_of_window: "待决回执超窗",
+        transcript_parse_unknown: "轨迹解析异常",
+        transcript_rolled_over_unknown: "轨迹滚窗缺输入",
+        optional_role_unavailable: "可选角色不可用",
+        worker_identity_unknown: "Worker 身份未知"
+      };
+
+      function formatHostDiagnosticsSummary(diag) {
+        const totals = diag && typeof diag === "object" && diag.totals && typeof diag.totals === "object"
+          ? diag.totals
+          : null;
+        if (!totals) return "";
+        const parts = [];
+        for (const [reason, rawCount] of Object.entries(totals)) {
+          const n = Number(rawCount);
+          if (Number.isFinite(n) && n > 0) {
+            parts.push(`${DIAGNOSTIC_REASON_ZH[reason] || reason} ${Math.floor(n)}`);
+          }
+        }
+        return parts.length > 0 ? `本地诊断：${parts.join(" · ")}` : "";
+      }
+
       function render(data) {
         if (!data?.settings) return;
         const s = data.settings;
         if (typeof data.version === "string" && data.version) {
           setVersionPillText(data.version);
+        }
+
+        const needsRecovery = data.updateRecoveryNeeded === true;
+        setElementHidden(recoveryBannerEl, !needsRecovery);
+        if (needsRecovery && recoveryCmdTextEl && typeof data.recoveryCliCommand === "string" && data.recoveryCliCommand) {
+          recoveryCmdTextEl.textContent = data.recoveryCliCommand;
         }
 
         onboardCard.hidden = Boolean(s.configuredByUser);
@@ -1824,6 +1871,15 @@
             setElementHidden(rowStopOutcome, true);
           }
         }
+        const diagText = formatHostDiagnosticsSummary(data.hostDiagnostics);
+        if (rowHostDiagnostics && lblHostDiagnostics) {
+          if (diagText) {
+            lblHostDiagnostics.textContent = diagText;
+            setElementHidden(rowHostDiagnostics, false);
+          } else {
+            setElementHidden(rowHostDiagnostics, true);
+          }
+        }
 
         lblSummary.textContent = data.summaryZh || "";
         lblBoostStatus.textContent = data.boostStatusZh || "";
@@ -1839,7 +1895,8 @@
           if (mutSeq < latestAppliedMutationSeq) return;
           latestAppliedMutationSeq = mutSeq;
           render(data);
-          showToast(toastText);
+          const resolvedToast = typeof toastText === "function" ? toastText(data) : toastText;
+          showToast(resolvedToast);
         } catch (err) {
           showToast(`保存失败：${err.message}`);
         }
@@ -1885,7 +1942,12 @@
       tierBtns.forEach((btn) => {
         btn.addEventListener("click", () => {
           const tier = btn.dataset.tier;
-          const msg = tier === "paid" ? "已切换至会员模式并开启 Boost 接入" : "已切回免费安全模式（关闭 Boost 防报错）";
+          const msg = (data) =>
+            tier === "paid"
+              ? data?.settings?.boostEnabled
+                ? "已切换至会员模式并开启 Boost 接入"
+                : "已保持会员模式（Boost 自动接入保持关闭）"
+              : "已切回免费安全模式（关闭 Boost 防报错）";
           return savePatch({ planTier: tier }, msg);
         });
       });
@@ -2019,6 +2081,21 @@
             latestAppliedMutationSeq = mutSeq;
             render(data);
             showToast("已恢复普通会话护栏");
+          } catch (err) {
+            showToast(`操作失败：${err.message}`);
+          }
+        });
+      }
+
+      if (btnResetDiagnostics) {
+        btnResetDiagnostics.addEventListener("click", async () => {
+          const mutSeq = ++apiMutationSeq;
+          try {
+            const data = await callApi("/api/reset-diagnostics", {});
+            if (mutSeq < latestAppliedMutationSeq) return;
+            latestAppliedMutationSeq = mutSeq;
+            render(data);
+            showToast("本地诊断计数已清零");
           } catch (err) {
             showToast(`操作失败：${err.message}`);
           }

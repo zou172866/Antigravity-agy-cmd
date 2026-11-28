@@ -7,6 +7,7 @@ import argparse
 from contextlib import contextmanager
 import ctypes
 from datetime import datetime, timezone
+import hashlib
 import json
 import math
 import os
@@ -790,6 +791,11 @@ def format_settings_summary(settings: dict) -> str:
     else:
         gate_str = "关闭"
     return f"自动重试={retry_str} | 交付门禁={gate_str} | 套餐档位={tier_str}"
+
+
+def compute_settings_revision(settings: dict) -> str:
+    canonical = json.dumps(settings, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
 
 
 def parse_auto_retry_arg(raw_val: str) -> tuple[str, int | None]:
@@ -1749,6 +1755,11 @@ def main(argv: list[str] | None = None) -> int:
     group.add_argument("--install", action="store_true", help="启用并同步 agy-cmd 自动路由规则")
     group.add_argument("--remove", action="store_true", help="停用插件或移除独立自动路由规则")
     group.add_argument("--status", action="store_true", help="查看当前插件、面板、钩子与重试配置状态")
+    group.add_argument(
+        "--tier",
+        action="store_true",
+        help="极速只读查询当前账号套餐档位、Boost 开关与配置修订号（跳过安装完整性扫盘）",
+    )
     group.add_argument("--sync-check", action="store_true", help="校验磁盘规则、钩子与面板完整性且无漂移")
 
     parser.add_argument(
@@ -1843,7 +1854,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--json",
         action="store_true",
-        help="以纯 JSON 格式输出 --status 或 --sync-check 结果（不包含文本提示）",
+        help="以纯 JSON 格式输出 --tier、--status 或 --sync-check 结果（不包含文本提示）",
     )
     args = parser.parse_args(argv)
 
@@ -1864,9 +1875,9 @@ def main(argv: list[str] | None = None) -> int:
             args.auto_update_install,
         )
     )
-    has_lifecycle_action = any((args.install, args.remove, args.status, args.sync_check))
+    has_lifecycle_action = any((args.install, args.remove, args.status, args.sync_check, args.tier))
     if not has_settings_mutation and not has_lifecycle_action:
-        parser.error("请至少指定一项操作（如 --status / --install / --auto-retry / --plan-tier / --boost / --reset-stats）")
+        parser.error("请至少指定一项操作（如 --tier / --status / --install / --auto-retry / --plan-tier / --boost / --reset-stats）")
 
     config_dir = resolve_config_dir(args.config_dir)
     state_dir = resolve_state_dir(args.state_dir)
@@ -1919,6 +1930,25 @@ def main(argv: list[str] | None = None) -> int:
             if args.json:
                 print(json.dumps({"ok": True, "settings": updated}, ensure_ascii=False))
             return 0
+
+    if args.tier:
+        settings = load_settings(state_dir)
+        mode = "plugin" if has_plugin else ("standalone" if standalone_rule_path.is_file() else None)
+        payload = {
+            "ok": True,
+            "mode": mode,
+            "planTier": settings["planTier"],
+            "boostEnabled": bool(settings["planTier"] == "paid" and settings["boostEnabled"]),
+            "configRev": compute_settings_revision(settings),
+        }
+        if args.json:
+            print(json.dumps(payload, ensure_ascii=False))
+            return 0
+        boost_label = "开启" if payload["boostEnabled"] else "关闭"
+        print(
+            f"套餐档位：{payload['planTier']} | Boost 自动接入：{boost_label} | 配置修订号：{payload['configRev']}"
+        )
+        return 0
 
     if args.status:
         settings = load_settings(state_dir)
