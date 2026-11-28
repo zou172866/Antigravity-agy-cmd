@@ -215,7 +215,8 @@ test("opt-in review requires an approved implementation and actual write, and ne
   assert.deepEqual(await f.pre(), {});
   await f.edit(3);
   const result = await f.pre();
-  assert.match(result.injectSteps?.[0]?.systemMessage.systemMessage, /invoke_subagent once.*cmd-verifier.*Workspace='inherit'/);
+  assert.match(result.injectSteps?.[0]?.systemMessage.systemMessage, /invoke_subagent once.*TypeName='research'.*Workspace='inherit'/);
+  assert.doesNotMatch(result.injectSteps?.[0]?.systemMessage.systemMessage, /TypeName='cmd-verifier'/);
   assert.deepEqual(await f.pre(), {});
   f.append({ step_index: 4, type: "PLANNER_RESPONSE", content: "running" });
   f.append({ step_index: 5, type: "SYSTEM_MESSAGE", content: "[Message] timestamp=2026-01-01 sender=scope/task-3 finished with result: ok" });
@@ -231,7 +232,7 @@ test("opt-in review requires an approved implementation and actual write, and ne
 test("confirmed whole-file overwrite can receive review without treating unknown prior contents as a code change", async (t) => {
   const f = await freePlanFixture(t, { settings: { freePlanReviewEnabled: true } });
   await f.post(3, "write_file", { Path: "app.ts", Overwrite: true, Content: "// note\nexport const version = 1;" }, "Created file.");
-  assert.match((await f.pre()).injectSteps[0].systemMessage.systemMessage, /cmd-verifier/);
+  assert.match((await f.pre()).injectSteps[0].systemMessage.systemMessage, /TypeName='research'/);
   assert.deepEqual(await f.stop(), { decision: "allow" });
   assert.deepEqual(await f.pre(), {});
 });
@@ -817,7 +818,8 @@ test("Trigger 2a: >=2 edit<->fail oscillations trigger /boost once, and passing 
   assert.equal(out1.injectSteps?.length, 1);
   assert.deepEqual(Object.keys(out1.injectSteps[0].systemMessage), ["systemMessage"]);
   assert.match(out1.injectSteps[0].systemMessage.systemMessage, /agy-cmd → 自动换视角排查/);
-  assert.match(out1.injectSteps[0].systemMessage.systemMessage, /one available investigator \("dart-reviewer" or "research"\) a read-only task/);
+  assert.match(out1.injectSteps[0].systemMessage.systemMessage, /built-in read-only "research" subagent \(Workspace='inherit'/);
+  assert.doesNotMatch(out1.injectSteps[0].systemMessage.systemMessage, /dart-reviewer/);
   assert.match(out1.injectSteps[0].systemMessage.systemMessage, /src\/auth\.ts/);
 
   // Cooldown: must NOT fire again immediately during same episode
@@ -3451,7 +3453,7 @@ test("Frozen Rules: test assertion weakening soft audit (positive triggers, zero
   );
   assert.equal(preExempt.reasonCode, "steady_state");
 
-  // 8. approved_free_plan_review enforces strict context desensitization & forwards test weakening flags to cmd-verifier
+  // 8. approved_free_plan_review enforces strict context desensitization & forwards test weakening flags to built-in research
   const f = await freePlanFixture(t, { settings: { freePlanReviewEnabled: true } });
   await f.command(3, "npm test", "Command exited with code 1.");
   await f.post(
@@ -3466,10 +3468,15 @@ test("Frozen Rules: test assertion weakening soft audit (positive triggers, zero
   );
   const reviewRes = await f.pre();
   const reviewMsg = reviewRes.injectSteps?.[0]?.systemMessage?.systemMessage || "";
-  assert.match(reviewMsg, /TypeName='cmd-verifier'.*Workspace='inherit'/);
+  assert.match(reviewMsg, /TypeName='research'.*Workspace='inherit'/);
+  assert.doesNotMatch(reviewMsg, /cmd-verifier|dart-reviewer/);
+  assert.match(reviewMsg, /strictly read-only review without making edits or expanding scope/);
+  assert.match(reviewMsg, /explicit paths of applicable root\/nested AGENTS\.md or GEMINI\.md rule files/);
+  assert.match(reviewMsg, /Verdict: 通过 \| 需修复 \| 证据不足/);
+  assert.match(reviewMsg, /1-based line number/);
   assert.match(reviewMsg, /Do NOT pass main-session reasoning, self-justifications, summaries, or chat history/);
   assert.match(reviewMsg, /app\.test\.ts.*新增 1 处跳过标记、净删减 1 处断言/);
-  // Follow-up PreInvocation does not duplicate the audit notice already folded into cmd-verifier dispatch
+  // Follow-up PreInvocation does not duplicate the audit notice already folded into research dispatch
   assert.deepEqual(await f.pre(), {});
 });
 
@@ -3949,7 +3956,7 @@ test("v2.7.4 review regressions 1-3: delayed apply_edits backfill, RUNNING->ERRO
   }
 });
 
-test("v2.7.4 review regressions 4-6: negated/unrelated authorization guards, approved-plan authorization inheritance, and late test edit forwarding to cmd-verifier", async (t) => {
+test("v2.7.4 review regressions 4-6: negated/unrelated authorization guards, approved-plan authorization inheritance, and late test edit forwarding to built-in research", async (t) => {
   // Finding 4: Negated clauses & unrelated test-cache requests must NOT exempt audit; explicit skip stays exempt
   const dropEditEv = classifyToolEvents(
     {
@@ -4011,7 +4018,8 @@ test("v2.7.4 review regressions 4-6: negated/unrelated authorization guards, app
     );
     const reviewRes = await f.pre();
     const reviewMsg = reviewRes.injectSteps?.[0]?.systemMessage?.systemMessage || "";
-    assert.match(reviewMsg, /TypeName='cmd-verifier'/);
+    assert.match(reviewMsg, /TypeName='research'/);
+    assert.doesNotMatch(reviewMsg, /cmd-verifier/);
     assert.doesNotMatch(reviewMsg, /strict assertion-integrity review|删减|跳过标记/);
     assert.deepEqual(await f.pre(), {});
     // New unrelated task resets authorization -> next assertion drop must alert
@@ -4032,20 +4040,20 @@ test("v2.7.4 review regressions 4-6: negated/unrelated authorization guards, app
     assert.match(newTaskMsg, /测试断言审计.*order\.test\.ts.*净删减 1 处断言/);
   }
 
-  // Finding 6: Free plan edits normal source first, then edits test later -> real Hook entrypoints forward test path & count to the single cmd-verifier dispatch with strict isolation
+  // Finding 6: Free plan edits normal source first, then edits test later -> real Hook entrypoints forward test path & count to the single built-in research dispatch with strict isolation
   {
     const f = await freePlanFixture(t, {
       task: "重构折扣计算逻辑",
       settings: { freePlanReviewEnabled: true, deliveryTestGateEnabled: true }
     });
-    // 1. Ordinary source edit triggers the initial one-time cmd-verifier instruction
+    // 1. Ordinary source edit triggers the initial one-time research review instruction
     await f.edit(3, "src/discount.ts");
     const firstPre = await f.pre();
     const firstMsg = firstPre.injectSteps?.[0]?.systemMessage?.systemMessage || "";
-    assert.match(firstMsg, /invoke_subagent once with TypeName='cmd-verifier' and Workspace='inherit'/);
-    assert.doesNotMatch(firstMsg, /discount\.test\.ts/);
+    assert.match(firstMsg, /invoke_subagent once with TypeName='research' and Workspace='inherit'/);
+    assert.doesNotMatch(firstMsg, /cmd-verifier|discount\.test\.ts/);
 
-    // 2. Later test edit deletes 1 assertion -> next PreInvocation forwards exact path & count to that single cmd-verifier dispatch
+    // 2. Later test edit deletes 1 assertion -> next PreInvocation forwards exact path & count to that single research dispatch
     await f.post(
       4,
       "edit_file",
@@ -4058,7 +4066,8 @@ test("v2.7.4 review regressions 4-6: negated/unrelated authorization guards, app
     );
     const secondPre = await f.pre();
     const secondMsg = secondPre.injectSteps?.[0]?.systemMessage?.systemMessage || "";
-    assert.match(secondMsg, /single TypeName='cmd-verifier' \(Workspace='inherit'\) dispatch/);
+    assert.match(secondMsg, /single TypeName='research' \(Workspace='inherit'\) independent review dispatch/);
+    assert.doesNotMatch(secondMsg, /cmd-verifier/);
     assert.match(secondMsg, /do NOT start a second reviewer/);
     assert.match(secondMsg, /tests\/discount\.test\.ts.*净删减 1 处断言/);
     assert.match(

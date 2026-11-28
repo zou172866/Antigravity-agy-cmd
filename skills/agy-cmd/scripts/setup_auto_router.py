@@ -1063,6 +1063,8 @@ def validate_bundle_sync(plugin_dir: Path) -> list[str]:
 
 def validate_verifier(plugin_dir: Path) -> list[str]:
     role = plugin_dir / "agents" / "cmd-verifier.md"
+    if not role.exists() and not role.is_symlink():
+        return []
     try:
         contents = normalize_lf(role.read_text(encoding="utf-8"))
     except (OSError, UnicodeError):

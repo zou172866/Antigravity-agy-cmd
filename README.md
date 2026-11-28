@@ -41,19 +41,19 @@ Run the pinned one-line installer for your OS (downloads the official release ZI
 **Windows (PowerShell):**
 
 ```powershell
-irm https://raw.githubusercontent.com/zou172866/Antigravity-agy-cmd/v2.8.1/install.ps1 | iex
+irm https://raw.githubusercontent.com/zou172866/Antigravity-agy-cmd/v2.8.2/install.ps1 | iex
 ```
 
 **macOS / Linux:**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zou172866/Antigravity-agy-cmd/v2.8.1/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/zou172866/Antigravity-agy-cmd/v2.8.2/install.sh | sh
 ```
 
 ### Other Install Options
 
 - **Offline stable ZIP (with SHA-256 verification)**: download the official ZIP and `SHA256SUMS.txt` from [GitHub Releases](https://github.com/zou172866/Antigravity-agy-cmd/releases/latest):
-  - Verify and install directly: `.\install.ps1 --archive .\agy-cmd-v2.8.1.zip --checksums .\SHA256SUMS.txt` (Windows) or `sh ./install.sh --archive ./agy-cmd-v2.8.1.zip --checksums ./SHA256SUMS.txt` (macOS / Linux).
+  - Verify and install directly: `.\install.ps1 --archive .\agy-cmd-v2.8.2.zip --checksums .\SHA256SUMS.txt` (Windows) or `sh ./install.sh --archive ./agy-cmd-v2.8.2.zip --checksums ./SHA256SUMS.txt` (macOS / Linux).
   - Or extract and run `.\install.ps1` (Windows) / `sh ./install.sh` (macOS / Linux) inside the unpacked folder.
 - **Manual Git clone** (a `.git` checkout inside `plugins/agy-cmd` disables Sidecar self-update to protect your working tree; update with `git pull` or use the one-line installer above):
 
@@ -113,7 +113,7 @@ To override the retry budget for a single turn, include `这次最多重试 5 �
 ### 3. Free-tier safety & stuck-loop recovery
 
 - **Plan and quota**: Google restricts `/boost` and `/teamwork` to paid tiers, while `/swarm` and `/run-workflow` are open on all App tiers. In free mode, `agy-cmd` runs sequentially by default to conserve weekly quota; you can still invoke the latter two explicitly in supported App sessions. In the IDE or unknown hosts, routing stays safely in the main session. [Boost and plan comparison](https://antigravity.google/docs/boost/) · [Dynamic Workflows](https://antigravity.google/docs/dynamic-workflows/)
-- **Optional independent review**: free users can enable a post-plan review in the panel (off by default). After editing and running checks, the main agent hands changed paths, key diffs, and test evidence to a read-only `cmd-verifier`; if that role is unavailable, the main agent reports that the review was skipped.
+- **Optional independent review**: free users can enable a post-plan review in the panel (off by default). After editing and running checks, the main agent hands changed paths, key diffs, applicable rule paths, and test evidence to the built-in read-only `research` subagent (1× standard quota, avoiding the 4× custom-agent quota multiplier introduced in Antigravity 1.5.17+); if unavailable, the main agent reports that the review was skipped.
 - **Stuck-loop circuit breaker**: on free plans (or with Boost off), 3 consecutive command failures or 2 edit-fail cycles pause blind edits and switch to read-only root-cause diagnosis. With paid Boost enabled, explicit hard debugging tasks, 3 consecutive command failures, or 3 edit-fail cycles (leaving Orchestrator's native 2-failure planner hand-back room to self-heal) dispatch `DeepInvestigator` / `DeepCoder` while the main session verifies the fix.
 
 Hooks and installers are verified locally; live free-tier reviewer dispatch in the App and IDE remains to be verified on real accounts. [Routing research](docs/research/multi-agent-routing-best-practices.md) · [Free-tier proposal](docs/proposals/free-tier-v2.3.md)

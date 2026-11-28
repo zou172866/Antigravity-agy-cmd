@@ -474,6 +474,13 @@ test("version-update: atomic ZIP-only self-update, case-insensitive FS, rollback
     // 2. Verifier role check mirrors setup_auto_router.py
     const realVerifier = fs.readFileSync(path.join(REPO_ROOT, "agents/cmd-verifier.md"), "utf8");
     assert.equal(isValidVerifierRole(realVerifier), true);
+    // YAML-safe DEPRECATED placeholder guard (compatible with v2.8.1 updater + strict YAML parsers)
+    const descMatch = realVerifier.replace(/\r\n/g, "\n").match(/^description: (.+)$/m);
+    assert.ok(descMatch, "placeholder cmd-verifier.md must declare description");
+    const descVal = descMatch[1].trim();
+    assert.ok(descVal.startsWith("DEPRECATED"), `description must start with DEPRECATED, got: ${descVal}`);
+    assert.equal(descVal.includes(": "), false, `description must not contain ': ': ${descVal}`);
+    assert.equal(descVal.includes(" #"), false, `description must not contain ' #': ${descVal}`);
     assert.equal(isValidVerifierRole(realVerifier.replace('["read_file"]', '["read_file", "run_command"]')), false);
     assert.equal(isValidVerifierRole(realVerifier.replace("inheritMcp: false", "inheritMcp: true")), false);
 
@@ -1887,8 +1894,9 @@ test("P1 Batch C · U1: pre/post SHA-256 asset display and oldest-supported (2.2
   assert.equal(savedAuto.lastAutoUpdatedAssetName, "agy-cmd-v2.8.0.zip");
   assert.equal(savedAuto.lastAutoUpdatedSha256, curSha);
 
-  // 2. N (2.8.0) -> N+1 (2.9.0) with forward-compatible read-only verifier fields succeeds cleanly
+  // 2. N (2.8.0) -> N+1 (2.9.0) with optional read-only verifier present still validates and updates cleanly
   const realVerifier = fs.readFileSync(path.join(REPO_ROOT, "agents/cmd-verifier.md"), "utf8");
+  assert.equal(isValidVerifierRole(realVerifier), true);
   const nextVerifier = realVerifier
     .replace('tools: ["read_file"]', 'tools: ["read_file", "view_file", "grep_search"]')
     .replace("model: inherit", "model: inherit\ncommandExecutionPolicy: off");
@@ -1914,7 +1922,35 @@ test("P1 Batch C · U1: pre/post SHA-256 asset display and oldest-supported (2.2
   assert.equal(rCurToNext.body.verifiedAssetName, "agy-cmd-v2.9.0.zip");
   assert.equal(rCurToNext.body.verifiedSha256, nextSha);
   assert.equal(readLocalVersion(root), "2.9.0");
+  assert.equal(fs.existsSync(path.join(root, "agents/cmd-verifier.md")), true);
   assert.equal(JSON.parse(fs.readFileSync(path.join(root, "sidecars/panel/sidecar.json"), "utf8")).command, pinnedNode);
+
+  // 2b. N+1 (2.9.0) -> N+2 (2.10.0) with agents/cmd-verifier.md removed passes validation and prunes the stale file
+  const removedVerifierZip = packBundleAsZip(
+    collectRepoBundleFiles("2.10.0", { "agents/cmd-verifier.md": null }),
+    "agy-cmd-v2.10.0"
+  );
+  const removedSha = sha256Hex(removedVerifierZip);
+  const removedRel = {
+    ok: true,
+    status: "update",
+    currentVersion: "2.9.0",
+    latestVersion: "2.10.0",
+    releaseTag: "v2.10.0",
+    releaseUrl: `https://github.com/${REPO}/releases/tag/v2.10.0`,
+    assetName: "agy-cmd-v2.10.0.zip",
+    assetUrl: `https://github.com/${REPO}/releases/download/v2.10.0/agy-cmd-v2.10.0.zip`,
+    assetSha256: removedSha,
+    assetFormat: "zip"
+  };
+  const rNextToRemoved = await handlePluginUpdate(
+    { version: "2.10.0", assetName: removedRel.assetName, assetUrl: removedRel.assetUrl, assetSha256: removedSha },
+    { stateDir, updater: mkUpdater(removedRel, removedVerifierZip) }
+  );
+  assert.equal(rNextToRemoved.body.status, "updated");
+  assert.equal(readLocalVersion(root), "2.10.0");
+  assert.equal(fs.existsSync(path.join(root, "agents/cmd-verifier.md")), false);
+  assert.equal(fs.existsSync(path.join(root, "agents")), false);
 
   // 3. Panel HTML renders both pre-install asset+SHA-256 and post-install verified asset+SHA-256
   const html = renderPanelHtml("u1-csrf");

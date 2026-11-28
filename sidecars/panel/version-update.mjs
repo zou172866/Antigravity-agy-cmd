@@ -1,6 +1,6 @@
 import { randomBytes } from "node:crypto";
 import { lstatSync, readFileSync } from "node:fs";
-import { lstat, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, unlink, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, rmdir, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join, posix, resolve, win32 } from "node:path";
 import { compareVersions, parseVersion, REPO } from "./version-check.mjs";
@@ -21,7 +21,6 @@ const REQUIRED_FILES = [
   "package.json",
   "hooks.json",
   "rules/AGENTS.md",
-  "agents/cmd-verifier.md",
   SIDECAR_MANIFEST,
   `${SIDECAR_REL_DIR}/server.mjs`,
   `${SIDECAR_REL_DIR}/api-handler.mjs`,
@@ -664,8 +663,11 @@ function prepareReleaseFiles(archiveFiles, expectedVersion, context = {}) {
     throw new UpdateError("incomplete");
   }
 
-  if (!isValidVerifierRole(archiveFiles.get("agents/cmd-verifier.md").toString("utf8"))) {
-    throw new UpdateError("incomplete");
+  const verifierBytes = archiveFiles.get("agents/cmd-verifier.md");
+  if (verifierBytes !== undefined) {
+    if (!verifierBytes?.length || !isValidVerifierRole(verifierBytes.toString("utf8"))) {
+      throw new UpdateError("incomplete");
+    }
   }
 
   const selectedFiles = selectBundleFiles(archiveFiles);
@@ -726,9 +728,7 @@ async function removeEmptyDirsRecursive(dirPath, rootDir) {
   if (!isSamePath(dirPath, rootDir)) {
     const after = await readdir(dirPath).catch(() => ["non-empty"]);
     if (after.length === 0) {
-      await unlink(dirPath).catch(async () => {
-        await rm(dirPath, { recursive: false, force: true }).catch(() => {});
-      });
+      await rmdir(dirPath).catch(() => {});
     }
   }
 }

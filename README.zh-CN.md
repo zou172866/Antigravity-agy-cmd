@@ -41,19 +41,19 @@
 **Windows（PowerShell 一行直装）：**
 
 ```powershell
-irm https://raw.githubusercontent.com/zou172866/Antigravity-agy-cmd/v2.8.1/install.ps1 | iex
+irm https://raw.githubusercontent.com/zou172866/Antigravity-agy-cmd/v2.8.2/install.ps1 | iex
 ```
 
 **macOS / Linux（一行直装）：**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zou172866/Antigravity-agy-cmd/v2.8.1/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/zou172866/Antigravity-agy-cmd/v2.8.2/install.sh | sh
 ```
 
 ### 其他安装方式
 
 - **离线稳定包（带 SHA-256 验签）**：从 [GitHub Releases](https://github.com/zou172866/Antigravity-agy-cmd/releases/latest) 下载正式 ZIP 与 `SHA256SUMS.txt`：
-  - 先验签再装：Windows 运行 `.\install.ps1 --archive .\agy-cmd-v2.8.1.zip --checksums .\SHA256SUMS.txt`，macOS / Linux 运行 `sh ./install.sh --archive ./agy-cmd-v2.8.1.zip --checksums ./SHA256SUMS.txt`。
+  - 先验签再装：Windows 运行 `.\install.ps1 --archive .\agy-cmd-v2.8.2.zip --checksums .\SHA256SUMS.txt`，macOS / Linux 运行 `sh ./install.sh --archive ./agy-cmd-v2.8.2.zip --checksums ./SHA256SUMS.txt`。
   - 或解压后在目录内运行 `.\install.ps1`（Windows）/ `sh ./install.sh`（macOS / Linux）。
 - **手动克隆仓库**（含 `.git` 目录时，面板在线自更新会自动关闭以防覆盖源码；后续用 `git pull` 更新，或改用上方一行直装）：
 
@@ -113,7 +113,7 @@ python ~/.agents/skills/agy-cmd/scripts/setup_auto_router.py --install --standal
 ### 3. 免费护航与卡壳换脑
 
 - **套餐与配额**：`/boost` 和 `/teamwork` 属于付费功能，`/swarm` 与 `/run-workflow` 在 App 全套餐开放。免费模式下插件默认顺序执行，帮免费号省下周配额；在支持的 App 会话里你仍可手动点名使用后两项。IDE 或宿主能力未知时，路由稳妥留在主会话。[官方套餐对照](https://antigravity.google/docs/boost/) · [工作流说明](https://antigravity.google/docs/dynamic-workflows/)
-- **可选独立复核**：免费用户在侧栏可打开计划实施后的独立复核（默认关闭）。主 Agent 改完并跑通验证后，把改动路径、关键 diff 和验证证据交给只读的 `cmd-verifier` 复查；宿主没提供该角色时，主 Agent 会如实声明跳过。
+- **可选独立复核**：免费用户在侧栏可打开计划实施后的独立复核（默认关闭）。主 Agent 改完并跑通验证后，把改动路径、关键 diff、适用规则路径和验证证据交给官方内置只读 `research` 复查（维持 1× 原价，避免 Antigravity 1.5.17+ 自定义/插件 Agent 的 4× 配额倍率）；宿主没提供该角色时，主 Agent 会如实声明跳过。
 - **卡壳止损**：免费版或关 Boost 时，命令连挂 3 次或连改 2 轮仍红，立刻停下盲改，转交只读角色排查根因。会员开 Boost 后，遇到明确疑难任务、连挂 3 次或连改 3 轮仍红（给 Orchestrator 原生“失败 2 次回交 Neon”留出自愈空间），自动派 `DeepInvestigator` / `DeepCoder` 接力，主会话验收结果。
 
 Hook 与安装流程已通过本地测试，真实免费账号在 App 和 IDE 中调度复核角色仍待真机验证。[多智能体路由调研](docs/research/multi-agent-routing-best-practices.md) · [免费档设计提案](docs/proposals/free-tier-v2.3.md)

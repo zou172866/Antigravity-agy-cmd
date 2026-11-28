@@ -30,8 +30,8 @@
 | **Workers / Executors** | `Gemini 4 Hydrogen` | 并行读写、构建与跑测；单价约 Neon 一半，共享稳定 `AGENTS.md` 前缀享隐式缓存折扣 |
 | **Verifier / Auditor** | `Gemini 4 Carbon`（或与 Worker 不同的模型） | 跨模型审 Diff、重跑测试、打回缺证据的 `[done]` 声明，消除自审盲区 |
 
-- **自定义 Subagent `model` 限制**：`.agents/agents/*.md` 的 `model` frontmatter 仅支持档位（`inherit`、`flash`、`pro`），无法直接写死具体模型 ID；要按角色锁模型，在 `/swarm` 中让 Coordinator 指定并在侧栏 `Members` 标签核对。
-- **`cmd-verifier` 边界**：本插件内置的 `cmd-verifier` 采用 `model: inherit` + 仅 `read_file`，提供**干净上下文独立复核**（去主会话锚定），尚未跨模型；需要严格跨模型对抗验收优先用 `/swarm` 锁定异构模型。
+- **自定义 Subagent 4× 配额与 `model` 限制（#1890）**：自 Antigravity `1.5.17+` 起，自定义/插件 Agent（`.agents/agents/*.md`、`plugins/*/agents/*.md`）及其子智能体按约 **4× 配额**扣费，且其 `model` frontmatter 仅支持档位（`inherit`、`flash`、`pro`）。日常单点调查、计划独立复核统一改派官方内置只读 **`research`**（编码用内置 **`self`**）以维持 **1× 原价**；按角色锁模型优先在 `/swarm` 中指定并在侧栏 `Members` 标签核对。
+- **计划独立复核边界**：免费计划获批后的可选独立复核现已改派内置只读 **`research`** 执行（严格上下文脱敏、显式传入适用规则路径、限制只读不扩范围，维持 1× 原价），尚未跨模型；需要严格跨模型对抗验收优先用 `/swarm` 锁定异构模型。
 
 ---
 
@@ -151,7 +151,7 @@
 - **范围红线**：多项目工作区根目录禁止直接跑，先锁定单仓库或单目录。
 - **额度护栏**：自动重试设为 `infinite` 时必须写硬停止条件，防止空转烧额度。
 - **回滚点**：每批独立 commit，代替 CLI 专属的 `/undo`、`/rewind`；出问题直接 `git revert` 该批。
-- **付费 App 分流**：首轮按多个维度做全库扫描属于同质只读，可交 Workflow 1（Diamond）或 Swarm 3（只读评审团）并行出清单；落地写入多为紧耦合改动，按负向否决门回主会话串行执行，每批 commit 后可派 `cmd-verifier` 独立复核。
+- **付费 App 分流**：首轮按多个维度做全库扫描属于同质只读，可交 Workflow 1（Diamond）或 Swarm 3（只读评审团）并行出清单；落地写入多为紧耦合改动，按负向否决门回主会话串行执行，每批 commit 后可派内置只读 `research`（1× 原价）独立复核。
 - **免费 / IDE**：全程单会话顺序推进，每轮自审 Diff 并实跑验证命令。
 
 **Teamwork · 多个里程碑分别验收（付费）**

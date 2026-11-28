@@ -3,13 +3,13 @@ name: agy-cmd
 description: Antigravity 桌面端/IDE 高阶能力自动路由与内置斜杠指令参谋。用于开关路由、调自动重试/交付门禁/会员 Boost，或查询对比 /grill-me、/plan、/goal、/boost、/swarm、/run-workflow 等内置指令（禁混 CLI 专属命令）。
 ---
 
-# agy-cmd：高阶能力自动路由与指令参谋（v2.8.1）
+# agy-cmd：高阶能力自动路由与指令参谋（v2.8.2）
 
 四项能力：**常驻精简规则**（`rules/AGENTS.md`）、**零稳态开销钩子**（`hooks.json`：`SessionStart` / `PreToolUse` / `PostToolUse` / `PreInvocation` / `Stop`）、**右侧 Sidecar 面板**（`sidecar://agy-cmd/panel/`）与**按需指令参谋**。
 
 ## 关键不变量
 
-1. **免费安全默认**：`planTier = "free"`、`boostEnabled = false`。`/boost`、`/teamwork` 仅付费；`/swarm`、`/run-workflow` 全套餐开放但耗额较高，免费档默认不主动推荐。卡壳优先派只读 `dart-reviewer` 或 `research`，不可用则主会话排查。
+1. **免费安全默认**：`planTier = "free"`、`boostEnabled = false`。`/boost`、`/teamwork` 仅付费；`/swarm`、`/run-workflow` 全套餐开放但耗额较高，免费档默认不主动推荐。卡壳改派内置只读 `research`（1× 原价，避免自定义/插件 Agent 触发 4× 配额倍率），不可用则主会话排查。
 2. **安装后首次引导**：初始化或未确认配置时，提醒打开 **[agy-cmd 自动路由](sidecar://agy-cmd/panel/)** 确认 **① 自动重试次数** 与 **② 会员 Boost 自动接入**。
 3. **审批与轻量边界**：只读 Plan Mode 拒写方案时正文输出方案并等待，严禁调 `exit_plan_mode` 绕过；1～2 文件明确低风险修改直接执行，不加徽标、不建计划、不推指令。
 4. **严禁 CLI 专属指令**：禁止推荐 `/undo`、`/rewind`、`/branch`、`/fork`、`/clear`、`/new`、`/resume`、`/switch`、`/effort`、`/codesearch`、`/diff`、`/statusline`、`/title`、`/voice`、`/exit`。
@@ -35,7 +35,7 @@ python3 scripts/setup_auto_router.py --reset-stats
 python3 scripts/setup_auto_router.py --delivery-test-gate on
 python3 scripts/setup_auto_router.py --delivery-test-cmd "npm run typecheck && npm test"
 
-# 免费计划获批后的可选只读复核（开关可选：on / off，默认关，最多派 1 次 cmd-verifier）
+# 免费计划获批后的可选只读复核（开关可选：on / off，默认关，最多派 1 次内置只读 research）
 python3 scripts/setup_auto_router.py --free-plan-review on
 
 # 极速查套餐 / 完整状态 / 同步安装 / 零漂移校验 / 停用
@@ -60,11 +60,11 @@ python3 scripts/setup_auto_router.py --remove
 | 需求模糊、边界未定 | `[agy-cmd → /grill-me 追问]` | `ask_question` 只问阻碍下一步的问题，独立问题可合问，推荐项置顶 `(Recommended)` |
 | 改 ≥3 文件、改公共接口或高风险 | `[agy-cmd → /plan 审批]` | 只读定范围（`apply_edits` 按文件计），交 `RequestFeedback: true` 计划；只读拒写时正文交方案等待。多模块获批计划在 App 可接 `/swarm execute our plan`；开「计划获批自动 Boost」按钩子单次派工 |
 | 单项独立旁支调查 | Subagents | 主线程有余量时 `invoke_subagent` 派 1 个可用角色，写清范围与证据，主线程核对 |
-| ≥5 同质对象同规则检查 | 默认顺序分批；准入后 `[agy-cmd → /run-workflow]` | 纯匹配用本地命令；进 Workflow 先读 `run-workflow`，按菱形骨架（便宜并发 Fan-out→纯代码 Reduce→独立 Verify→单节点 Synthesize）执行，强制首轮 `CAP` 上限、Fan-in 完整性校验（核对 `total/dispatched/returned/remaining`）与超 30～40 项分层汇聚（模板见 [多智能体与 Swarm 模板](references/multi-agent-playbooks.md)）。编码优先选可用的 `dart-coder`，否则选 `self`；高精度用 `model="inherit"`（接口靠省略继承则省略） |
+| ≥5 同质对象同规则检查 | 默认顺序分批；准入后 `[agy-cmd → /run-workflow]` | 纯匹配用本地命令；进 Workflow 先读 `run-workflow`，按菱形骨架（便宜并发 Fan-out→纯代码 Reduce→独立 Verify→单节点 Synthesize）执行，强制首轮 `CAP` 上限、Fan-in 完整性校验（核对 `total/dispatched/returned/remaining`）与超 30～40 项分层汇聚（模板见 [多智能体与 Swarm 模板](references/multi-agent-playbooks.md)）。编码选内置 `self`，只读选内置 `research`（均为 1× 原价，避免自定义/插件 Agent 的 4× 配额倍率）；高精度用 `model="inherit"`（接口靠省略继承则省略） |
 | 独立 Lane（多模块写码、多视角只读评审/排障、Best-of-N） | 默认单写手；准入后 `[agy-cmd → 建议 /swarm]` | **负向否决门**：先过假边测试与隐式资源边检查，前后强依赖或紧耦合改动禁止强行并行（留主会话/Orchestrator 或 `/boost`）。准入后先 Pre-flight（接口、`OWNS`/`MUST NOT TOUCH`/`DONE MEANS` 与验证命令），出可复制 `/swarm` 提示词（未点名不私调 `swarm`）。活跃 Swarm 读 `swarm_pane`，6 套模板、三层选模与自检见 [多智能体与 Swarm 模板](references/multi-agent-playbooks.md) |
 | 长程 `/goal` 治理或重构（用户点名并授权连续执行） | 跟随原生 `/goal` | `/grill-me`、`/plan` 门禁改为写入待确认清单并继续独立任务；产品决策、破坏性迁移、改外部合同或只读 Plan Mode 仍停下。锁定单仓库范围、独立 worktree 每批 commit、写硬停止条件，模板见 [多智能体与 Swarm 模板](references/multi-agent-playbooks.md) 的「Goal · 长程治理闭环」 |
 | 动态网页 / 交互图表 | `[agy-cmd → /browser]` / `[agy-cmd → /generative_ui]` | 委派 `browser`；App 支持时读 `generative_ui` |
-| 疑难或反复卡壳（免费 ≥2 次 / 付费 ≥3 次震荡，连败 ≥3 次或跨 ≥2 轮） | 套餐感知自动派工 | 按钩子提示：会员 `[agy-cmd → 自动 Boost]` 派 `DeepInvestigator`（只读/待审）或 `DeepCoder`（已授权），主会话验收、失败接手；免费 `[agy-cmd → 自动换视角排查]` 派只读 `dart-reviewer` 或 `research`。活跃 Swarm 及 Worker 由钩子豁免 |
+| 疑难或反复卡壳（免费 ≥2 次 / 付费 ≥3 次震荡，连败 ≥3 次或跨 ≥2 轮） | 套餐感知自动派工 | 按钩子提示：会员 `[agy-cmd → 自动 Boost]` 派 `DeepInvestigator`（只读/待审）或 `DeepCoder`（已授权），主会话验收、失败接手；免费 `[agy-cmd → 自动换视角排查]` 派内置只读 `research`（1× 原价）。活跃 Swarm 及 Worker 由钩子豁免 |
 | 改码/修错后测试未绿 | Stop 自动续跑监工 | 验证未绿自动续跑；问原因、只读探测或等确认自动放行。免费获批计划漏测最多提醒补验 1 次；开交付门禁全套餐改后必测 |
 
 ### 模式 C：指令选型参谋（按需读单卡）

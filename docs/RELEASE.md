@@ -17,6 +17,12 @@
 2. **第 N+1 版（确认存量升级后再改角色字段）**：
    - 待存量用户基本升至第 N 版及以上，再修改 [agents/cmd-verifier.md](../agents/cmd-verifier.md) 的 frontmatter，并在离线自更新测试中验证 `N → N+1` 顺利通过。
 
+### `agents/cmd-verifier.md` 下线与删除进度（Antigravity #1890 · 4× 自定义 Agent 计费）
+因 Antigravity `1.5.17+` 对自定义/插件 Agent 计约 4× 配额，独立复核与卡壳换视角已迁回官方内置只读 `research`（1× 原价）。为避免 `<= 2.8.1` 存量用户在侧栏在线自更新时因旧版 `REQUIRED_FILES` 缺文件触发 `UpdateError("incomplete")`，`agents/cmd-verifier.md` 至少保留 2 个版本再删除：
+1. **本版（第 N 版）**：钩子、Skill 与文档全部改派内置 `research` / `self`；新版 `version-update.mjs` 与 `setup_auto_router.py` 已放宽为 `agents/cmd-verifier.md` 可选存在（存在时仍严检只读安全不变量）；`agents/cmd-verifier.md` 保留兼容 `v2.8.1` 的 frontmatter，仅把 `description` 改为 YAML 安全 `DEPRECATED` 文案（不含 `: ` 与 ` #`）。
+2. **第 N+1 版**：继续保留 `agents/cmd-verifier.md` 占位文件，为跳过第 N 版的存量用户留出升级缓冲（若实测发现未调用的占位文件仍影响默认会话扣额，可评估提前至 N+1 删除）。
+3. **第 N+2 版（删除占位文件）**：删除 `agents/cmd-verifier.md` 与空 `agents/` 目录；发版说明必须附**跳版直升兜底提示**：「`<= 2.8.1` 用户若跨版在线更新提示 `incomplete`，请改用 `python skills/agy-cmd/scripts/setup_auto_router.py --install` 脚本安装（或先升至中间版本）」。
+
 ---
 
 ## 2. 其他发版兼容性红线
